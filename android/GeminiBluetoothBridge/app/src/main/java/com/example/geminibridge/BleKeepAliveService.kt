@@ -246,11 +246,18 @@ class BleKeepAliveService : Service() {
             val source = obj["source"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
             val page = obj["page"]?.jsonPrimitive?.intOrNull ?: 0
             val text = obj["text"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
-            val terms: List<String> = obj["terms"]?.jsonArray
+            var terms: List<String> = obj["terms"]?.jsonArray
                 ?.mapNotNull { it.jsonPrimitive.contentOrNull }
                 ?: emptyList()
+
+            // If terms were stripped by Mac to save bandwidth, recompute them
+            if (terms.isEmpty() && text.isNotBlank()) {
+                terms = tokenizeForBm25(text)
+            }
+
             StoredChunk(source = source, page = page, text = text, terms = terms)
         }
+
         val container = StoredContainer(id = containerId, name = containerName, chunks = chunks)
         BridgeRuntimeState.addOrUpdateContainer(container)
         containerStore.save(container)
@@ -573,6 +580,15 @@ class BleKeepAliveService : Service() {
             .setContentIntent(pendingIntent)
 
         return builder.build()
+    }
+    private fun tokenizeForBm25(text: String): List<String> {
+        val result = mutableSetOf<String>()
+        val tokenRegex = Regex("[A-Za-z0-9_\\u00C0-\\u024F]{2,}")
+        tokenRegex.findAll(text.lowercase()).forEach { match ->
+            val token = match.value
+            if (token.length >= 3) result.add(token)
+        }
+        return result.toList()
     }
 
     companion object {

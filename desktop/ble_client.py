@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
 import io
 import json
 import mimetypes
@@ -144,23 +145,40 @@ class BleChatClient:
 
     def send_container(self, container_dict: dict[str, Any]) -> str:
         """Transfer a full container to Android. Returns request_id for ACK matching.
-        
-        Android responds with: {"type":"container_ack","containerId":"...","chunkCount":N}
+
+        Payload is gzip-compressed (level 6) to minimise BLE packet count.
+        `terms` are stripped from chunks — Android recomputes them from `text`.
+        Android detects compression via the magic 4-byte prefix b'gz:\\x01'.
         """
         request_id = str(uuid.uuid4())
+
+        # Strip terms to reduce size; Android recomputes them on load
+        lean_chunks = [
+            {"source": ch["source"], "page": ch.get("page", 0), "text": ch["text"]}
+            for ch in container_dict.get("chunks", [])
+        ]
         message = {
             "type": "load_container",
             "messageId": request_id,
             "containerId": container_dict["id"],
             "containerName": container_dict["name"],
-            "chunks": container_dict["chunks"],
+            "chunks": lean_chunks,
         }
-        payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        MAX_CONTAINER_BYTES = 4 * 1024 * 1024  # 4MB — BLE framing handles splitting
+        raw_json = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        compressed = gzip.compress(raw_json, compresslevel=6)
+        # Prefix so Android can detect this is compressed: magic b"gz\x01" + compressed bytes
+        payload = b"gz\x01" + compressed
+
+        raw_kb = len(raw_json) // 1024
+        cmp_kb = len(payload) // 1024
+        ratio = 100 - int(len(payload) / max(len(raw_json), 1) * 100)
+        self._emit({"type": "status", "text": f"Container compressed: {raw_kb}KB → {cmp_kb}KB (-{ratio}%)"})
+
+        MAX_CONTAINER_BYTES = 4 * 1024 * 1024
         if len(payload) > MAX_CONTAINER_BYTES:
             raise ValueError(
-                f"Container too large for BLE transfer ({len(payload) // 1024}KB). "
-                f"Reduce the number of PDFs or split into multiple containers."
+                f"Container too large even after compression ({cmp_kb}KB). "
+                f"Split into smaller containers."
             )
         self._run_coro(self._send_payload(payload, request_id))
         return request_id
