@@ -1347,6 +1347,31 @@ class DesktopChatApp:
     def on_disconnect(self) -> None:
         self.client.disconnect()
 
+    def _ensure_active_session(self, source: str = "action") -> str:
+        current_id = str(getattr(self, "active_session_id", "") or "").strip()
+        sessions = self.sessions_store.list_sessions()
+        known_ids = {str(s.get("id", "")) for s in sessions}
+        if current_id and current_id in known_ids:
+            return current_id
+
+        if sessions:
+            recovered_id = str(sessions[0]["id"])
+            self.active_session_id = recovered_id
+            self.sessions_store.set_active_session(recovered_id)
+            self._refresh_sessions_list(recovered_id)
+            self._render_active_chat()
+            self._refresh_memory_label()
+            self._append_log("System", f"Recovered active chat for {source}")
+            return recovered_id
+
+        session_id = self.sessions_store.create_session("Nuova chat")
+        self.active_session_id = session_id
+        self._refresh_sessions_list(session_id)
+        self._render_active_chat()
+        self._refresh_memory_label()
+        self._append_log("System", f"Auto-created chat for {source}")
+        return session_id
+
     def on_new_chat(self) -> None:
         session_id = self.sessions_store.create_session("Nuova chat")
         self.active_session_id = session_id
@@ -1455,6 +1480,8 @@ class DesktopChatApp:
             self._show_overlay_message("Bridge non connesso", ttl_ms=3500)
             return
 
+        session_id = self._ensure_active_session("Shot+Ask")
+
         path = self._capture_area_screenshot_path(log_errors=False)
         if path is None:
             self._show_overlay_message("Screenshot annullato", ttl_ms=2500)
@@ -1496,6 +1523,7 @@ class DesktopChatApp:
         self._overlay_started_at[request_id] = now
         self._overlay_last_update_at[request_id] = now
         self._overlay_image_paths_by_request[request_id] = path
+        self._pending_request_session[request_id] = session_id
         self._show_overlay_message("Analisi screenshot in corso...", ttl_ms=0)
 
     def on_clipboard_send(self) -> None:
@@ -1777,7 +1805,7 @@ class DesktopChatApp:
             self._append_log("System", "Not connected")
             return
 
-        session_id = self.active_session_id
+        session_id = self._ensure_active_session("send")
         memory_turns = self.sessions_store.recent_turns(session_id, max_items=10, max_chars=2600)
         context_blocks = []
 
