@@ -1320,6 +1320,8 @@ class DesktopChatApp:
                 prompt,
                 model=model_override,
                 image_path=path,
+                image_target_bytes=38 * 1024,
+                image_max_dimension=640,
                 enable_web_search=self.web_search_enabled.get(),
                 thinking_enabled=thinking_enabled,
                 thinking_budget=thinking_budget,
@@ -1335,7 +1337,7 @@ class DesktopChatApp:
 
         self._overlay_request_ids.add(request_id)
         self._overlay_image_paths_by_request[request_id] = path
-        self._show_overlay_message("Analisi screenshot in corso...", ttl_ms=18000)
+        self._show_overlay_message("Analisi screenshot in corso...", ttl_ms=0)
 
     def on_clipboard_send(self) -> None:
         text = ""
@@ -1868,7 +1870,7 @@ class DesktopChatApp:
                     if channel != "thought":
                         partial_text = str(message.get("text", "")).strip()
                         if partial_text:
-                            self._show_overlay_message(partial_text + "\n▌", ttl_ms=12000)
+                            self._show_overlay_message(partial_text + "\n▌", ttl_ms=0)
                     return
                 if message_type == "result":
                     response_text = str(message.get("text", "")).strip()
@@ -1885,7 +1887,7 @@ class DesktopChatApp:
                 if message_type == "status":
                     state = str(message.get("state", "processing")).strip()
                     if state:
-                        self._show_overlay_message(state, ttl_ms=3000)
+                        self._show_overlay_message(state, ttl_ms=0)
                     return
 
             target_session = self._pending_request_session.get(message_id, self.active_session_id)

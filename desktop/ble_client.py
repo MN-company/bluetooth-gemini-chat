@@ -99,6 +99,8 @@ class BleChatClient:
         prompt: str,
         model: str | None = None,
         image_path: str | None = None,
+        image_target_bytes: int | None = None,
+        image_max_dimension: int | None = None,
         context_blocks: list[dict[str, Any]] | None = None,
         memory_turns: list[dict[str, str]] | None = None,
         enable_web_search: bool = False,
@@ -129,7 +131,11 @@ class BleChatClient:
             message["conversationMemory"] = memory_turns
 
         if image_path is not None:
-            image_file, raw, mime_type = self._prepare_image_payload(image_path)
+            image_file, raw, mime_type = self._prepare_image_payload(
+                image_path,
+                target_bytes=image_target_bytes,
+                max_dimension=image_max_dimension,
+            )
             message["imageMimeType"] = mime_type
             message["imageBase64"] = base64.b64encode(raw).decode("ascii")
             message["imageName"] = image_file.name
@@ -434,7 +440,14 @@ class BleChatClient:
             if emit_sent_event:
                 self._emit({"type": "error", "text": f"Send failed: {exc}"})
 
-    def _prepare_image_payload(self, image_path: str) -> tuple[Path, bytes, str]:
+    def _prepare_image_payload(
+        self,
+        image_path: str,
+        target_bytes: int | None = None,
+        max_dimension: int | None = None,
+    ) -> tuple[Path, bytes, str]:
+        target_limit = max(8 * 1024, int(target_bytes or TARGET_IMAGE_BYTES))
+        max_dim = max(256, int(max_dimension or MAX_IMAGE_DIMENSION))
         image_file = Path(image_path)
         try:
             raw = image_file.read_bytes()
@@ -448,7 +461,7 @@ class BleChatClient:
         if mime_type is None or not mime_type.startswith("image/"):
             raise ValueError("Selected file is not a supported image format")
 
-        if len(raw) <= TARGET_IMAGE_BYTES:
+        if len(raw) <= target_limit:
             return image_file, raw, mime_type
 
         if Image is None:
@@ -459,7 +472,11 @@ class BleChatClient:
                 )
             return image_file, raw, mime_type
 
-        optimized = self._optimize_image_to_jpeg(image_file)
+        optimized = self._optimize_image_to_jpeg(
+            image_file,
+            target_bytes=target_limit,
+            max_dimension=max_dim,
+        )
         if optimized is not None:
             raw = optimized
             mime_type = "image/jpeg"
@@ -472,7 +489,12 @@ class BleChatClient:
 
         return image_file, raw, mime_type
 
-    def _optimize_image_to_jpeg(self, image_file: Path) -> bytes | None:
+    def _optimize_image_to_jpeg(
+        self,
+        image_file: Path,
+        target_bytes: int = TARGET_IMAGE_BYTES,
+        max_dimension: int = MAX_IMAGE_DIMENSION,
+    ) -> bytes | None:
         try:
             with Image.open(image_file) as img:  # type: ignore[arg-type]
                 if ImageOps is not None:
@@ -486,8 +508,8 @@ class BleChatClient:
                 elif img.mode != "RGB":
                     img = img.convert("RGB")
 
-                if max(img.size) > MAX_IMAGE_DIMENSION:
-                    img.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION), Image.Resampling.LANCZOS)
+                if max(img.size) > max_dimension:
+                    img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
 
                 best: bytes | None = None
                 for quality in (76, 68, 60, 52, 44, 36):
@@ -496,7 +518,7 @@ class BleChatClient:
                     candidate = buffer.getvalue()
                     if best is None or len(candidate) < len(best):
                         best = candidate
-                    if len(candidate) <= TARGET_IMAGE_BYTES:
+                    if len(candidate) <= target_bytes:
                         return candidate
                 return best
         except (UnidentifiedImageError, OSError):
