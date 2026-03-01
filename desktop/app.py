@@ -635,6 +635,13 @@ class DesktopChatApp:
             pass
         if success:
             self._append_log("System", "➜ Pacchetti inviati. In attesa di conferma di salvataggio dal telefono...")
+            # Auto-activate the container that was just uploaded
+            cid = self._selected_container_id()
+            if cid:
+                self._active_container_id = cid
+                c = self._context_store.get(cid)
+                self._append_log("System", f"Container auto-attivato: {c.name if c else cid}")
+                self._refresh_container_list()
 
 
     def _toggle_pip(self) -> None:
@@ -1461,6 +1468,8 @@ class DesktopChatApp:
             )
         except ValueError as exc:
             self._append_log("Error", str(exc))
+            from tkinter import messagebox
+            messagebox.showerror("Errore di Invio", str(exc), parent=self.root)
             return
 
         self._streaming_preview_by_session.pop(session_id, None)
