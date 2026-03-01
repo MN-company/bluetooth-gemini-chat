@@ -79,6 +79,9 @@ class DesktopChatApp:
         self._toggle_flag_mtime = 0.0
         self._clipboard_flag_path = Path(__file__).with_name('clipboard.flag')
         self._clipboard_flag_mtime = 0.0
+        
+        self._settings_path = Path(__file__).with_name("settings.json")
+        self.system_instructions_var = tk.StringVar(value=self._load_settings().get("system_instructions", ""))
 
         self._configure_theme()
         self._build_ui()
@@ -122,7 +125,8 @@ class DesktopChatApp:
         
         ctk.CTkButton(header_left, text="ADD PDF", command=self.on_add_pdf, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT, padx=(0, 6))
         ctk.CTkButton(header_left, text="CLIPBOARD", command=self.on_clipboard_send, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT, padx=(0, 6))
-        ctk.CTkButton(header_left, text="SCREENSHOT", command=self.on_quick_screenshot, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT)
+        ctk.CTkButton(header_left, text="SCREENSHOT", command=self.on_quick_screenshot, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT, padx=(0, 6))
+        ctk.CTkButton(header_left, text="⚙️", command=self.on_open_settings, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=30).pack(side=tk.LEFT)
 
         # Header Right: Device Name / Connection info
         header_right = ctk.CTkFrame(self.header_frame, fg_color="transparent")
@@ -151,7 +155,7 @@ class DesktopChatApp:
 
         # Chat Search
         self.search_var = tk.StringVar()
-        search_entry = ctk.CTkEntry(
+        self.search_entry = ctk.CTkEntry(
             self.sidebar_frame,
             textvariable=self.search_var,
             placeholder_text="Cerca chat...",
@@ -161,8 +165,8 @@ class DesktopChatApp:
             border_width=1,
             border_color="#333333"
         )
-        search_entry.pack(fill=tk.X, pady=(0, 6))
-        search_entry.bind("<KeyRelease>", lambda e: self._refresh_sessions_list(self.active_session_id))
+        self.search_entry.pack(fill=tk.X, pady=(0, 6))
+        self.search_entry.bind("<KeyRelease>", lambda e: self._refresh_sessions_list(self.active_session_id))
 
         # Chats listbox
         self.chats_list = tk.Listbox(
@@ -267,7 +271,63 @@ class DesktopChatApp:
         self.memory_var = tk.StringVar(value="")
         
         self.root.bind("<Configure>", self._on_window_resize)
+        
+        # --- GLOBAL HOTKEYS BINDING ---
+        self.root.bind("<Command-n>", lambda e: [self.on_new_chat(), self.prompt_entry.focus()])
+        self.root.bind("<Command-r>", lambda e: self.on_rename_chat())
+        self.root.bind("<Command-BackSpace>", self._on_global_backspace_hotkey)
+        self.root.bind("<Command-k>", lambda e: self.search_entry.focus())
+        self.root.bind("<Command-f>", lambda e: self.search_entry.focus())
+        
         self._is_compact_mode = False
+
+    def _on_global_backspace_hotkey(self, event) -> str | None:
+        if event.widget == self.prompt_entry._textbox:
+            self._on_clear_composer_hotkey(event)
+            return "break"
+        # If we're not inside the textbox, attempt to delete the active chat
+        self.on_delete_chat()
+        return "break"
+
+    def _load_settings(self) -> dict[str, Any]:
+        if not self._settings_path.exists():
+            return {}
+        try:
+            with self._settings_path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_settings(self, data: dict[str, Any]) -> None:
+        try:
+            with self._settings_path.open("w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    def on_open_settings(self) -> None:
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Settings")
+        dialog.geometry("500x300")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="System Instructions (Global Prompt):", font=("Avenir", 14, "bold")).pack(pady=(12, 6), padx=12, anchor=tk.W)
+
+        textbox = ctk.CTkTextbox(dialog, height=180, font=("Avenir", 13), fg_color="#1e1e1e", border_width=1, border_color="#333333")
+        textbox.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+        textbox.insert("1.0", self.system_instructions_var.get())
+
+        def save() -> None:
+            text = textbox.get("1.0", tk.END).strip()
+            self.system_instructions_var.set(text)
+            old_settings = self._load_settings()
+            old_settings["system_instructions"] = text
+            self._save_settings(old_settings)
+            dialog.destroy()
+            self._append_log("System", "System instructions updated. These apply to all following messages.")
+
+        ctk.CTkButton(dialog, text="SAVE", command=save, fg_color="#1f538d").pack(pady=(0, 12))
 
     def _toggle_pip(self) -> None:
         if self.pip_enabled.get():
@@ -595,6 +655,10 @@ class DesktopChatApp:
         self._refresh_sessions_list(self.active_session_id)
 
     def on_delete_chat(self) -> None:
+        from tkinter import messagebox
+        if not messagebox.askyesno("Delete Chat", "Are you sure you want to delete this conversation?", parent=self.root):
+            return
+            
         removed = self.sessions_store.delete_session(self.active_session_id)
         if not removed:
             return
@@ -1025,9 +1089,15 @@ class DesktopChatApp:
         memory_turns = self.sessions_store.recent_turns(session_id, max_items=10, max_chars=2600)
 
         context_blocks: list[dict[str, Any]] = []
+        
+        sys_instr = self.system_instructions_var.get().strip()
+        if sys_instr:
+            context_blocks.append({"type": "text", "text": f"System Instructions:\n{sys_instr}"})
+            
         if self.selected_pdf_paths:
             try:
-                context_blocks = self.pdf_context_engine.build_context(prompt, self.selected_pdf_paths)
+                blocks = self.pdf_context_engine.build_context(prompt, self.selected_pdf_paths)
+                context_blocks.extend(blocks)
             except ValueError as exc:
                 self._append_log("Error", str(exc))
                 return
