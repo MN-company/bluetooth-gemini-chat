@@ -290,7 +290,7 @@ def _ensure_wrapper(script_path: Path) -> Path:
     shot_wrapper = runtime_dir / "ask_gemini_ble_shot.sh"
     toggle_wrapper = runtime_dir / "toggle_gemini_ble.sh"
     helper_path = script_path.with_name("macos_quick_ask.py")
-    inbox_path = script_path.with_name("quick_inbox.jsonl")
+    inbox_path = runtime_dir / "quick_inbox.jsonl"
 
     _write_wrapper(default_wrapper, f'exec "{script_path}" "$@"')
     _write_wrapper(

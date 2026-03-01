@@ -2,7 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-INBOX_FILE="$SCRIPT_DIR/quick_inbox.jsonl"
+RUNTIME_DIR="$HOME/.gemini_ble"
+mkdir -p "$RUNTIME_DIR"
+INBOX_FILE="$RUNTIME_DIR/quick_inbox.jsonl"
 HELPER_PY="$SCRIPT_DIR/macos_quick_ask.py"
 MODE="quick_send"
 OVERLAY_PROMPT=""

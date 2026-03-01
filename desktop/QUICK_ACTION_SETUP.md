@@ -6,6 +6,8 @@ All'avvio, l'app desktop installa automaticamente la Quick Action di testo e cre
 - `~/.gemini_ble/ask_gemini_ble_shot.sh` -> trigger screenshot+ask overlay
 - `~/.gemini_ble/toggle_gemini_ble.sh` -> mostra/nasconde finestra chat
 
+Tutti gli eventi rapidi passano da `~/.gemini_ble/quick_inbox.jsonl` (runtime condiviso, indipendente dalla cartella progetto).
+
 ## Quick Action (tasto destro testo)
 
 1. Tieni aperta la chat desktop.

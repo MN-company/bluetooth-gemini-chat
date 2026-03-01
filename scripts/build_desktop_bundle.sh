@@ -22,6 +22,9 @@ python3 -m PyInstaller \
   --name "$APP_NAME" \
   --paths "$ROOT_DIR/desktop" \
   --collect-submodules bleak \
+  --add-data "$ROOT_DIR/desktop/install_macos_quick_action.py:." \
+  --add-data "$ROOT_DIR/desktop/macos_quick_ask.sh:." \
+  --add-data "$ROOT_DIR/desktop/macos_quick_ask.py:." \
   "$ROOT_DIR/desktop/app.py"
 
 if [ -d "$ROOT_DIR/dist/$APP_NAME.app" ]; then

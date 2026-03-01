@@ -32,7 +32,24 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r desktop/requirements.txt pyinstaller
 
-      - name: Build desktop app
+      - name: Build desktop app (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          python -m PyInstaller \
+            --noconfirm \
+            --clean \
+            --windowed \
+            --name BluetoothGeminiChat \
+            --paths desktop \
+            --collect-submodules bleak \
+            --add-data "desktop/install_macos_quick_action.py:." \
+            --add-data "desktop/macos_quick_ask.sh:." \
+            --add-data "desktop/macos_quick_ask.py:." \
+            desktop/app.py
+
+      - name: Build desktop app (Windows)
+        if: runner.os == 'Windows'
         shell: bash
         run: |
           python -m PyInstaller \

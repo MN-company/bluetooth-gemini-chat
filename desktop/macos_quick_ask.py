@@ -11,6 +11,7 @@ inbox = sys.argv[1]
 mode = (sys.argv[2] if len(sys.argv) > 2 else "quick_send").strip().lower()
 overlay_prompt = (sys.argv[3] if len(sys.argv) > 3 else "").strip()
 text = os.environ.get("GEMINI_INPUT_TEXT", "").strip()
+os.makedirs(os.path.dirname(inbox), exist_ok=True)
 
 if mode == "quick_send":
     if not text:
