@@ -15,6 +15,12 @@ if [ "${1:-}" = "--shot-ask" ] || [ "${1:-}" = "--overlay" ]; then
   if [ "$#" -gt 0 ]; then
     OVERLAY_PROMPT="$*"
   fi
+elif [ "${1:-}" = "--clip-ask" ] || [ "${1:-}" = "--clipboard-overlay" ]; then
+  MODE="quick_clipboard"
+  shift
+  if [ "$#" -gt 0 ]; then
+    OVERLAY_PROMPT="$*"
+  fi
 elif [ "${1:-}" = "--toggle" ]; then
   MODE="toggle_visibility"
   shift

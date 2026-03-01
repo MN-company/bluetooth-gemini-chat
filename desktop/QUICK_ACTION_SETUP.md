@@ -4,6 +4,7 @@ All'avvio, l'app desktop installa automaticamente la Quick Action di testo e cre
 
 - `~/.gemini_ble/ask_gemini_ble.sh` -> invia testo selezionato
 - `~/.gemini_ble/ask_gemini_ble_shot.sh` -> trigger screenshot+ask overlay
+- `~/.gemini_ble/ask_gemini_ble_clipboard.sh` -> trigger clipboard+ask overlay
 - `~/.gemini_ble/toggle_gemini_ble.sh` -> mostra/nasconde finestra chat
 
 Tutti gli eventi rapidi passano da `~/.gemini_ble/quick_inbox.jsonl` (runtime condiviso, indipendente dalla cartella progetto).
@@ -27,4 +28,10 @@ Opzionale: crea un secondo shortcut per toggle finestra con:
 
 ```zsh
 /Users/$USER/.gemini_ble/toggle_gemini_ble.sh
+```
+
+Opzionale: crea un altro shortcut per clipboard+ask overlay:
+
+```zsh
+/Users/$USER/.gemini_ble/ask_gemini_ble_clipboard.sh
 ```

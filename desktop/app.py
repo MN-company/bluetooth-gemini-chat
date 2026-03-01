@@ -93,6 +93,7 @@ class DesktopChatApp:
         self._overlay_started_at: dict[str, float] = {}
         self._overlay_last_update_at: dict[str, float] = {}
         self._overlay_timeout_seconds = 95.0
+        self._overlay_last_present_at = 0.0
         self._overlay_hide_after_id: str | None = None
         self._overlay_window: tk.Toplevel | None = None
         self._overlay_message_widget: tk.Message | None = None
@@ -296,6 +297,7 @@ class DesktopChatApp:
                 ("Disconnect", self.on_disconnect),
                 ("Clear Mem", self.on_clear_memory),
                 ("Shot+Ask", self.on_hotkey_overlay_triggered),
+                ("Clip+Ask", self.on_hotkey_clipboard_triggered),
             ],
             columns=2,
             pady=(8, 8),
@@ -929,6 +931,32 @@ class DesktopChatApp:
             except Exception:
                 pass
 
+    def _present_overlay_window(self, force: bool = False) -> None:
+        win = self._overlay_window
+        if win is None or not win.winfo_exists():
+            return
+        now = time.monotonic()
+        if not force and (now - self._overlay_last_present_at) < 0.7:
+            return
+        self._overlay_last_present_at = now
+        try:
+            win.deiconify()
+        except Exception:
+            pass
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        if self._is_macos:
+            try:
+                self.root.tk.call("::tk::unsupported::MacWindowStyle", "style", win._w, "floating", "none")
+            except Exception:
+                pass
+        try:
+            win.lift()
+        except Exception:
+            pass
+
     def _on_overlay_window_configure(self, event: tk.Event[Any]) -> None:
         if self._overlay_window is None or event.widget is not self._overlay_window:
             return
@@ -992,6 +1020,7 @@ class DesktopChatApp:
             self._apply_overlay_window_preferences()
 
         self._overlay_text_var.set(clean[:1800])
+        self._present_overlay_window(force=True)
         if self._overlay_hide_after_id is not None:
             self.root.after_cancel(self._overlay_hide_after_id)
             self._overlay_hide_after_id = None
@@ -1475,34 +1504,35 @@ class DesktopChatApp:
             return
         self._set_selected_image(path)
 
-    def on_hotkey_overlay_triggered(self, prompt_override: str | None = None) -> None:
+    def _send_overlay_request(
+        self,
+        prompt: str,
+        source: str,
+        status_text: str,
+        image_path: str | None = None,
+        fail_text: str = "Invio richiesta fallito",
+    ) -> bool:
         if not self.connected:
             self._show_overlay_message("Bridge non connesso", ttl_ms=3500)
-            return
+            if image_path:
+                try:
+                    Path(image_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return False
 
-        session_id = self._ensure_active_session("Shot+Ask")
-
-        path = self._capture_area_screenshot_path(log_errors=False)
-        if path is None:
-            self._show_overlay_message("Screenshot annullato", ttl_ms=2500)
-            return
-
+        session_id = self._ensure_active_session(source)
         selected_model = self.model_var.get().strip() if hasattr(self, "model_var") else MODEL_PRESETS[0]
         model_override = selected_model if selected_model and selected_model != MODEL_PRESETS[0] else None
         thinking_budget = self._get_thinking_budget()
         thinking_enabled = self.thinking_enabled.get()
         include_thoughts = thinking_enabled and self.show_thoughts_var.get()
 
-        prompt = (
-            prompt_override.strip()
-            if prompt_override and prompt_override.strip()
-            else "Analizza rapidamente questo screenshot. Rispondi in italiano con massimo 5 righe."
-        )
         try:
             request_id = self.client.send_prompt(
                 prompt,
                 model=model_override,
-                image_path=path,
+                image_path=image_path,
                 image_target_bytes=38 * 1024,
                 image_max_dimension=640,
                 enable_web_search=self.web_search_enabled.get(),
@@ -1511,20 +1541,113 @@ class DesktopChatApp:
                 include_thoughts=include_thoughts,
             )
         except Exception as exc:
-            self._show_overlay_message(f"Invio screenshot fallito: {exc}", ttl_ms=5000)
-            try:
-                Path(path).unlink(missing_ok=True)
-            except OSError:
-                pass
-            return
+            self._show_overlay_message(f"{fail_text}: {exc}", ttl_ms=5000)
+            if image_path:
+                try:
+                    Path(image_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return False
 
         self._overlay_request_ids.add(request_id)
         now = time.monotonic()
         self._overlay_started_at[request_id] = now
         self._overlay_last_update_at[request_id] = now
-        self._overlay_image_paths_by_request[request_id] = path
+        if image_path:
+            self._overlay_image_paths_by_request[request_id] = image_path
         self._pending_request_session[request_id] = session_id
-        self._show_overlay_message("Analisi screenshot in corso...", ttl_ms=0)
+        self._show_overlay_message(status_text, ttl_ms=0)
+        return True
+
+    def _capture_clipboard_image_path(self, log_errors: bool = True) -> str | None:
+        if ImageGrab is None:
+            if log_errors:
+                self._append_log("System", "Clipboard image unavailable: install Pillow")
+            return None
+
+        try:
+            image = ImageGrab.grabclipboard()  # type: ignore[union-attr]
+            if image is None or not hasattr(image, "save"):
+                return None
+            fd, path = tempfile.mkstemp(prefix="gemini-clip-", suffix=".png")
+            os.close(fd)
+            image.save(path, format="PNG")
+            return path
+        except Exception as exc:
+            if log_errors:
+                self._append_log("Error", f"Clipboard import failed: {exc}")
+            return None
+
+    def on_hotkey_overlay_triggered(self, prompt_override: str | None = None) -> None:
+        if not self.connected:
+            self._show_overlay_message("Bridge non connesso", ttl_ms=3500)
+            return
+
+        path = self._capture_area_screenshot_path(log_errors=False)
+        if path is None:
+            self._show_overlay_message("Screenshot annullato", ttl_ms=2500)
+            return
+
+        prompt = (
+            prompt_override.strip()
+            if prompt_override and prompt_override.strip()
+            else "Analizza rapidamente questo screenshot. Rispondi in italiano con massimo 5 righe."
+        )
+        self._send_overlay_request(
+            prompt=prompt,
+            source="Shot+Ask",
+            status_text="Analisi screenshot in corso...",
+            image_path=path,
+            fail_text="Invio screenshot fallito",
+        )
+
+    def on_hotkey_clipboard_triggered(self, prompt_override: str | None = None) -> None:
+        if not self.connected:
+            self._show_overlay_message("Bridge non connesso", ttl_ms=3500)
+            return
+
+        override = prompt_override.strip() if prompt_override else ""
+        clip_text = ""
+        try:
+            clip_text = self.root.clipboard_get().strip()
+        except tk.TclError:
+            clip_text = ""
+
+        if clip_text:
+            if override:
+                prompt = f"{override}\n\nClipboard:\n{clip_text}"
+            else:
+                prompt = (
+                    "Analizza rapidamente questo testo copiato negli appunti. "
+                    "Rispondi in italiano con massimo 5 righe.\n\n"
+                    f"{clip_text}"
+                )
+            self._send_overlay_request(
+                prompt=prompt,
+                source="Clip+Ask",
+                status_text="Analisi clipboard in corso...",
+                image_path=None,
+                fail_text="Invio clipboard fallito",
+            )
+            return
+
+        path = self._capture_clipboard_image_path(log_errors=False)
+        if path is None:
+            self._show_overlay_message("Clipboard vuota o formato non supportato", ttl_ms=3200)
+            return
+
+        prompt = (
+            override
+            if override
+            else "Analizza rapidamente questa immagine dagli appunti. Rispondi in italiano con massimo 5 righe."
+        )
+        self._send_overlay_request(
+            prompt=prompt,
+            source="Clip+Ask",
+            status_text="Analisi clipboard in corso...",
+            image_path=path,
+            fail_text="Invio clipboard fallito",
+        )
 
     def on_clipboard_send(self) -> None:
         text = ""
@@ -1539,24 +1662,14 @@ class DesktopChatApp:
             self.on_send()
             return
 
-        if ImageGrab is None:
+        path = self._capture_clipboard_image_path(log_errors=True)
+        if path is None:
             self._append_log("System", "Clipboard empty or unsupported format")
             return
-
-        try:
-            image = ImageGrab.grabclipboard()  # type: ignore[union-attr]
-            if image is None:
-                self._append_log("System", "Clipboard empty or unsupported format")
-                return
-            fd, path = tempfile.mkstemp(prefix="gemini-clip-", suffix=".png")
-            os.close(fd)
-            image.save(path, format="PNG")
-            self._set_selected_image(path)
-            self.prompt_entry.delete("1.0", tk.END)
-            self.prompt_entry.insert("1.0", "Descrivi questo screenshot.")
-            self.on_send()
-        except Exception as exc:
-            self._append_log("Error", f"Clipboard import failed: {exc}")
+        self._set_selected_image(path)
+        self.prompt_entry.delete("1.0", tk.END)
+        self.prompt_entry.insert("1.0", "Descrivi questo screenshot.")
+        self.on_send()
 
     def _auto_install_quick_action(self) -> None:
         if platform.system().lower() != "darwin":
@@ -1634,6 +1747,10 @@ class DesktopChatApp:
             if payload_type in {"quick_overlay", "quick_shot_ask", "hotkey_overlay"}:
                 prompt = str(payload.get("prompt", "")).strip()
                 self.events.put({"type": "quick_overlay", "prompt": prompt})
+                continue
+            if payload_type in {"quick_clipboard_overlay", "quick_clipboard", "quick_clip_ask"}:
+                prompt = str(payload.get("prompt", "")).strip()
+                self.events.put({"type": "quick_clipboard_overlay", "prompt": prompt})
                 continue
             if payload_type == "toggle_visibility":
                 self.events.put({"type": "toggle_visibility"})
@@ -1943,6 +2060,7 @@ class DesktopChatApp:
         self._consume_toggle_flag()
         self._consume_clipboard_flag()
         self._check_overlay_request_timeouts()
+        self._present_overlay_window()
 
         while True:
             try:
@@ -1970,6 +2088,10 @@ class DesktopChatApp:
 
         if event_type == "quick_overlay":
             self.on_hotkey_overlay_triggered(str(event.get("prompt", "")))
+            return
+
+        if event_type == "quick_clipboard_overlay":
+            self.on_hotkey_clipboard_triggered(str(event.get("prompt", "")))
             return
 
         if event_type == "status":

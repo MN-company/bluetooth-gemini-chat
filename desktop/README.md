@@ -27,6 +27,9 @@ python app.py
    - macOS: usa Apple Shortcuts + `~/.gemini_ble/ask_gemini_ble_shot.sh` (puoi assegnare `Cmd+Shift+G`)
    - Windows: `Ctrl+Shift+G` (hotkey globale integrata)
    Esegue screenshot area, invia direttamente a Gemini e mostra risposta in overlay semitrasparente.
+14. Overlay clipboard rapido (testo o immagine):
+   - macOS: Apple Shortcuts + `~/.gemini_ble/ask_gemini_ble_clipboard.sh`
+   Legge la clipboard locale e mostra la risposta in overlay.
 
 ## Dettagli
 

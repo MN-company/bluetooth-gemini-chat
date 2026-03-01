@@ -46,6 +46,7 @@ Nota: su macOS devi concedere `Screen Recording` per gli screenshot area.
 4. Scrivi prompt e `Send`.
 5. Overlay rapido:
    - macOS: Shortcut Apple con `~/.gemini_ble/ask_gemini_ble_shot.sh` (es. `Cmd+Shift+G`)
+   - macOS (clipboard): Shortcut Apple con `~/.gemini_ble/ask_gemini_ble_clipboard.sh`
    - Windows: `Ctrl+Shift+G` (hotkey globale integrata)
 
 ## Script utili
