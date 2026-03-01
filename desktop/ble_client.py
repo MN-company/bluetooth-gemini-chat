@@ -104,6 +104,7 @@ class BleChatClient:
         thinking_enabled: bool = False,
         thinking_budget: int | None = None,
         include_thoughts: bool = False,
+        active_container_id: str | None = None,
     ) -> str:
         request_id = str(uuid.uuid4())
         message = {
@@ -118,6 +119,8 @@ class BleChatClient:
             message["model"] = model.strip()
         if isinstance(thinking_budget, int):
             message["thinkingBudget"] = thinking_budget
+        if active_container_id is not None:
+            message["activeContainerId"] = active_container_id
 
         if context_blocks:
             message["contextBlocks"] = context_blocks
@@ -135,6 +138,29 @@ class BleChatClient:
             raise ValueError(
                 f"Request payload too large ({len(payload)} bytes). "
                 f"Reduce prompt/context/image (max {MAX_REQUEST_BYTES} bytes)."
+            )
+        self._run_coro(self._send_payload(payload, request_id))
+        return request_id
+
+    def send_container(self, container_dict: dict[str, Any]) -> str:
+        """Transfer a full container to Android. Returns request_id for ACK matching.
+        
+        Android responds with: {"type":"container_ack","containerId":"...","chunkCount":N}
+        """
+        request_id = str(uuid.uuid4())
+        message = {
+            "type": "load_container",
+            "messageId": request_id,
+            "containerId": container_dict["id"],
+            "containerName": container_dict["name"],
+            "chunks": container_dict["chunks"],
+        }
+        payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        MAX_CONTAINER_BYTES = 4 * 1024 * 1024  # 4MB — BLE framing handles splitting
+        if len(payload) > MAX_CONTAINER_BYTES:
+            raise ValueError(
+                f"Container too large for BLE transfer ({len(payload) // 1024}KB). "
+                f"Reduce the number of PDFs or split into multiple containers."
             )
         self._run_coro(self._send_payload(payload, request_id))
         return request_id

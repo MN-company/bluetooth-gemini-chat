@@ -33,6 +33,7 @@ data class PromptRequest(
     val imageName: String? = null,
     val contextBlocks: List<ContextBlockRequest> = emptyList(),
     val conversationMemory: List<MemoryTurnRequest> = emptyList(),
+    val activeContainerId: String? = null,
 )
 
 @Serializable
@@ -91,6 +92,14 @@ data class PongResponse(
     val messageId: String,
     val clientTsMs: Long? = null,
     val serverTsMs: Long = System.currentTimeMillis(),
+)
+
+@Serializable
+data class ContainerAckResponse(
+    val type: String = "container_ack",
+    val messageId: String,
+    val containerId: String,
+    val chunkCount: Int,
 )
 
 data class UiState(

@@ -23,6 +23,7 @@ class CTkinterDnD(ctk.CTk, TkinterDnD.DnDWrapper):
 
 from ble_client import BleChatClient
 from chat_sessions import ChatSessionsStore
+from context_store import ContextStore
 from pdf_context import PdfContextEngine
 
 try:
@@ -84,6 +85,9 @@ class DesktopChatApp:
         _saved = self._load_settings()
         self.system_instructions_var = tk.StringVar(value=_saved.get("system_instructions", ""))
         self.pinned_pdf_paths: list[str] = _saved.get("pinned_pdf_paths", [])
+
+        self._context_store = ContextStore(Path(__file__).parent)
+        self._active_container_id: str | None = None
 
         self._configure_theme()
         self._build_ui()
@@ -181,8 +185,36 @@ class DesktopChatApp:
             relief=tk.SOLID,
             highlightthickness=0,
         )
-        self.chats_list.pack(fill=tk.BOTH, expand=True, pady=(0, 16))
+        self.chats_list.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         self.chats_list.bind("<<ListboxSelect>>", self._on_session_selected)
+
+        # --- Knowledge Base Container Panel ---
+        kb_header = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        kb_header.pack(fill=tk.X, pady=(4, 2))
+        ctk.CTkLabel(kb_header, text="📚 libreria", font=("Avenir", 14)).pack(side=tk.LEFT)
+        ctk.CTkButton(kb_header, text="+", command=self._on_create_container, width=28, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0").pack(side=tk.RIGHT)
+
+        self.container_list = tk.Listbox(
+            self.sidebar_frame,
+            bg="#1c1c1c",
+            fg="#aaaaaa",
+            selectbackground="#2a5c2a",
+            activestyle=tk.NONE,
+            borderwidth=1,
+            relief=tk.SOLID,
+            highlightthickness=0,
+            height=4,
+        )
+        self.container_list.pack(fill=tk.X, pady=(0, 4))
+        self.container_list.bind("<<ListboxSelect>>", self._on_container_selected)
+        self.container_list.bind("<Double-Button-1>", lambda e: self._on_upload_container())
+
+        kb_btn_row = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        kb_btn_row.pack(fill=tk.X, pady=(0, 8))
+        ctk.CTkButton(kb_btn_row, text="📤 Carica", command=self._on_upload_container, width=80, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0").pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(kb_btn_row, text="PDF+", command=self._on_add_pdf_to_container, width=55, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0").pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(kb_btn_row, text="✕", command=self._on_delete_container, width=30, fg_color="transparent", border_width=1, hover_color="#5c1a1a", text_color="#e0e0e0").pack(side=tk.LEFT)
+        self._refresh_container_list()
         
         # Extra tool buttons collapsed at bottom of sidebar since sketch didn't strictly place them
         self._build_button_grid(
@@ -378,7 +410,108 @@ class DesktopChatApp:
 
         ctk.CTkButton(dialog, text="💾 SALVA", command=save, fg_color="#1f538d").pack(pady=(0, 14))
 
+    # ── Knowledge Base Container handlers ─────────────────────────────────────
+
+    def _refresh_container_list(self) -> None:
+        self.container_list.delete(0, tk.END)
+        for c in self._context_store.all():
+            label = c.name
+            if c.id == self._active_container_id:
+                label = f"✓ {c.name} ({c.total_chunks()} chunk)"
+            else:
+                label = f"  {c.name} ({c.total_chunks()} chunk)"
+            self.container_list.insert(tk.END, label)
+
+    def _selected_container_id(self) -> str | None:
+        idxs = self.container_list.curselection()
+        if not idxs:
+            return None
+        containers = self._context_store.all()
+        idx = idxs[0]
+        if idx >= len(containers):
+            return None
+        return containers[idx].id
+
+    def _on_create_container(self) -> None:
+        name = simpledialog.askstring("Nuovo Container", "Nome della libreria:", parent=self.root)
+        if not name or not name.strip():
+            return
+        c = self._context_store.create(name.strip())
+        self._append_log("System", f"Container creato: '{c.name}' (id: {c.id[:8]})")
+        self._refresh_container_list()
+
+    def _on_container_selected(self, _event=None) -> None:
+        cid = self._selected_container_id()
+        if cid is None:
+            return
+        if self._active_container_id == cid:
+            # Deselect on second click
+            self._active_container_id = None
+            self._append_log("System", "Container deselezionato — il contesto PDF è disattivato")
+        else:
+            self._active_container_id = cid
+            c = self._context_store.get(cid)
+            if c:
+                self._append_log("System", f"Container attivo: '{c.name}' ({c.total_chunks()} chunk) — sarà usato nelle prossime richieste")
+        self._refresh_container_list()
+
+    def _on_add_pdf_to_container(self) -> None:
+        cid = self._selected_container_id()
+        if cid is None:
+            self._append_log("System", "Seleziona prima un container dalla lista 📚")
+            return
+        paths = filedialog.askopenfilenames(
+            parent=self.root, title="Aggiungi PDF al container",
+            filetypes=[("PDF", "*.pdf"), ("All Files", "*")],
+        )
+        if not paths:
+            return
+        c = self._context_store.get(cid)
+        for p in paths:
+            try:
+                n = self._context_store.add_pdf(cid, p)
+                self._append_log("System", f"PDF aggiunto: {Path(p).name} → {n} chunk estratti")
+            except ValueError as exc:
+                self._append_log("Error", str(exc))
+        self._refresh_container_list()
+
+    def _on_delete_container(self) -> None:
+        from tkinter import messagebox
+        cid = self._selected_container_id()
+        if cid is None:
+            return
+        c = self._context_store.get(cid)
+        if not messagebox.askyesno("Elimina Container", f"Eliminare '{c.name if c else cid}'?", parent=self.root):
+            return
+        self._context_store.delete(cid)
+        if self._active_container_id == cid:
+            self._active_container_id = None
+        self._refresh_container_list()
+        self._append_log("System", "Container eliminato")
+
+    def _on_upload_container(self) -> None:
+        cid = self._selected_container_id()
+        if cid is None:
+            self._append_log("System", "Seleziona un container da caricare sul telefono")
+            return
+        if not self.connected:
+            self._append_log("System", "Non connesso — connetti il bridge Android prima di caricare")
+            return
+        c = self._context_store.get(cid)
+        if c is None or c.total_chunks() == 0:
+            self._append_log("System", "Container vuoto — aggiungi prima dei PDF")
+            return
+        try:
+            container_dict = self._context_store.export_for_transfer(cid)
+            size_kb = len(str(container_dict)) // 1024
+            self._append_log("System", f"Avvio trasferimento container '{c.name}' (~{size_kb}KB, {c.total_chunks()} chunk)...")
+            request_id = self.client.send_container(container_dict)
+            self._append_log("System", f"Container inviato (id: {request_id[:8]}). In attesa di conferma dal telefono...")
+        except ValueError as exc:
+            self._append_log("Error", str(exc))
+
     def _toggle_pip(self) -> None:
+
         if self.pip_enabled.get():
             self._pip_mode_active = True
             self._pre_pip_geometry = self.root.geometry()
@@ -1137,25 +1270,32 @@ class DesktopChatApp:
         session_id = self.active_session_id
         memory_turns = self.sessions_store.recent_turns(session_id, max_items=10, max_chars=2600)
 
-        context_blocks: list[dict[str, Any]] = []
-        
-        sys_instr = self.system_instructions_var.get().strip()
-        if sys_instr:
-            context_blocks.append({"type": "text", "text": f"System Instructions:\n{sys_instr}"})
-        
-        # --- Pinned PDFs (always attached) ---  
-        all_pdf_paths = list(self.pinned_pdf_paths)
-        for p in self.selected_pdf_paths:
-            if p not in all_pdf_paths:
-                all_pdf_paths.append(p)
-            
-        if all_pdf_paths:
-            try:
-                blocks = self.pdf_context_engine.build_context(prompt, all_pdf_paths)
-                context_blocks.extend(blocks)
-            except ValueError as exc:
-                self._append_log("Error", str(exc))
-                return
+        # --- Active container takes priority over per-session PDFs ---
+        use_container = self._active_container_id is not None
+
+        if not use_container:
+            # Legacy: system instructions + pinned PDFs + session PDFs
+            sys_instr = self.system_instructions_var.get().strip()
+            if sys_instr:
+                context_blocks.append({"type": "text", "text": f"System Instructions:\n{sys_instr}"})
+
+            all_pdf_paths = list(self.pinned_pdf_paths)
+            for p in self.selected_pdf_paths:
+                if p not in all_pdf_paths:
+                    all_pdf_paths.append(p)
+
+            if all_pdf_paths:
+                try:
+                    blocks = self.pdf_context_engine.build_context(prompt, all_pdf_paths)
+                    context_blocks.extend(blocks)
+                except ValueError as exc:
+                    self._append_log("Error", str(exc))
+                    return
+        else:
+            # Container mode: inject system instructions only; Android does retrieval
+            sys_instr = self.system_instructions_var.get().strip()
+            if sys_instr:
+                context_blocks.append({"type": "text", "text": f"System Instructions:\n{sys_instr}"})
 
         est_total, est_text, est_image = self._estimate_input_tokens(prompt, memory_turns, context_blocks)
         if est_image > 0:
@@ -1189,6 +1329,7 @@ class DesktopChatApp:
                 thinking_enabled=thinking_enabled,
                 thinking_budget=thinking_budget,
                 include_thoughts=include_thoughts,
+                active_container_id=self._active_container_id,
             )
         except ValueError as exc:
             self._append_log("Error", str(exc))

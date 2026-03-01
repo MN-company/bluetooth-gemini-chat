@@ -52,6 +52,7 @@ class GeminiApiClient(
         imageMimeType: String? = null,
         contextBlocks: List<ContextBlockRequest> = emptyList(),
         conversationMemory: List<MemoryTurnRequest> = emptyList(),
+        activeContainerId: String? = null,
         onPartialText: ((String) -> Unit)? = null,
         onPartialThought: ((String) -> Unit)? = null,
     ): GeminiGenerationResult = withContext(Dispatchers.IO) {
@@ -74,9 +75,23 @@ class GeminiApiClient(
         val cleanedImageBase64 = imageBase64?.trim()?.takeIf { it.isNotEmpty() }
         val cleanedImageMimeType = imageMimeType?.trim()?.takeIf { it.isNotEmpty() }
 
+        // On-device BM25 retrieval from active container
+        val effectiveContextBlocks: List<ContextBlockRequest> = if (!activeContainerId.isNullOrBlank()) {
+            val container = BridgeRuntimeState.containers[activeContainerId]
+            if (container != null && container.chunks.isNotEmpty()) {
+                val retrieved = retrieveTopChunks(query = prompt, container = container, topK = 20)
+                // Merge retrieved with any explicit contextBlocks (e.g. system instructions)
+                contextBlocks + retrieved
+            } else {
+                contextBlocks
+            }
+        } else {
+            contextBlocks
+        }
+
         val contextualPrompt = buildContextualPrompt(
             userPrompt = prompt,
-            contextBlocks = contextBlocks,
+            contextBlocks = effectiveContextBlocks,
             conversationMemory = conversationMemory,
             webSearchEnabled = enableWebSearch,
         )
@@ -686,7 +701,49 @@ class GeminiApiClient(
         }
     }
 
+    /**
+     * On-device BM25-style retrieval: scores all chunks in the container against
+     * the user's query and returns the top [topK] most relevant as ContextBlockRequest.
+     */
+    private fun retrieveTopChunks(
+        query: String,
+        container: StoredContainer,
+        topK: Int = 20,
+    ): List<ContextBlockRequest> {
+        val queryTerms = tokenize(query)
+        val queryLower = query.lowercase()
+        if (queryTerms.isEmpty()) {
+            // No scorable terms → return first topK chunks as fallback
+            return container.chunks.take(topK).map {
+                ContextBlockRequest(source = it.source, page = it.page, text = it.text)
+            }
+        }
+        data class Scored(val score: Double, val chunk: StoredChunk)
+        val scored = container.chunks.mapNotNull { chunk ->
+            val chunkTermSet = chunk.terms.toHashSet()
+            val overlap = queryTerms.count { it in chunkTermSet }.toDouble()
+            if (overlap == 0.0) return@mapNotNull null
+            val phraseBonus = if (chunk.text.lowercase().contains(queryLower)) 4.0 else 0.0
+            Scored(score = overlap + phraseBonus, chunk = chunk)
+        }
+        return scored
+            .sortedByDescending { it.score }
+            .take(topK)
+            .map { ContextBlockRequest(source = it.chunk.source, page = it.chunk.page, text = it.chunk.text) }
+    }
+
+    private fun tokenize(text: String): Set<String> {
+        val result = mutableSetOf<String>()
+        val tokenRegex = Regex("[A-Za-z0-9_\\u00C0-\\u024F]{2,}")
+        tokenRegex.findAll(text.lowercase()).forEach { match ->
+            val token = match.value
+            if (token.length >= 3) result.add(token)
+        }
+        return result
+    }
+
     private data class CandidateParts(
+
         val answer: String = "",
         val thought: String = "",
     )

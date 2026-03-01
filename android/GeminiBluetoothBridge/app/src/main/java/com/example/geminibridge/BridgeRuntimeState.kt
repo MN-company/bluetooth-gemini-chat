@@ -4,6 +4,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import java.util.concurrent.ConcurrentHashMap
 
 object BridgeRuntimeState {
     private const val maxLogs = 300
@@ -16,6 +17,31 @@ object BridgeRuntimeState {
 
     private val _serviceRunning = MutableStateFlow(false)
     val serviceRunning: StateFlow<Boolean> = _serviceRunning.asStateFlow()
+
+    // ── Knowledge Base Containers ────────────────────────────────────────────
+    /** In-memory cache of all loaded containers (id → container). */
+    val containers: ConcurrentHashMap<String, StoredContainer> = ConcurrentHashMap()
+
+    /** The ID of the container currently active for retrieval (null = disabled). */
+    @Volatile
+    var activeContainerId: String? = null
+
+    fun addOrUpdateContainer(container: StoredContainer) {
+        containers[container.id] = container
+    }
+
+    fun removeContainer(containerId: String) {
+        containers.remove(containerId)
+        if (activeContainerId == containerId) {
+            activeContainerId = null
+        }
+    }
+
+    fun getActiveContainer(): StoredContainer? {
+        val id = activeContainerId ?: return null
+        return containers[id]
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     fun setBridgeStatus(value: String) {
         _bridgeStatus.value = value

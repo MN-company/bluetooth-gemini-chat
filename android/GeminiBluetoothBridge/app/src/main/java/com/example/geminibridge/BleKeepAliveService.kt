@@ -35,6 +35,7 @@ class BleKeepAliveService : Service() {
     private var watchdogJob: Job? = null
     private var restartJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private lateinit var containerStore: ContainerStore
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -50,6 +51,14 @@ class BleKeepAliveService : Service() {
         BridgeRuntimeState.setServiceRunning(true)
         appendLog("Foreground BLE service created")
         updateBridgeStatus("Starting BLE bridge...")
+
+        // Load persisted containers from disk into memory
+        containerStore = ContainerStore(applicationContext)
+        val loaded = containerStore.loadAll()
+        loaded.values.forEach { BridgeRuntimeState.addOrUpdateContainer(it) }
+        if (loaded.isNotEmpty()) {
+            appendLog("Loaded ${loaded.size} container(s) from disk")
+        }
 
         startBridgeIfNeeded()
         startWatchdog()
@@ -191,6 +200,7 @@ class BleKeepAliveService : Service() {
         when (envelope.type) {
             "prompt" -> handlePromptRequest(rawJson)
             "ping" -> handlePing(rawJson)
+            "load_container" -> handleLoadContainer(rawJson)
             else -> {
                 val messageId = envelope.messageId.ifBlank { "unknown" }
                 sendError(messageId, "Unsupported request type: ${envelope.type}")
@@ -205,6 +215,45 @@ class BleKeepAliveService : Service() {
             return
         }
         sendPong(messageId = ping.messageId, clientTsMs = ping.clientTsMs)
+    }
+
+    private suspend fun handleLoadContainer(rawJson: String) {
+        val root = try {
+            kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+                .parseToJsonElement(rawJson)
+                .jsonObject
+        } catch (t: Throwable) {
+            appendLog("load_container parse error: ${t.message}")
+            return
+        }
+        val messageId = root["messageId"]?.jsonPrimitive?.contentOrNull ?: "unknown"
+        val containerId = root["containerId"]?.jsonPrimitive?.contentOrNull
+        val containerName = root["containerName"]?.jsonPrimitive?.contentOrNull
+        if (containerId.isNullOrBlank() || containerName.isNullOrBlank()) {
+            sendError(messageId, "load_container: missing containerId or containerName")
+            return
+        }
+        val chunksArray = root["chunks"]?.jsonArray ?: run {
+            sendError(messageId, "load_container: missing chunks")
+            return
+        }
+        val chunks = chunksArray.mapNotNull { element ->
+            val obj = element.jsonObject
+            val source = obj["source"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+            val page = obj["page"]?.jsonPrimitive?.intOrNull ?: 0
+            val text = obj["text"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+            val terms = obj["terms"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
+            StoredChunk(source = source, page = page, text = text, terms = terms)
+        }
+        val container = StoredContainer(id = containerId, name = containerName, chunks = chunks)
+        BridgeRuntimeState.addOrUpdateContainer(container)
+        containerStore.save(container)
+        appendLog("load_container: saved '${container.name}' (${chunks.size} chunks)")
+        // ACK back to Mac
+        val ackPayload = json.encodeToString(
+            ContainerAckResponse(containerId = containerId, chunkCount = chunks.size, messageId = messageId)
+        )
+        sendToPc(ackPayload, "container_ack", messageId)
     }
 
     private suspend fun handlePromptRequest(rawJson: String) {
@@ -339,6 +388,7 @@ class BleKeepAliveService : Service() {
                 imageMimeType = request.imageMimeType?.takeIf { it.isNotBlank() },
                 contextBlocks = sanitizedContextBlocks,
                 conversationMemory = sanitizedMemoryTurns,
+                activeContainerId = request.activeContainerId?.takeIf { it.isNotBlank() },
                 onPartialText = { partial ->
                     val now = System.currentTimeMillis()
                     val longEnough = partial.length >= (lastPartialLength + 12)
