@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import java.net.SocketTimeoutException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeoutException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -33,6 +34,7 @@ import kotlinx.serialization.json.jsonPrimitive
 class BleKeepAliveService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+    private val requestRouteByMessageId = ConcurrentHashMap<String, String>()
 
     private lateinit var settingsRepository: SettingsRepository
     private lateinit var geminiApiClient: GeminiApiClient
@@ -129,7 +131,7 @@ class BleKeepAliveService : Service() {
         val manager = BleServerManager(
             context = applicationContext,
             scope = serviceScope,
-            onPromptJson = { handleIncomingJson(it) },
+            onPromptJson = { rawJson, sourceAddress -> handleIncomingJson(rawJson, sourceAddress) },
             onLog = { appendLog(it) },
             onBridgeStatus = { status -> updateBridgeStatus(status) },
         )
@@ -195,35 +197,38 @@ class BleKeepAliveService : Service() {
         }
     }
 
-    private suspend fun handleIncomingJson(rawJson: String) {
+    private suspend fun handleIncomingJson(rawJson: String, sourceAddress: String) {
         val envelope = try {
             json.decodeFromString<IncomingEnvelope>(rawJson)
         } catch (t: Throwable) {
             appendLog("Invalid request payload: ${t.message}")
             return
         }
+        if (envelope.messageId.isNotBlank()) {
+            requestRouteByMessageId[envelope.messageId] = sourceAddress
+        }
 
         when (envelope.type) {
-            "prompt" -> handlePromptRequest(rawJson)
-            "ping" -> handlePing(rawJson)
-            "load_container" -> handleLoadContainer(rawJson)
+            "prompt" -> handlePromptRequest(rawJson, sourceAddress)
+            "ping" -> handlePing(rawJson, sourceAddress)
+            "load_container" -> handleLoadContainer(rawJson, sourceAddress)
             else -> {
                 val messageId = envelope.messageId.ifBlank { "unknown" }
-                sendError(messageId, "Unsupported request type: ${envelope.type}")
+                sendError(messageId, "Unsupported request type: ${envelope.type}", sourceAddress)
             }
         }
     }
 
-    private suspend fun handlePing(rawJson: String) {
+    private suspend fun handlePing(rawJson: String, sourceAddress: String) {
         val ping = try {
             json.decodeFromString<PingRequest>(rawJson)
         } catch (_: Throwable) {
             return
         }
-        sendPong(messageId = ping.messageId, clientTsMs = ping.clientTsMs)
+        sendPong(messageId = ping.messageId, clientTsMs = ping.clientTsMs, targetAddress = sourceAddress)
     }
 
-    private suspend fun handleLoadContainer(rawJson: String) {
+    private suspend fun handleLoadContainer(rawJson: String, sourceAddress: String) {
         val root: JsonObject = try {
             json.parseToJsonElement(rawJson).jsonObject
         } catch (t: Throwable) {
@@ -234,11 +239,11 @@ class BleKeepAliveService : Service() {
         val containerId = root["containerId"]?.jsonPrimitive?.contentOrNull
         val containerName = root["containerName"]?.jsonPrimitive?.contentOrNull
         if (containerId.isNullOrBlank() || containerName.isNullOrBlank()) {
-            sendError(messageId, "load_container: missing containerId or containerName")
+            sendError(messageId, "load_container: missing containerId or containerName", sourceAddress)
             return
         }
         val chunksArray = root["chunks"]?.jsonArray ?: run {
-            sendError(messageId, "load_container: missing chunks")
+            sendError(messageId, "load_container: missing chunks", sourceAddress)
             return
         }
         val chunks = chunksArray.mapNotNull { element ->
@@ -265,41 +270,42 @@ class BleKeepAliveService : Service() {
         val ackPayload = json.encodeToString(
             ContainerAckResponse(containerId = containerId, chunkCount = chunks.size, messageId = messageId)
         )
-        sendToPc(ackPayload, "container_ack", messageId)
+        sendToPc(ackPayload, "container_ack", messageId, sourceAddress)
     }
 
-    private suspend fun handlePromptRequest(rawJson: String) {
+    private suspend fun handlePromptRequest(rawJson: String, sourceAddress: String) {
         val request = try {
             json.decodeFromString<PromptRequest>(rawJson)
         } catch (t: Throwable) {
             appendLog("Invalid prompt payload: ${t.message}")
             return
         }
+        requestRouteByMessageId[request.messageId] = sourceAddress
 
         if (request.type != "prompt") {
-            sendError(request.messageId, "Unsupported request type: ${request.type}")
+            sendError(request.messageId, "Unsupported request type: ${request.type}", sourceAddress)
             return
         }
 
         if (request.prompt.isBlank()) {
-            sendError(request.messageId, "Prompt is empty")
+            sendError(request.messageId, "Prompt is empty", sourceAddress)
             return
         }
 
         val hasImageData = !request.imageBase64.isNullOrBlank()
         val hasImageMime = !request.imageMimeType.isNullOrBlank()
         if (hasImageData != hasImageMime) {
-            sendError(request.messageId, "Invalid image payload: missing mime type or image data")
+            sendError(request.messageId, "Invalid image payload: missing mime type or image data", sourceAddress)
             return
         }
 
         if (hasImageData && request.imageBase64!!.length > 1_200_000) {
-            sendError(request.messageId, "Image payload too large for BLE bridge")
+            sendError(request.messageId, "Image payload too large for BLE bridge", sourceAddress)
             return
         }
 
         if (request.contextBlocks.size > 12) {
-            sendError(request.messageId, "Too many context blocks")
+            sendError(request.messageId, "Too many context blocks", sourceAddress)
             return
         }
 
@@ -313,7 +319,7 @@ class BleKeepAliveService : Service() {
         }
 
         if (request.conversationMemory.size > 24) {
-            sendError(request.messageId, "Too many memory turns")
+            sendError(request.messageId, "Too many memory turns", sourceAddress)
             return
         }
 
@@ -372,13 +378,13 @@ class BleKeepAliveService : Service() {
 
         appendLog("Prompt received (${request.messageId})$imageInfo$contextInfo$memoryInfo$webInfo$modelInfo$thinkingInfo")
         val startedMs = System.currentTimeMillis()
-        sendStatus(request.messageId, "processing (0s)")
+        sendStatus(request.messageId, "processing (0s)", sourceAddress)
         val progressJob = serviceScope.launch {
             var elapsedSec = 5
             while (isActive) {
                 delay(5_000L)
                 runCatching {
-                    sendStatus(request.messageId, "processing (${elapsedSec}s)")
+                    sendStatus(request.messageId, "processing (${elapsedSec}s)", sourceAddress)
                 }
                 elapsedSec += 5
             }
@@ -410,7 +416,7 @@ class BleKeepAliveService : Service() {
                         lastAnswerPartialSentMs = now
                         serviceScope.launch {
                             runCatching {
-                                sendPartial(request.messageId, partial, channel = "answer")
+                                sendPartial(request.messageId, partial, channel = "answer", targetAddress = sourceAddress)
                             }
                         }
                     }
@@ -425,7 +431,12 @@ class BleKeepAliveService : Service() {
                             lastThoughtPartialSentMs = now
                             serviceScope.launch {
                                 runCatching {
-                                    sendPartial(request.messageId, partialThought, channel = "thought")
+                                    sendPartial(
+                                        request.messageId,
+                                        partialThought,
+                                        channel = "thought",
+                                        targetAddress = sourceAddress,
+                                    )
                                 }
                             }
                         }
@@ -438,7 +449,8 @@ class BleKeepAliveService : Service() {
                     messageId = request.messageId,
                     text = response.text,
                     thought = response.thought.takeIf { includeThoughts && it.isNotBlank() },
-                )
+                ),
+                sourceAddress,
             )
             val elapsed = ((System.currentTimeMillis() - startedMs) / 1000L).coerceAtLeast(0)
             appendLog("Response sent (${request.messageId}) in ${elapsed}s")
@@ -454,7 +466,7 @@ class BleKeepAliveService : Service() {
                 t.message ?: "Unknown Gemini error"
             }
             runCatching {
-                sendError(request.messageId, errorText)
+                sendError(request.messageId, errorText, sourceAddress)
             }.onFailure { sendFailure ->
                 appendLog("Failed to send error to PC (${request.messageId}): ${sendFailure.message}")
             }
@@ -462,17 +474,22 @@ class BleKeepAliveService : Service() {
         }
     }
 
-    private suspend fun sendStatus(messageId: String, state: String) {
+    private suspend fun sendStatus(messageId: String, state: String, targetAddress: String? = null) {
         val payload = json.encodeToString(StatusResponse(messageId = messageId, state = state))
-        sendToPc(payload, "status", messageId)
+        sendToPc(payload, "status", messageId, targetAddress)
     }
 
-    private suspend fun sendResult(response: ResultResponse) {
+    private suspend fun sendResult(response: ResultResponse, targetAddress: String? = null) {
         val payload = json.encodeToString(response)
-        sendToPc(payload, "result", response.messageId)
+        sendToPc(payload, "result", response.messageId, targetAddress)
     }
 
-    private suspend fun sendPartial(messageId: String, text: String, channel: String) {
+    private suspend fun sendPartial(
+        messageId: String,
+        text: String,
+        channel: String,
+        targetAddress: String? = null,
+    ) {
         val safeChannel = if (channel == "thought") "thought" else "answer"
         val payload = json.encodeToString(
             PartialResponse(
@@ -481,20 +498,25 @@ class BleKeepAliveService : Service() {
                 channel = safeChannel,
             )
         )
-        sendToPc(payload, "partial", messageId)
+        sendToPc(payload, "partial", messageId, targetAddress)
     }
 
-    private suspend fun sendError(messageId: String, error: String) {
+    private suspend fun sendError(messageId: String, error: String, targetAddress: String? = null) {
         val payload = json.encodeToString(ErrorResponse(messageId = messageId, error = error))
-        sendToPc(payload, "error", messageId)
+        sendToPc(payload, "error", messageId, targetAddress)
     }
 
-    private suspend fun sendPong(messageId: String, clientTsMs: Long?) {
+    private suspend fun sendPong(messageId: String, clientTsMs: Long?, targetAddress: String? = null) {
         val payload = json.encodeToString(PongResponse(messageId = messageId, clientTsMs = clientTsMs))
-        sendToPc(payload, "pong", messageId)
+        sendToPc(payload, "pong", messageId, targetAddress)
     }
 
-    private suspend fun sendToPc(payload: String, type: String, messageId: String) {
+    private suspend fun sendToPc(
+        payload: String,
+        type: String,
+        messageId: String,
+        targetAddress: String? = null,
+    ) {
         val manager = bleServerManager
         if (manager == null) {
             appendLog("BLE send skipped ($type $messageId): bridge not ready")
@@ -502,9 +524,16 @@ class BleKeepAliveService : Service() {
         }
 
         try {
-            manager.sendJson(payload)
+            val resolvedAddress = targetAddress ?: requestRouteByMessageId[messageId]
+            manager.sendJson(payload, resolvedAddress)
+            if (type == "result" || type == "error" || type == "pong") {
+                requestRouteByMessageId.remove(messageId)
+            }
         } catch (t: Throwable) {
             appendLog("BLE send failed ($type $messageId): ${t.message}")
+            if (type == "result" || type == "error" || type == "pong") {
+                requestRouteByMessageId.remove(messageId)
+            }
             throw t
         }
     }

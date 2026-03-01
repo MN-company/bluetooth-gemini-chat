@@ -286,15 +286,24 @@ def install(verbose: bool = False) -> Path:
 def _ensure_wrapper(script_path: Path) -> Path:
     runtime_dir = Path.home() / ".gemini_ble"
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    wrapper = runtime_dir / "ask_gemini_ble.sh"
+    default_wrapper = runtime_dir / "ask_gemini_ble.sh"
+    shot_wrapper = runtime_dir / "ask_gemini_ble_shot.sh"
+    toggle_wrapper = runtime_dir / "toggle_gemini_ble.sh"
+
+    _write_wrapper(default_wrapper, f'exec "{script_path}" "$@"')
+    _write_wrapper(shot_wrapper, f'exec "{script_path}" --shot-ask "$@"')
+    _write_wrapper(toggle_wrapper, f'exec "{script_path}" --toggle "$@"')
+    return default_wrapper
+
+
+def _write_wrapper(target_path: Path, command: str) -> None:
     content = (
         "#!/bin/zsh\n"
         "set -euo pipefail\n"
-        f'exec "{script_path}" "$@"\n'
+        f"{command}\n"
     )
-    wrapper.write_text(content, encoding="utf-8")
-    os.chmod(wrapper, 0o755)
-    return wrapper
+    target_path.write_text(content, encoding="utf-8")
+    os.chmod(target_path, 0o755)
 
 
 def main() -> int:

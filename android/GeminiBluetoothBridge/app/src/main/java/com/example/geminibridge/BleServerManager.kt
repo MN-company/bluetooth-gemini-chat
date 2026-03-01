@@ -19,6 +19,7 @@ import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
 import android.os.Build
 import android.os.ParcelUuid
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -27,7 +28,7 @@ import kotlinx.coroutines.launch
 class BleServerManager(
     context: Context,
     private val scope: CoroutineScope,
-    private val onPromptJson: suspend (String) -> Unit,
+    private val onPromptJson: suspend (String, String) -> Unit,
     private val onLog: (String) -> Unit,
     private val onBridgeStatus: (String) -> Unit,
 ) {
@@ -36,17 +37,18 @@ class BleServerManager(
         appContext.getSystemService(BluetoothManager::class.java)
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
 
-    private val frameAssembler = BleFrameAssembler()
+    private val frameAssemblersByDevice = ConcurrentHashMap<String, BleFrameAssembler>()
     private val transportIds = TransportIdGenerator()
 
-    private val mtuByDevice = mutableMapOf<String, Int>()
+    private val mtuByDevice = ConcurrentHashMap<String, Int>()
+    private val connectedDevices = ConcurrentHashMap<String, BluetoothDevice>()
 
     private var gattServer: BluetoothGattServer? = null
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
     private var advertiseCallback: AdvertiseCallback? = null
 
     @Volatile
-    private var connectedDevice: BluetoothDevice? = null
+    private var lastActiveDeviceAddress: String? = null
 
     @Volatile
     private var advertisingActive: Boolean = false
@@ -55,18 +57,23 @@ class BleServerManager(
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    connectedDevice = device
+                    connectedDevices[device.address] = device
+                    lastActiveDeviceAddress = device.address
                     onLog("BLE connected: ${device.address}")
-                    onBridgeStatus("Connected to desktop (${device.address})")
+                    onBridgeStatus("Connected clients: ${connectedDevices.size}")
                 }
 
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    if (connectedDevice?.address == device.address) {
-                        connectedDevice = null
+                    connectedDevices.remove(device.address)
+                    if (lastActiveDeviceAddress == device.address) {
+                        lastActiveDeviceAddress = connectedDevices.keys.firstOrNull()
                     }
                     mtuByDevice.remove(device.address)
+                    frameAssemblersByDevice.remove(device.address)
                     onLog("BLE disconnected: ${device.address}")
-                    if (advertisingActive) {
+                    if (connectedDevices.isNotEmpty()) {
+                        onBridgeStatus("Connected clients: ${connectedDevices.size}")
+                    } else if (advertisingActive) {
                         onBridgeStatus("Advertising BLE bridge")
                     } else {
                         onBridgeStatus("BLE idle, waiting for advertising restart")
@@ -117,9 +124,16 @@ class BleServerManager(
                     if (frame == null) {
                         onLog("Received invalid BLE frame")
                     } else {
-                        val payload = frameAssembler.addFrame(frame)
+                        val assembler = frameAssemblersByDevice.getOrPut(device.address) { BleFrameAssembler() }
+                        val payload = assembler.addFrame(frame)
                         if (payload != null) {
-                            val json = if (payload.size >= 3 && payload[0] == 'g'.code.toByte() && payload[1] == 'z'.code.toByte() && payload[2] == 1.toByte()) {
+                            lastActiveDeviceAddress = device.address
+                            val json = if (
+                                payload.size >= 3 &&
+                                payload[0] == 'g'.code.toByte() &&
+                                payload[1] == 'z'.code.toByte() &&
+                                payload[2] == 1.toByte()
+                            ) {
                                 onLog("Decompressing payload (${payload.size} bytes)")
                                 try {
                                     java.util.zip.GZIPInputStream(java.io.ByteArrayInputStream(payload, 3, payload.size - 3)).bufferedReader(Charsets.UTF_8).use { it.readText() }
@@ -132,9 +146,9 @@ class BleServerManager(
                             }
 
                             if (json.isNotEmpty()) {
-                                onLog("Received request JSON (${json.length} chars)")
+                                onLog("Received request JSON (${json.length} chars) from ${device.address}")
                                 scope.launch {
-                                    onPromptJson(json)
+                                    onPromptJson(json, device.address)
                                 }
                             }
                         }
@@ -198,17 +212,19 @@ class BleServerManager(
         gattServer?.close()
         gattServer = null
         notifyCharacteristic = null
-        connectedDevice = null
+        lastActiveDeviceAddress = null
+        connectedDevices.clear()
         mtuByDevice.clear()
+        frameAssemblersByDevice.clear()
         onBridgeStatus("BLE bridge stopped")
     }
 
     fun isOperational(): Boolean {
-        return gattServer != null && (advertisingActive || connectedDevice != null)
+        return gattServer != null && (advertisingActive || connectedDevices.isNotEmpty())
     }
 
     fun ensureAdvertising(): Result<Unit> {
-        if (connectedDevice != null) return Result.success(Unit)
+        if (connectedDevices.isNotEmpty()) return Result.success(Unit)
         if (advertisingActive) return Result.success(Unit)
 
         val adapter = bluetoothAdapter ?: return Result.failure(
@@ -233,9 +249,13 @@ class BleServerManager(
         return startAdvertisingInternal(advertiser)
     }
 
-    suspend fun sendJson(jsonMessage: String) {
-        val device = connectedDevice
-            ?: throw IllegalStateException("No connected BLE central device")
+    suspend fun sendJson(jsonMessage: String, targetAddress: String? = null) {
+        val device = if (!targetAddress.isNullOrBlank()) {
+            connectedDevices[targetAddress]
+        } else {
+            val active = lastActiveDeviceAddress?.let { connectedDevices[it] }
+            active ?: connectedDevices.values.firstOrNull()
+        } ?: throw IllegalStateException("No connected BLE central device")
 
         val mtu = mtuByDevice[device.address] ?: BleConstants.defaultAttMtu
         val mtuPayloadMax = maxOf(BleConstants.defaultMaxPacketSize, mtu - 3)
