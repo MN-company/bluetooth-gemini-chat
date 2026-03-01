@@ -23,6 +23,12 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 class BleKeepAliveService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -218,10 +224,8 @@ class BleKeepAliveService : Service() {
     }
 
     private suspend fun handleLoadContainer(rawJson: String) {
-        val root = try {
-            kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
-                .parseToJsonElement(rawJson)
-                .jsonObject
+        val root: JsonObject = try {
+            json.parseToJsonElement(rawJson).jsonObject
         } catch (t: Throwable) {
             appendLog("load_container parse error: ${t.message}")
             return
@@ -242,14 +246,15 @@ class BleKeepAliveService : Service() {
             val source = obj["source"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
             val page = obj["page"]?.jsonPrimitive?.intOrNull ?: 0
             val text = obj["text"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
-            val terms = obj["terms"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
+            val terms: List<String> = obj["terms"]?.jsonArray
+                ?.mapNotNull { it.jsonPrimitive.contentOrNull }
+                ?: emptyList()
             StoredChunk(source = source, page = page, text = text, terms = terms)
         }
         val container = StoredContainer(id = containerId, name = containerName, chunks = chunks)
         BridgeRuntimeState.addOrUpdateContainer(container)
         containerStore.save(container)
         appendLog("load_container: saved '${container.name}' (${chunks.size} chunks)")
-        // ACK back to Mac
         val ackPayload = json.encodeToString(
             ContainerAckResponse(containerId = containerId, chunkCount = chunks.size, messageId = messageId)
         )
