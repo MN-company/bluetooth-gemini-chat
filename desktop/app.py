@@ -634,7 +634,7 @@ class DesktopChatApp:
         except Exception:
             pass
         if success:
-            self._append_log("System", "✅ Container trasferito e salvato sul telefono.")
+            self._append_log("System", "➜ Pacchetti inviati. In attesa di conferma di salvataggio dal telefono...")
 
 
     def _toggle_pip(self) -> None:

@@ -180,7 +180,7 @@ class BleChatClient:
                 f"Container too large even after compression ({cmp_kb}KB). "
                 f"Split into smaller containers."
             )
-        self._run_coro(self._send_payload(payload, request_id))
+        self._run_coro(self._send_payload(payload, request_id, reliable=True))
         return request_id
 
     def _run_loop(self) -> None:
@@ -384,7 +384,7 @@ class BleChatClient:
             await asyncio.sleep(backoff)
             attempt += 1
 
-    async def _send_payload(self, payload: bytes, request_id: str, emit_sent_event: bool = True) -> None:
+    async def _send_payload(self, payload: bytes, request_id: str, emit_sent_event: bool = True, reliable: bool = False) -> None:
         client = self._client
         if client is None or not client.is_connected:
             if emit_sent_event:
@@ -408,7 +408,8 @@ class BleChatClient:
 
             for idx, packet in enumerate(packets, start=1):
                 try:
-                    await client.write_gatt_char(WRITE_CHAR_UUID, packet, response=False)
+                    # If reliable=True, force response=True for guaranteed delivery
+                    await client.write_gatt_char(WRITE_CHAR_UUID, packet, response=reliable)
                 except BleakError:
                     await client.write_gatt_char(WRITE_CHAR_UUID, packet, response=True)
 
@@ -424,7 +425,7 @@ class BleChatClient:
                         }
                     )
 
-                if idx % throttle_every == 0:
+                if not reliable and idx % throttle_every == 0:
                     await asyncio.sleep(throttle_delay)
 
             if emit_sent_event:
