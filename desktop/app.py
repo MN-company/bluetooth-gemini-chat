@@ -11,7 +11,7 @@ import tkinter as tk
 import customtkinter as ctk
 import webbrowser
 from pathlib import Path
-from tkinter import filedialog, simpledialog, ttk
+from tkinter import colorchooser, filedialog, simpledialog, ttk
 from typing import Any
 from tkinterdnd2 import TkinterDnD, DND_FILES
 
@@ -91,6 +91,7 @@ class DesktopChatApp:
         self._overlay_image_paths_by_request: dict[str, str] = {}
         self._overlay_hide_after_id: str | None = None
         self._overlay_window: tk.Toplevel | None = None
+        self._overlay_message_widget: tk.Message | None = None
         self._overlay_text_var = tk.StringVar(value="")
         self._toggle_flag_path = self._runtime_bridge_dir / "toggle.flag"
         self._toggle_flag_mtime = 0.0
@@ -101,6 +102,10 @@ class DesktopChatApp:
         _saved = self._load_settings()
         self.system_instructions_var = tk.StringVar(value=_saved.get("system_instructions", ""))
         self.pinned_pdf_paths: list[str] = _saved.get("pinned_pdf_paths", [])
+        self._overlay_bg_color = self._normalize_hex_color(_saved.get("overlay_bg_color"), "#0f172a")
+        self._overlay_width = self._parse_int_setting(_saved.get("overlay_width"), 460, 320, 1280)
+        self._overlay_height = self._parse_int_setting(_saved.get("overlay_height"), 220, 160, 900)
+        self._overlay_resizable = bool(_saved.get("overlay_resizable", True))
 
         self._context_store = ContextStore(Path(__file__).parent)
         self._active_container_id: str | None = None
@@ -399,6 +404,21 @@ class DesktopChatApp:
         except Exception:
             return {}
 
+    def _parse_int_setting(self, raw: Any, default: int, low: int, high: int) -> int:
+        try:
+            value = int(raw)
+        except Exception:
+            value = default
+        return max(low, min(high, value))
+
+    def _normalize_hex_color(self, raw: Any, fallback: str) -> str:
+        if not isinstance(raw, str):
+            return fallback
+        value = raw.strip()
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            return value
+        return fallback
+
     def _save_settings(self, data: dict[str, Any]) -> None:
         try:
             with self._settings_path.open("w", encoding="utf-8") as f:
@@ -409,7 +429,7 @@ class DesktopChatApp:
     def on_open_settings(self) -> None:
         dialog = ctk.CTkToplevel(self.root)
         dialog.title("Settings")
-        dialog.geometry("540x540")
+        dialog.geometry("560x700")
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -463,17 +483,91 @@ class DesktopChatApp:
         ctk.CTkButton(pdf_btn_row, text="+ Aggiungi PDF", command=add_pdf, width=120, fg_color="#1f538d").pack(side=tk.LEFT, padx=(0, 8))
         ctk.CTkButton(pdf_btn_row, text="− Rimuovi selezionato", command=remove_pdf, width=160, fg_color="transparent", border_width=1, hover_color="#333333").pack(side=tk.LEFT)
 
+        # --- Section 3: Shot+Ask Overlay ---
+        ctk.CTkLabel(dialog, text="🪟 Shot+Ask Overlay:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        ctk.CTkLabel(
+            dialog,
+            text="Scegli sfondo e dimensioni della finestra risposta.",
+            font=("Avenir", 11),
+            text_color="#888888",
+        ).pack(padx=12, anchor=tk.W)
+
+        overlay_bg_var = tk.StringVar(value=self._overlay_bg_color)
+        overlay_width_var = tk.StringVar(value=str(self._overlay_width))
+        overlay_height_var = tk.StringVar(value=str(self._overlay_height))
+        overlay_resizable_var = tk.BooleanVar(value=self._overlay_resizable)
+
+        overlay_bg_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        overlay_bg_row.pack(fill=tk.X, padx=12, pady=(6, 6))
+        ctk.CTkLabel(overlay_bg_row, text="Sfondo (#RRGGBB):", width=120).pack(side=tk.LEFT)
+        ctk.CTkEntry(overlay_bg_row, textvariable=overlay_bg_var, width=120).pack(side=tk.LEFT, padx=(0, 8))
+        color_swatch = tk.Frame(
+            overlay_bg_row,
+            width=24,
+            height=24,
+            bg=self._overlay_bg_color,
+            highlightthickness=1,
+            highlightbackground="#555555",
+        )
+        color_swatch.pack(side=tk.LEFT, padx=(0, 8))
+        color_swatch.pack_propagate(False)
+
+        def choose_overlay_bg() -> None:
+            _, picked = colorchooser.askcolor(color=overlay_bg_var.get().strip(), parent=dialog, title="Sfondo overlay")
+            if not picked:
+                return
+            overlay_bg_var.set(picked)
+            color_swatch.configure(bg=picked)
+
+        ctk.CTkButton(overlay_bg_row, text="Scegli", width=80, command=choose_overlay_bg).pack(side=tk.LEFT)
+
+        def on_overlay_bg_changed(*_: Any) -> None:
+            value = self._normalize_hex_color(overlay_bg_var.get(), "")
+            if value:
+                color_swatch.configure(bg=value)
+
+        overlay_bg_var.trace_add("write", on_overlay_bg_changed)
+
+        overlay_size_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        overlay_size_row.pack(fill=tk.X, padx=12, pady=(0, 8))
+        ctk.CTkLabel(overlay_size_row, text="Larghezza:", width=120).pack(side=tk.LEFT)
+        ctk.CTkEntry(overlay_size_row, textvariable=overlay_width_var, width=80).pack(side=tk.LEFT, padx=(0, 12))
+        ctk.CTkLabel(overlay_size_row, text="Altezza:", width=70).pack(side=tk.LEFT)
+        ctk.CTkEntry(overlay_size_row, textvariable=overlay_height_var, width=80).pack(side=tk.LEFT)
+
+        ctk.CTkCheckBox(
+            dialog,
+            text="Consenti ridimensionamento manuale finestra overlay",
+            variable=overlay_resizable_var,
+        ).pack(anchor=tk.W, padx=12, pady=(0, 12))
+
         def save() -> None:
             text = textbox.get("1.0", tk.END).strip()
             self.system_instructions_var.set(text)
             self.pinned_pdf_paths = list(pinned_list_var.get())
+            self._overlay_bg_color = self._normalize_hex_color(overlay_bg_var.get(), self._overlay_bg_color)
+            self._overlay_width = self._parse_int_setting(overlay_width_var.get(), self._overlay_width, 320, 1280)
+            self._overlay_height = self._parse_int_setting(overlay_height_var.get(), self._overlay_height, 160, 900)
+            self._overlay_resizable = bool(overlay_resizable_var.get())
             old_settings = self._load_settings()
             old_settings["system_instructions"] = text
             old_settings["pinned_pdf_paths"] = self.pinned_pdf_paths
+            old_settings["overlay_bg_color"] = self._overlay_bg_color
+            old_settings["overlay_width"] = self._overlay_width
+            old_settings["overlay_height"] = self._overlay_height
+            old_settings["overlay_resizable"] = self._overlay_resizable
             self._save_settings(old_settings)
+            self._apply_overlay_window_preferences()
             dialog.destroy()
             n = len(self.pinned_pdf_paths)
-            self._append_log("System", f"Settings saved. Pinned PDFs: {n}. System instructions: {'YES' if text else 'none'}.")
+            self._append_log(
+                "System",
+                (
+                    f"Settings saved. Pinned PDFs: {n}. "
+                    f"System instructions: {'YES' if text else 'none'}. "
+                    f"Overlay: {self._overlay_width}x{self._overlay_height}, bg {self._overlay_bg_color}"
+                ),
+            )
 
         ctk.CTkButton(dialog, text="💾 SALVA", command=save, fg_color="#1f538d").pack(pady=(0, 14))
 
@@ -815,6 +909,35 @@ class DesktopChatApp:
         except Exception as exc:
             self._append_log("Error", f"Global hotkey unavailable: {exc}")
 
+    def _apply_overlay_window_preferences(self) -> None:
+        win = self._overlay_window
+        if win is None or not win.winfo_exists():
+            return
+        try:
+            win.configure(bg=self._overlay_bg_color)
+            win.resizable(self._overlay_resizable, self._overlay_resizable)
+            win.geometry(f"{self._overlay_width}x{self._overlay_height}")
+        except Exception:
+            pass
+        if self._overlay_message_widget is not None:
+            try:
+                self._overlay_message_widget.configure(bg=self._overlay_bg_color, width=max(140, self._overlay_width - 30))
+            except Exception:
+                pass
+
+    def _on_overlay_window_configure(self, event: tk.Event[Any]) -> None:
+        if self._overlay_window is None or event.widget is not self._overlay_window:
+            return
+        width = max(320, int(getattr(event, "width", self._overlay_width)))
+        height = max(160, int(getattr(event, "height", self._overlay_height)))
+        self._overlay_width = width
+        self._overlay_height = height
+        if self._overlay_message_widget is not None:
+            try:
+                self._overlay_message_widget.configure(width=max(140, width - 30))
+            except Exception:
+                pass
+
     def _show_overlay_message(self, text: str, ttl_ms: int = 12000) -> None:
         clean = text.strip()
         if not clean:
@@ -822,41 +945,47 @@ class DesktopChatApp:
 
         if self._overlay_window is None or not self._overlay_window.winfo_exists():
             win = tk.Toplevel(self.root)
-            win.overrideredirect(True)
             win.attributes("-topmost", True)
             try:
                 win.attributes("-alpha", 0.5)
             except Exception:
                 pass
-            win.configure(bg="#0f172a")
+            win.title("Gemini Quick Reply")
+            win.configure(bg=self._overlay_bg_color)
+            win.resizable(self._overlay_resizable, self._overlay_resizable)
 
-            width, height = 460, 220
+            width, height = self._overlay_width, self._overlay_height
             x = max(12, win.winfo_screenwidth() - width - 18)
             y = max(12, win.winfo_screenheight() - height - 40)
             win.geometry(f"{width}x{height}+{x}+{y}")
+            win.bind("<Configure>", self._on_overlay_window_configure)
 
-            frame = tk.Frame(win, bg="#0f172a", padx=12, pady=10)
+            frame = tk.Frame(win, bg=self._overlay_bg_color, padx=12, pady=10)
             frame.pack(fill=tk.BOTH, expand=True)
             tk.Label(
                 frame,
                 text="Gemini Quick Reply",
-                bg="#0f172a",
+                bg=self._overlay_bg_color,
                 fg="#dbeafe",
                 font=("Avenir", 11, "bold"),
                 anchor="w",
             ).pack(fill=tk.X)
-            tk.Message(
+            message_widget = tk.Message(
                 frame,
                 textvariable=self._overlay_text_var,
-                bg="#0f172a",
+                bg=self._overlay_bg_color,
                 fg="#f8fafc",
                 font=("Avenir", 11),
-                width=430,
+                width=max(140, width - 30),
                 anchor="w",
                 justify=tk.LEFT,
-            ).pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+            )
+            message_widget.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
             self._overlay_window = win
+            self._overlay_message_widget = message_widget
+        else:
+            self._apply_overlay_window_preferences()
 
         self._overlay_text_var.set(clean[:1800])
         if self._overlay_hide_after_id is not None:
@@ -874,6 +1003,7 @@ class DesktopChatApp:
             self._overlay_hide_after_id = None
         win = self._overlay_window
         self._overlay_window = None
+        self._overlay_message_widget = None
         if win is not None and win.winfo_exists():
             win.destroy()
 
@@ -2007,6 +2137,12 @@ class DesktopChatApp:
             except Exception:
                 pass
             self._overlay_listener = None
+        latest_settings = self._load_settings()
+        latest_settings["overlay_bg_color"] = self._overlay_bg_color
+        latest_settings["overlay_width"] = self._overlay_width
+        latest_settings["overlay_height"] = self._overlay_height
+        latest_settings["overlay_resizable"] = self._overlay_resizable
+        self._save_settings(latest_settings)
         self._hide_overlay_window()
         self.client.stop()
         self.root.destroy()
