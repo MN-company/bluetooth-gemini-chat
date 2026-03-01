@@ -8,6 +8,7 @@ import re
 import subprocess
 import tempfile
 import tkinter as tk
+import customtkinter as ctk
 import webbrowser
 from pathlib import Path
 from tkinter import filedialog, simpledialog, ttk
@@ -35,10 +36,10 @@ MODEL_PRESETS = [
 
 class DesktopChatApp:
     def __init__(self) -> None:
-        self.root = tk.Tk()
+        self.root = ctk.CTk()
         self.root.title("Gemini BLE Chat")
         self.root.geometry("1240x780")
-        self.root.minsize(1020, 640)
+        self.root.minsize(300, 400)
 
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.client = BleChatClient(self.events.put)
@@ -62,7 +63,10 @@ class DesktopChatApp:
         self._quick_inbox_path = Path(__file__).with_name("quick_inbox.jsonl")
         self._quick_inbox_offset = 0
         self._md_link_seq = 0
-        self._md_link_urls: dict[str, str] = {}
+        self._md_link_urls: dict[str, str] = {}        
+        self._pip_mode_active = False
+        self._pre_pip_geometry = ""
+
 
         self._configure_theme()
         self._build_ui()
@@ -75,269 +79,197 @@ class DesktopChatApp:
         self.root.after(100, self._poll_events)
 
     def _configure_theme(self) -> None:
-        self.root.configure(bg="#eef3fb")
-        self.root.option_add("*Font", "Avenir 12")
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
 
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-
-        style.configure("App.TFrame", background="#eef3fb")
-        style.configure("Header.TFrame", background="#eef3fb")
-        style.configure("Card.TFrame", background="#ffffff", relief=tk.FLAT)
-        style.configure("Title.TLabel", background="#eef3fb", foreground="#14233d", font=("Avenir", 19, "bold"))
-        style.configure("Subtitle.TLabel", background="#eef3fb", foreground="#5a667c", font=("Avenir", 11))
-        style.configure("Status.TLabel", background="#eef3fb", foreground="#1d2f50", font=("Avenir", 11, "bold"))
-        style.configure("Section.TLabel", background="#ffffff", foreground="#20314f", font=("Avenir", 12, "bold"))
-        style.configure("Meta.TLabel", background="#ffffff", foreground="#616d80", font=("Avenir", 10))
-        style.configure("Action.TButton", padding=(10, 7))
 
     def _build_ui(self) -> None:
-        main = ttk.Frame(self.root, style="App.TFrame", padding=(16, 14))
-        main.pack(fill=tk.BOTH, expand=True)
+        # Main grid setup: 2 rows (Header, Content), 2 cols (Sidebar, Chat)
+        self.root.columnconfigure(1, weight=1)
+        self.root.rowconfigure(1, weight=1)
 
-        header = ttk.Frame(main, style="Header.TFrame")
-        header.pack(fill=tk.X)
+        # --- HEADER (Row 0, spans 2 cols originally, but we'll put it in a frame that spans) ---
+        self.header_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        self.header_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=8)
+        self.header_frame.columnconfigure(1, weight=1) # filler
+        
+        # Header Left: Model, Add PDF, Clipboard, Screenshot
+        header_left = ctk.CTkFrame(self.header_frame, fg_color="transparent")
+        header_left.grid(row=0, column=0, sticky="w")
+        
+        self.model_var = tk.StringVar(value=MODEL_PRESETS[0])
+        self.model_combo = ctk.CTkComboBox(
+            header_left,
+            variable=self.model_var,
+            values=MODEL_PRESETS,
+            state="readonly",
+            command=lambda _: self._refresh_context_preview(),
+            width=160
+        )
+        self.model_combo.pack(side=tk.LEFT, padx=(0, 10))
+        
+        ctk.CTkButton(header_left, text="ADD PDF", command=self.on_add_pdf, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT, padx=(0, 6))
+        ctk.CTkButton(header_left, text="CLIPBOARD", command=self.on_clipboard_send, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT, padx=(0, 6))
+        ctk.CTkButton(header_left, text="SCREENSHOT", command=self.on_quick_screenshot, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT)
 
-        title_col = ttk.Frame(header, style="Header.TFrame")
-        title_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(title_col, text="Gemini over Bluetooth", style="Title.TLabel").pack(anchor=tk.W)
-        ttk.Label(
-            title_col,
-            text="Multi-chat history, PDF/Image context, optional Google Search grounding",
-            style="Subtitle.TLabel",
-        ).pack(anchor=tk.W, pady=(2, 0))
-
-        status_col = ttk.Frame(header, style="Header.TFrame")
-        status_col.pack(side=tk.RIGHT, anchor=tk.NE)
+        # Header Right: Device Name / Connection info
+        header_right = ctk.CTkFrame(self.header_frame, fg_color="transparent")
+        header_right.grid(row=0, column=2, sticky="e")
+        
         self.status_var = tk.StringVar(value="Not connected")
         self.link_var = tk.StringVar(value="Link: n/a")
-        ttk.Label(status_col, textvariable=self.status_var, style="Status.TLabel").pack(anchor=tk.E)
-        ttk.Label(status_col, textvariable=self.link_var, style="Subtitle.TLabel").pack(anchor=tk.E, pady=(2, 0))
+        
+        status_card = ctk.CTkFrame(header_right, border_width=1, border_color="#333333", fg_color="#1c1c1c")
+        status_card.pack(side=tk.RIGHT)
+        
+        ctk.CTkLabel(status_card, textvariable=self.status_var, font=("Avenir", 12, "bold")).pack(anchor=tk.E, padx=10, pady=(6, 0))
+        ctk.CTkLabel(status_card, textvariable=self.link_var, font=("Avenir", 10), text_color="#a1a1a1").pack(anchor=tk.E, padx=10, pady=(0, 6))
 
-        body = ttk.Frame(main, style="App.TFrame")
-        body.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
 
-        sidebar = ttk.Frame(body, style="Card.TFrame", padding=12, width=390)
-        sidebar.pack(side=tk.LEFT, fill=tk.Y)
-        sidebar.pack_propagate(False)
+        # --- SIDEBAR (Row 1, Col 0) ---
+        self.sidebar_frame = ctk.CTkFrame(self.root, width=280, fg_color="transparent")
+        self.sidebar_frame.grid(row=1, column=0, sticky="ns", padx=(12, 6), pady=(0, 12))
+        self.sidebar_frame.grid_propagate(False)
+        
+        # Chats header
+        chats_header = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        chats_header.pack(fill=tk.X, pady=(0, 6))
+        ctk.CTkLabel(chats_header, text="chats", font=("Avenir", 18)).pack(side=tk.LEFT)
+        ctk.CTkButton(chats_header, text="+", command=self.on_new_chat, width=30, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0").pack(side=tk.RIGHT)
 
-        ttk.Label(sidebar, text="Bridge", style="Section.TLabel").pack(anchor=tk.W)
+        # Chats listbox
+        self.chats_list = tk.Listbox(
+            self.sidebar_frame,
+            bg="#1c1c1c",
+            fg="#e0e0e0",
+            selectbackground="#1f538d",
+            activestyle=tk.NONE,
+            borderwidth=1,
+            relief=tk.SOLID,
+            highlightthickness=0,
+        )
+        self.chats_list.pack(fill=tk.BOTH, expand=True, pady=(0, 16))
+        self.chats_list.bind("<<ListboxSelect>>", self._on_session_selected)
+        
+        # Extra tool buttons collapsed at bottom of sidebar since sketch didn't strictly place them
         self._build_button_grid(
-            sidebar,
+            self.sidebar_frame,
             [
+                ("Rename", self.on_rename_chat),
+                ("Delete", self.on_delete_chat),
                 ("Scan", self.on_scan),
                 ("Connect", self.on_connect),
                 ("Disconnect", self.on_disconnect),
-            ],
-            columns=3,
-            pady=(8, 8),
-        )
-
-        self.devices_list = tk.Listbox(
-            sidebar,
-            height=5,
-            bg="#f9fbff",
-            fg="#1f2430",
-            selectbackground="#d9e7ff",
-            activestyle=tk.NONE,
-            borderwidth=1,
-            relief=tk.SOLID,
-            highlightthickness=0,
-        )
-        self.devices_list.pack(fill=tk.X, expand=False, pady=(0, 10))
-
-        ttk.Label(sidebar, text="Chats", style="Section.TLabel").pack(anchor=tk.W)
-        self._build_button_grid(
-            sidebar,
-            [
-                ("New", self.on_new_chat),
-                ("Rename", self.on_rename_chat),
-                ("Delete", self.on_delete_chat),
-            ],
-            columns=3,
-            pady=(8, 6),
-        )
-
-        self.chats_list = tk.Listbox(
-            sidebar,
-            height=7,
-            bg="#f9fbff",
-            fg="#1f2430",
-            selectbackground="#d9e7ff",
-            activestyle=tk.NONE,
-            borderwidth=1,
-            relief=tk.SOLID,
-            highlightthickness=0,
-        )
-        self.chats_list.pack(fill=tk.X, expand=False, pady=(0, 10))
-        self.chats_list.bind("<<ListboxSelect>>", self._on_session_selected)
-
-        ttk.Label(sidebar, text="Context", style="Section.TLabel").pack(anchor=tk.W)
-        self._build_button_grid(
-            sidebar,
-            [
-                ("Attach Image", self.on_attach_image),
-                ("Add PDF", self.on_add_pdf),
-                ("Screenshot", self.on_quick_screenshot),
-                ("Ask Clipboard", self.on_clipboard_send),
-            ],
-            columns=2,
-            pady=(8, 6),
-        )
-        self._build_button_grid(
-            sidebar,
-            [
-                ("Clear Image", self.on_clear_image),
-                ("Clear PDFs", self.on_clear_pdfs),
+                ("Clear Mem", self.on_clear_memory),
             ],
             columns=2,
             pady=(0, 6),
         )
-
-        ttk.Label(sidebar, text="Runtime", style="Section.TLabel").pack(anchor=tk.W, pady=(4, 0))
-        model_row = ttk.Frame(sidebar, style="Card.TFrame")
-        model_row.pack(fill=tk.X, pady=(8, 6))
-        ttk.Label(model_row, text="Model", style="Meta.TLabel").pack(side=tk.LEFT)
-        self.model_var = tk.StringVar(value=MODEL_PRESETS[0])
-        self.model_combo = ttk.Combobox(
-            model_row,
-            textvariable=self.model_var,
-            values=MODEL_PRESETS,
-            state="readonly",
-            width=24,
+        
+        self.devices_list = tk.Listbox(
+            self.sidebar_frame, height=3, bg="#1c1c1c", fg="#e0e0e0", selectbackground="#1f538d", activestyle=tk.NONE, borderwidth=1, relief=tk.SOLID, highlightthickness=0,
         )
-        self.model_combo.pack(side=tk.LEFT, padx=(6, 0))
-        self.model_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_context_preview())
-        ttk.Button(
-            model_row,
-            text="Default",
-            style="Action.TButton",
-            command=self._set_phone_default_model,
-        ).pack(side=tk.LEFT, padx=(6, 0))
+        self.devices_list.pack(fill=tk.X, pady=(0, 6))
 
-        self.web_search_enabled = tk.BooleanVar(value=False)
-        web_check = ttk.Checkbutton(
-            sidebar,
-            text="Enable Web Search (Google)",
-            variable=self.web_search_enabled,
-            command=self._refresh_context_preview,
-        )
-        web_check.pack(anchor=tk.W, pady=(0, 6))
 
-        self.thinking_enabled = tk.BooleanVar(value=False)
-        thinking_check = ttk.Checkbutton(
-            sidebar,
-            text="Thinking Mode",
-            variable=self.thinking_enabled,
-            command=self._refresh_context_preview,
-        )
-        thinking_check.pack(anchor=tk.W, pady=(0, 4))
-
-        think_row = ttk.Frame(sidebar, style="Card.TFrame")
-        think_row.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(think_row, text="Budget", style="Meta.TLabel").pack(side=tk.LEFT)
-        self.thinking_budget_var = tk.StringVar(value="1024")
-        self.thinking_budget_spin = tk.Spinbox(
-            think_row,
-            from_=0,
-            to=24576,
-            increment=256,
-            textvariable=self.thinking_budget_var,
-            width=8,
-            relief=tk.SOLID,
-            borderwidth=1,
-            command=self._refresh_context_preview,
-        )
-        self.thinking_budget_spin.pack(side=tk.LEFT, padx=(6, 0))
-        self.thinking_budget_spin.bind("<FocusOut>", lambda _e: self._refresh_context_preview())
-        self.thinking_auto_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            think_row,
-            text="Auto",
-            variable=self.thinking_auto_var,
-            command=self._refresh_context_preview,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        self.show_thoughts_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            sidebar,
-            text="Show Thought Trace",
-            variable=self.show_thoughts_var,
-            command=self._refresh_context_preview,
-        ).pack(anchor=tk.W, pady=(0, 6))
-
-        self.image_var = tk.StringVar(value="Image: none")
-        self.pdf_var = tk.StringVar(value="PDF: none")
-        self.memory_var = tk.StringVar(value="")
-        ttk.Label(sidebar, textvariable=self.image_var, style="Meta.TLabel").pack(anchor=tk.W, pady=(2, 0))
-        ttk.Label(sidebar, textvariable=self.pdf_var, style="Meta.TLabel").pack(anchor=tk.W, pady=(2, 0))
-        ttk.Label(sidebar, textvariable=self.memory_var, style="Meta.TLabel").pack(anchor=tk.W, pady=(2, 0))
-
-        self._build_button_grid(
-            sidebar,
-            [
-                ("Clear Memory", self.on_clear_memory),
-                ("Install Right-click", self.on_install_quick_action),
-            ],
-            columns=2,
-            pady=(10, 0),
-        )
-
-        right = ttk.Frame(body, style="App.TFrame")
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
-
-        chat_card = ttk.Frame(right, style="Card.TFrame", padding=(8, 8))
-        chat_card.pack(fill=tk.BOTH, expand=True)
-
-        self.chat_log = tk.Text(
+        # --- MAIN CHAT AREA (Row 1, Col 1) ---
+        self.chat_area_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        self.chat_area_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 12), pady=(0, 12))
+        
+        # Chat card
+        chat_card = ctk.CTkFrame(self.chat_area_frame, fg_color="#1e1e1e", border_width=1, border_color="#333333")
+        chat_card.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
+        
+        self.chat_log = ctk.CTkTextbox(
             chat_card,
             wrap=tk.WORD,
-            state=tk.DISABLED,
-            bg="#ffffff",
-            fg="#1f2430",
-            insertbackground="#1f2430",
-            borderwidth=0,
-            highlightthickness=0,
-            padx=10,
-            pady=10,
+            state="disabled",
+            fg_color="transparent",
+            text_color="#e0e0e0",
+            font=("Avenir", 13)
         )
-        self.chat_log.pack(fill=tk.BOTH, expand=True)
+        self.chat_log.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         self._configure_chat_tags()
 
-        composer = ttk.Frame(right, style="Card.TFrame", padding=(10, 10))
-        composer.pack(fill=tk.X, pady=(10, 0))
+        # Context indicators & Toggles row
+        toggles_row = ctk.CTkFrame(self.chat_area_frame, fg_color="transparent")
+        toggles_row.pack(fill=tk.X, pady=(0, 6))
+        
+        self.web_search_enabled = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(toggles_row, text="WEBSEARCH", variable=self.web_search_enabled, command=self._refresh_context_preview).pack(side=tk.LEFT, padx=(0, 12))
+        self.thinking_enabled = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(toggles_row, text="THINKING", variable=self.thinking_enabled, command=self._refresh_context_preview).pack(side=tk.LEFT, padx=(0, 12))
+        
+        self.pip_enabled = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(toggles_row, text="PiP MODE", variable=self.pip_enabled, command=self._toggle_pip).pack(side=tk.LEFT)
+        
+        # Hidden variables for thinking budget since they were in older UI
+        self.thinking_auto_var = tk.BooleanVar(value=False)
+        self.thinking_budget_var = tk.StringVar(value="1024")
+        self.show_thoughts_var = tk.BooleanVar(value=True)
 
         self.context_preview_var = tk.StringVar(value="No active attachments")
-        ttk.Label(composer, textvariable=self.context_preview_var, style="Meta.TLabel").pack(anchor=tk.W)
+        ctk.CTkLabel(toggles_row, textvariable=self.context_preview_var, text_color="#a1a1a1", font=("Avenir", 11)).pack(side=tk.RIGHT)
 
-        self.prompt_entry = tk.Text(
-            composer,
-            height=4,
+        # Input Row
+        input_row = ctk.CTkFrame(self.chat_area_frame, fg_color="transparent")
+        input_row.pack(fill=tk.X)
+        
+        self.prompt_entry = ctk.CTkTextbox(
+            input_row,
+            height=60,
             wrap=tk.WORD,
-            bg="#f8faff",
-            fg="#1f2430",
-            insertbackground="#1f2430",
-            borderwidth=1,
-            relief=tk.SOLID,
-            highlightthickness=0,
-            padx=10,
-            pady=8,
+            fg_color="#1e1e1e",
+            text_color="#e0e0e0",
+            border_width=1,
+            border_color="#333333",
+            font=("Avenir", 13)
         )
-        self.prompt_entry.pack(fill=tk.X, expand=True, pady=(8, 8))
+        self.prompt_entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.prompt_entry.bind("<Return>", self._on_prompt_return)
         self.prompt_entry.bind("<Command-BackSpace>", self._on_clear_composer_hotkey)
         self.prompt_entry.bind("<Command-Delete>", self._on_clear_composer_hotkey)
 
-        send_row = ttk.Frame(composer, style="Card.TFrame")
-        send_row.pack(fill=tk.X)
-        ttk.Label(
-            send_row,
-            text="Enter = send, Shift+Enter = newline",
-            style="Meta.TLabel",
-        ).pack(side=tk.LEFT)
-        ttk.Button(send_row, text="Send", style="Action.TButton", command=self.on_send).pack(side=tk.RIGHT)
+        send_btn = ctk.CTkButton(input_row, text="SEND", command=self.on_send, fg_color="#1e1e1e", border_width=1, border_color="#333333", hover_color="#333333", text_color="#e0e0e0", width=80)
+        send_btn.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
+
+        # Hidden variables to preserve underlying logic
+        self.image_var = tk.StringVar(value="Image: none")
+        self.pdf_var = tk.StringVar(value="PDF: none")
+        self.memory_var = tk.StringVar(value="")
+        
+        self.root.bind("<Configure>", self._on_window_resize)
+        self._is_compact_mode = False
+
+    def _toggle_pip(self) -> None:
+        if self.pip_enabled.get():
+            self._pip_mode_active = True
+            self._pre_pip_geometry = self.root.geometry()
+            self.root.attributes('-topmost', True)
+            self.root.geometry("400x500")
+        else:
+            self._pip_mode_active = False
+            self.root.attributes('-topmost', False)
+            if self._pre_pip_geometry:
+                self.root.geometry(self._pre_pip_geometry)
+
+    def _on_window_resize(self, event) -> None:
+        if event.widget != self.root:
+            return
+        width = event.width
+        # Threshold for compact mode
+        if width < 750 and not self._is_compact_mode:
+            self._is_compact_mode = True
+            self.header_frame.grid_remove()
+            self.sidebar_frame.grid_remove()
+            self.chat_area_frame.grid(row=0, column=0, rowspan=2, columnspan=2, sticky="nsew", padx=0, pady=0)
+            # Remove padding for pure chat view
+            self.root.configure(padx=0, pady=0)
+        elif width >= 750 and self._is_compact_mode:
+            self._is_compact_mode = False
+            self.header_frame.grid()
+            self.sidebar_frame.grid()
+            self.chat_area_frame.grid(row=1, column=1, rowspan=1, columnspan=1, sticky="nsew", padx=(6, 12), pady=(0, 12))
 
     def _set_phone_default_model(self) -> None:
         self.model_var.set(MODEL_PRESETS[0])
@@ -349,8 +281,8 @@ class DesktopChatApp:
         entries: list[tuple[str, Any]],
         columns: int = 2,
         pady: tuple[int, int] = (6, 6),
-    ) -> ttk.Frame:
-        frame = ttk.Frame(parent, style="Card.TFrame")
+    ) -> ctk.CTkFrame:
+        frame = ctk.CTkFrame(parent)
         frame.pack(fill=tk.X, pady=pady)
         for col in range(columns):
             frame.columnconfigure(col, weight=1, uniform=f"btn-{id(frame)}")
@@ -360,7 +292,7 @@ class DesktopChatApp:
             col = idx % columns
             pad_right = 6 if col < (columns - 1) else 0
             pad_bottom = 6 if idx < (len(entries) - columns) else 0
-            ttk.Button(frame, text=label, style="Action.TButton", command=command).grid(
+            ctk.CTkButton(frame, text=label, command=command, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0").grid(
                 row=row,
                 column=col,
                 sticky="ew",
@@ -371,54 +303,54 @@ class DesktopChatApp:
         return frame
 
     def _configure_chat_tags(self) -> None:
-        self.chat_log.tag_configure("role_you", foreground="#1a56d9", font=("Avenir", 10, "bold"), spacing1=10)
-        self.chat_log.tag_configure(
+        self.chat_log._textbox.tag_configure("role_you", foreground="#6ba5ff", font=("Avenir", 10, "bold"), spacing1=10)
+        self.chat_log._textbox.tag_configure(
             "msg_you",
-            foreground="#102a57",
-            background="#d7e7ff",
+            foreground="#e0e0e0",
+            background="#1a2b42",
             lmargin1=200,
             lmargin2=200,
             rmargin=14,
             spacing3=8,
         )
 
-        self.chat_log.tag_configure("role_gemini", foreground="#117a45", font=("Avenir", 10, "bold"), spacing1=10)
-        self.chat_log.tag_configure(
+        self.chat_log._textbox.tag_configure("role_gemini", foreground="#4de68d", font=("Avenir", 10, "bold"), spacing1=10)
+        self.chat_log._textbox.tag_configure(
             "msg_gemini",
-            foreground="#1f2430",
-            background="#e7f4ea",
+            foreground="#e0e0e0",
+            background="#14261d",
             lmargin1=14,
             lmargin2=14,
             rmargin=210,
             spacing3=8,
         )
 
-        self.chat_log.tag_configure("role_thought", foreground="#7d4f00", font=("Avenir", 10, "bold"), spacing1=8)
-        self.chat_log.tag_configure(
+        self.chat_log._textbox.tag_configure("role_thought", foreground="#e5b229", font=("Avenir", 10, "bold"), spacing1=8)
+        self.chat_log._textbox.tag_configure(
             "msg_thought",
-            foreground="#5f4a16",
-            background="#fff5d9",
+            foreground="#d1a634",
+            background="#2b220d",
             lmargin1=14,
             lmargin2=14,
             rmargin=210,
             spacing3=8,
         )
 
-        self.chat_log.tag_configure("role_phone", foreground="#5f52bf", font=("Avenir", 10, "bold"), spacing1=8)
-        self.chat_log.tag_configure("msg_phone", foreground="#3d3f50", lmargin1=14, lmargin2=14, rmargin=160)
+        self.chat_log._textbox.tag_configure("role_phone", foreground="#9e8dff", font=("Avenir", 10, "bold"), spacing1=8)
+        self.chat_log._textbox.tag_configure("msg_phone", foreground="#a1a1a1", lmargin1=14, lmargin2=14, rmargin=160)
 
-        self.chat_log.tag_configure("role_system", foreground="#4f5d75", font=("Avenir", 10, "bold"), spacing1=8)
-        self.chat_log.tag_configure("msg_system", foreground="#4f5d75", lmargin1=14, lmargin2=14, rmargin=100)
+        self.chat_log._textbox.tag_configure("role_system", foreground="#a9b9cf", font=("Avenir", 10, "bold"), spacing1=8)
+        self.chat_log._textbox.tag_configure("msg_system", foreground="#a9b9cf", lmargin1=14, lmargin2=14, rmargin=100)
 
-        self.chat_log.tag_configure("role_error", foreground="#d93025", font=("Avenir", 10, "bold"), spacing1=8)
-        self.chat_log.tag_configure("msg_error", foreground="#d93025", lmargin1=14, lmargin2=14, rmargin=100)
-        self.chat_log.tag_configure("md_h1", font=("Avenir", 14, "bold"), spacing1=10)
-        self.chat_log.tag_configure("md_h2", font=("Avenir", 13, "bold"), spacing1=8)
-        self.chat_log.tag_configure("md_h3", font=("Avenir", 12, "bold"), spacing1=6)
-        self.chat_log.tag_configure("md_bold", font=("Avenir", 11, "bold"))
-        self.chat_log.tag_configure("md_inline_code", font=("Menlo", 10), background="#f1f5fb", foreground="#21405f")
-        self.chat_log.tag_configure("md_code_block", font=("Menlo", 10), background="#f7f9fc", foreground="#1f2430")
-        self.chat_log.tag_configure("md_link", foreground="#1a73e8", underline=True)
+        self.chat_log._textbox.tag_configure("role_error", foreground="#ff6b6b", font=("Avenir", 10, "bold"), spacing1=8)
+        self.chat_log._textbox.tag_configure("msg_error", foreground="#ff6b6b", lmargin1=14, lmargin2=14, rmargin=100)
+        self.chat_log._textbox.tag_configure("md_h1", font=("Avenir", 14, "bold"), spacing1=10)
+        self.chat_log._textbox.tag_configure("md_h2", font=("Avenir", 13, "bold"), spacing1=8)
+        self.chat_log._textbox.tag_configure("md_h3", font=("Avenir", 12, "bold"), spacing1=6)
+        self.chat_log._textbox.tag_configure("md_bold", font=("Avenir", 11, "bold"))
+        self.chat_log._textbox.tag_configure("md_inline_code", font=("Menlo", 10), background="#2a2a2a", foreground="#a6c8ff")
+        self.chat_log._textbox.tag_configure("md_code_block", font=("Menlo", 10), background="#f7f9fc", foreground="#e0e0e0")
+        self.chat_log._textbox.tag_configure("md_link", foreground="#5c9dff", underline=True)
 
     def _on_prompt_return(self, event: tk.Event[tk.Text]) -> str | None:
         # Shift+Enter inserts newline; Enter sends.
@@ -450,7 +382,7 @@ class DesktopChatApp:
         else:
             role_tag, msg_tag = "role_system", "msg_system"
 
-        self.chat_log.config(state=tk.NORMAL)
+        self.chat_log.configure(state='normal')
         self.chat_log.insert(tk.END, f"{role}\n", role_tag)
         if role_key in {"gemini", "assistant"}:
             self._insert_markdown_message(clean, msg_tag)
@@ -458,7 +390,7 @@ class DesktopChatApp:
         else:
             self.chat_log.insert(tk.END, f"{clean}\n\n", msg_tag)
         self.chat_log.see(tk.END)
-        self.chat_log.config(state=tk.DISABLED)
+        self.chat_log.configure(state='disabled')
 
     def _insert_markdown_message(self, text: str, base_tag: str) -> None:
         inline_pattern = re.compile(
@@ -526,9 +458,9 @@ class DesktopChatApp:
         self._md_link_seq += 1
         self._md_link_urls[tag_name] = url
         self.chat_log.insert(tk.END, label, (base_tag, "md_link", tag_name))
-        self.chat_log.tag_bind(tag_name, "<Button-1>", lambda _e, t=tag_name: self._open_md_link(t))
-        self.chat_log.tag_bind(tag_name, "<Enter>", lambda _e: self.chat_log.config(cursor="hand2"))
-        self.chat_log.tag_bind(tag_name, "<Leave>", lambda _e: self.chat_log.config(cursor="xterm"))
+        self.chat_log._textbox.tag_bind(tag_name, "<Button-1>", lambda _e, t=tag_name: self._open_md_link(t))
+        self.chat_log._textbox.tag_bind(tag_name, "<Enter>", lambda _e: self.chat_log.configure(cursor="hand2"))
+        self.chat_log._textbox.tag_bind(tag_name, "<Leave>", lambda _e: self.chat_log.configure(cursor="xterm"))
 
     def _open_md_link(self, tag_name: str) -> None:
         url = self._md_link_urls.get(tag_name)
@@ -540,9 +472,9 @@ class DesktopChatApp:
             self._append_log("System", f"Open link manually: {url}")
 
     def _clear_chat_widget(self) -> None:
-        self.chat_log.config(state=tk.NORMAL)
+        self.chat_log.configure(state='normal')
         self.chat_log.delete("1.0", tk.END)
-        self.chat_log.config(state=tk.DISABLED)
+        self.chat_log.configure(state='disabled')
 
     def _render_active_chat(self) -> None:
         self._clear_chat_widget()
@@ -1014,7 +946,7 @@ class DesktopChatApp:
         thinking_enabled = self.thinking_enabled.get()
         include_thoughts = thinking_enabled and self.show_thoughts_var.get()
         selected_model = self.model_var.get().strip()
-        model_override = selected_model if selected_model and selected_model != MODEL_PRESETS[0] else None
+        model_override = selected_model if selected_model and selected_model != 'phone-default' else None
 
         try:
             request_id = self.client.send_prompt(
