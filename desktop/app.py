@@ -76,7 +76,9 @@ class DesktopChatApp:
         self._streaming_thought_by_session: dict[str, str] = {}
         self._session_ids_in_view: list[str] = []
         self._last_link_state = "unknown"
-        self._quick_inbox_path = Path(__file__).with_name("quick_inbox.jsonl")
+        self._runtime_bridge_dir = Path.home() / ".gemini_ble"
+        self._runtime_bridge_dir.mkdir(parents=True, exist_ok=True)
+        self._quick_inbox_path = self._runtime_bridge_dir / "quick_inbox.jsonl"
         self._quick_inbox_offset = 0
         self._md_link_seq = 0
         self._md_link_urls: dict[str, str] = {}
@@ -90,9 +92,9 @@ class DesktopChatApp:
         self._overlay_hide_after_id: str | None = None
         self._overlay_window: tk.Toplevel | None = None
         self._overlay_text_var = tk.StringVar(value="")
-        self._toggle_flag_path = Path(__file__).with_name("toggle.flag")
+        self._toggle_flag_path = self._runtime_bridge_dir / "toggle.flag"
         self._toggle_flag_mtime = 0.0
-        self._clipboard_flag_path = Path(__file__).with_name("clipboard.flag")
+        self._clipboard_flag_path = self._runtime_bridge_dir / "clipboard.flag"
         self._clipboard_flag_mtime = 0.0
 
         self._settings_path = Path(__file__).with_name("settings.json")
