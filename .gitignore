@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+
+# Desktop local state
+desktop/.venv/
+desktop/.venv_test/
+desktop/__pycache__/
+desktop/chat_sessions.json
+desktop/chat_memory.json
+desktop/quick_inbox.jsonl
+
+# Android build/local
+android/**/build/
+android/**/.gradle/
+android/**/.kotlin/
+android/**/local.properties
+android/**/*.iml
+
+# Gradle local
+.gradle/
+
+# Logs
+*.log
