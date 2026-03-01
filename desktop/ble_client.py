@@ -402,8 +402,8 @@ class BleChatClient:
             self._emit({"type": "status", "text": f"Sending large payload ({packet_count} BLE packets)..."})
 
         try:
-            throttle_every = 16 if packet_count > 140 else 4
-            throttle_delay = 0.0008 if packet_count > 140 else 0.0017
+            throttle_every = 12 if packet_count > 140 else 5
+            throttle_delay = 0.0015 if packet_count > 140 else 0.003
             progress_step = max(packet_count // 12, 1)
 
             for idx, packet in enumerate(packets, start=1):
@@ -412,7 +412,7 @@ class BleChatClient:
                 except BleakError:
                     await client.write_gatt_char(WRITE_CHAR_UUID, packet, response=True)
 
-                if packet_count >= 90 and (idx % progress_step == 0 or idx == packet_count):
+                if idx % progress_step == 0 or idx == packet_count:
                     pct = int((idx / packet_count) * 100)
                     self._emit(
                         {
