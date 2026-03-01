@@ -23,6 +23,10 @@ python app.py
 10. Usa `New/Rename/Delete` per chat multiple con cronologia persistente.
 11. Scrivi prompt e premi `Send`.
 12. Su macOS puoi usare `cmd + backspace` nel composer per pulirlo.
+13. Hotkey globale overlay:
+   - macOS: `Cmd+Shift+G`
+   - Windows: `Ctrl+Shift+G`
+   Esegue screenshot area, invia direttamente a Gemini e mostra risposta in overlay semitrasparente.
 
 ## Dettagli
 
@@ -43,4 +47,5 @@ python app.py
 - Supporta Thinking Mode + Think Budget + thought trace (`includeThoughts`) nel payload API.
 - Supporta quick action macOS via script `macos_quick_ask.sh` (vedi `QUICK_ACTION_SETUP.md`).
 - Tenta install automatica della Quick Action macOS all'avvio; bottone `Install Right-click` per reinstall.
+- Supporta hotkey globale via `pynput` (richiede permessi Accessibility su macOS).
 - Su macOS lo screenshot richiede permesso `Screen Recording` per Terminal/Python.

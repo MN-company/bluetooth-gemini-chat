@@ -23,6 +23,11 @@ try:
 except Exception:
     ImageGrab = None
 
+try:
+    from pynput import keyboard as pynput_keyboard
+except Exception:
+    pynput_keyboard = None
+
 MODEL_PRESETS = [
     "phone-default",
     "gemini-2.5-flash",
@@ -63,10 +68,16 @@ class DesktopChatApp:
         self._quick_inbox_path = Path(__file__).with_name("quick_inbox.jsonl")
         self._quick_inbox_offset = 0
         self._md_link_seq = 0
-        self._md_link_urls: dict[str, str] = {}        
+        self._md_link_urls: dict[str, str] = {}
         self._pip_mode_active = False
         self._pre_pip_geometry = ""
-
+        self._overlay_listener: Any | None = None
+        self._overlay_hotkey = "Cmd+Shift+G" if platform.system().lower() == "darwin" else "Ctrl+Shift+G"
+        self._overlay_request_ids: set[str] = set()
+        self._overlay_image_paths_by_request: dict[str, str] = {}
+        self._overlay_hide_after_id: str | None = None
+        self._overlay_window: tk.Toplevel | None = None
+        self._overlay_text_var = tk.StringVar(value="")
 
         self._configure_theme()
         self._build_ui()
@@ -75,6 +86,7 @@ class DesktopChatApp:
         self._refresh_memory_label()
         self._refresh_context_preview()
         self._auto_install_quick_action()
+        self._start_overlay_hotkey_listener()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self._poll_events)
 
@@ -161,15 +173,22 @@ class DesktopChatApp:
                 ("Connect", self.on_connect),
                 ("Disconnect", self.on_disconnect),
                 ("Clear Mem", self.on_clear_memory),
+                ("Shot+Ask", self.on_hotkey_overlay_triggered),
             ],
             columns=2,
-            pady=(0, 6),
+            pady=(8, 8),
         )
         
         self.devices_list = tk.Listbox(
             self.sidebar_frame, height=3, bg="#1c1c1c", fg="#e0e0e0", selectbackground="#1f538d", activestyle=tk.NONE, borderwidth=1, relief=tk.SOLID, highlightthickness=0,
         )
         self.devices_list.pack(fill=tk.X, pady=(0, 6))
+        ctk.CTkLabel(
+            self.sidebar_frame,
+            text=f"Hotkey: {self._overlay_hotkey}",
+            text_color="#a1a1a1",
+            font=("Avenir", 10),
+        ).pack(anchor=tk.W, pady=(0, 6))
 
 
         # --- MAIN CHAT AREA (Row 1, Col 1) ---
@@ -362,6 +381,215 @@ class DesktopChatApp:
     def _on_clear_composer_hotkey(self, _: tk.Event[tk.Text]) -> str:
         self.prompt_entry.delete("1.0", tk.END)
         return "break"
+
+    def _start_overlay_hotkey_listener(self) -> None:
+        if pynput_keyboard is None:
+            self._append_log("System", "Global hotkey disabled: install 'pynput' to enable overlay shortcut")
+            return
+
+        combo = "<cmd>+<shift>+g" if platform.system().lower() == "darwin" else "<ctrl>+<shift>+g"
+        try:
+            listener = pynput_keyboard.GlobalHotKeys(
+                {
+                    combo: lambda: self.events.put({"type": "hotkey_overlay"}),
+                }
+            )
+            listener.start()
+            self._overlay_listener = listener
+            self._append_log("System", f"Global hotkey ready: {self._overlay_hotkey}")
+        except Exception as exc:
+            self._append_log("Error", f"Global hotkey unavailable: {exc}")
+
+    def _show_overlay_message(self, text: str, ttl_ms: int = 12000) -> None:
+        clean = text.strip()
+        if not clean:
+            return
+
+        if self._overlay_window is None or not self._overlay_window.winfo_exists():
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            try:
+                win.attributes("-alpha", 0.5)
+            except Exception:
+                pass
+            win.configure(bg="#0f172a")
+
+            width, height = 460, 220
+            x = max(12, win.winfo_screenwidth() - width - 18)
+            y = max(12, win.winfo_screenheight() - height - 40)
+            win.geometry(f"{width}x{height}+{x}+{y}")
+
+            frame = tk.Frame(win, bg="#0f172a", padx=12, pady=10)
+            frame.pack(fill=tk.BOTH, expand=True)
+            tk.Label(
+                frame,
+                text="Gemini Quick Reply",
+                bg="#0f172a",
+                fg="#dbeafe",
+                font=("Avenir", 11, "bold"),
+                anchor="w",
+            ).pack(fill=tk.X)
+            tk.Message(
+                frame,
+                textvariable=self._overlay_text_var,
+                bg="#0f172a",
+                fg="#f8fafc",
+                font=("Avenir", 11),
+                width=430,
+                anchor="w",
+                justify=tk.LEFT,
+            ).pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+            self._overlay_window = win
+
+        self._overlay_text_var.set(clean[:1800])
+        if self._overlay_hide_after_id is not None:
+            self.root.after_cancel(self._overlay_hide_after_id)
+            self._overlay_hide_after_id = None
+        if ttl_ms > 0:
+            self._overlay_hide_after_id = self.root.after(ttl_ms, self._hide_overlay_window)
+
+    def _hide_overlay_window(self) -> None:
+        if self._overlay_hide_after_id is not None:
+            try:
+                self.root.after_cancel(self._overlay_hide_after_id)
+            except Exception:
+                pass
+            self._overlay_hide_after_id = None
+        win = self._overlay_window
+        self._overlay_window = None
+        if win is not None and win.winfo_exists():
+            win.destroy()
+
+    def _cleanup_overlay_request(self, request_id: str) -> None:
+        self._overlay_request_ids.discard(request_id)
+        path = self._overlay_image_paths_by_request.pop(request_id, None)
+        if path:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _select_area_rect(self) -> tuple[int, int, int, int] | None:
+        selector = tk.Toplevel(self.root)
+        selector.overrideredirect(True)
+        selector.attributes("-topmost", True)
+        try:
+            selector.attributes("-alpha", 0.18)
+        except Exception:
+            pass
+        width = selector.winfo_screenwidth()
+        height = selector.winfo_screenheight()
+        selector.geometry(f"{width}x{height}+0+0")
+        selector.configure(bg="black")
+
+        canvas = tk.Canvas(selector, bg="black", highlightthickness=0, cursor="crosshair")
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        state: dict[str, Any] = {"start": None, "rect_id": None, "bbox": None}
+
+        def on_press(event: tk.Event[Any]) -> None:
+            state["start"] = (event.x, event.y)
+            if state["rect_id"] is not None:
+                canvas.delete(state["rect_id"])
+            state["rect_id"] = canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="#60a5fa", width=2)
+
+        def on_drag(event: tk.Event[Any]) -> None:
+            start = state.get("start")
+            rect_id = state.get("rect_id")
+            if start is None or rect_id is None:
+                return
+            canvas.coords(rect_id, start[0], start[1], event.x, event.y)
+
+        def on_release(event: tk.Event[Any]) -> None:
+            start = state.get("start")
+            if start is None:
+                selector.destroy()
+                return
+            x1, y1 = start
+            x2, y2 = event.x, event.y
+            left, right = sorted((int(x1), int(x2)))
+            top, bottom = sorted((int(y1), int(y2)))
+            if (right - left) >= 8 and (bottom - top) >= 8:
+                state["bbox"] = (left, top, right, bottom)
+            selector.destroy()
+
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_release)
+        selector.bind("<Escape>", lambda _e: selector.destroy())
+        selector.focus_force()
+        selector.grab_set()
+        self.root.wait_window(selector)
+        return state.get("bbox")
+
+    def _capture_area_screenshot_path(self, log_errors: bool = True) -> str | None:
+        system_name = platform.system().lower()
+        if system_name == "darwin":
+            tmp = tempfile.NamedTemporaryFile(prefix="gemini-shot-", suffix=".png", delete=False)
+            path = tmp.name
+            tmp.close()
+            try:
+                Path(path).unlink(missing_ok=True)
+                result = subprocess.run(
+                    ["screencapture", "-i", "-x", path],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                stderr = (result.stderr or "").strip()
+                if result.returncode != 0:
+                    lowered = stderr.lower()
+                    if log_errors:
+                        if "cancel" in lowered:
+                            self._append_log("System", "Screenshot canceled")
+                        elif "not authorized" in lowered or "permission" in lowered:
+                            self._append_log(
+                                "Error",
+                                "Screenshot blocked: abilita Screen Recording per Terminal/Python in macOS Settings.",
+                            )
+                        else:
+                            detail = stderr if stderr else f"exit code {result.returncode}"
+                            self._append_log("Error", f"Screenshot failed: {detail}")
+                    Path(path).unlink(missing_ok=True)
+                    return None
+                if not Path(path).exists() or Path(path).stat().st_size <= 0:
+                    if log_errors:
+                        self._append_log("Error", "Screenshot non disponibile: nessun file creato.")
+                    Path(path).unlink(missing_ok=True)
+                    return None
+                return path
+            except Exception as exc:
+                if log_errors:
+                    self._append_log("Error", f"Screenshot failed: {exc}")
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return None
+
+        if ImageGrab is None:
+            if log_errors:
+                self._append_log("Error", "Area screenshot requires Pillow ImageGrab")
+            return None
+
+        try:
+            full = ImageGrab.grab(all_screens=True)  # type: ignore[union-attr]
+            bbox = self._select_area_rect()
+            if bbox is None:
+                if log_errors:
+                    self._append_log("System", "Screenshot canceled")
+                return None
+            cropped = full.crop(bbox)
+            fd, path = tempfile.mkstemp(prefix="gemini-shot-", suffix=".png")
+            os.close(fd)
+            cropped.save(path, format="PNG")
+            return path
+        except Exception as exc:
+            if log_errors:
+                self._append_log("Error", f"Screenshot failed: {exc}")
+            return None
 
     def _append_log(self, role: str, text: str) -> None:
         clean = str(text).strip()
@@ -603,86 +831,49 @@ class DesktopChatApp:
         self._append_log("System", f"Selected image: {os.path.basename(path)}")
 
     def on_quick_screenshot(self) -> None:
-        system_name = platform.system().lower()
-        if system_name == "darwin":
-            tmp = tempfile.NamedTemporaryFile(prefix="gemini-shot-", suffix=".png", delete=False)
-            path = tmp.name
-            tmp.close()
-            try:
-                # Avoid pre-existing empty file edge cases for screencapture.
-                Path(path).unlink(missing_ok=True)
-                result = subprocess.run(
-                    ["screencapture", "-i", "-x", path],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                )
-                stderr = (result.stderr or "").strip()
-                if result.returncode != 0:
-                    lowered = stderr.lower()
-                    if "cancel" in lowered:
-                        self._append_log("System", "Screenshot canceled")
-                    elif "not authorized" in lowered or "permission" in lowered:
-                        self._append_log(
-                            "Error",
-                            "Screenshot blocked: abilita Screen Recording per Terminal/Python in macOS Settings.",
-                        )
-                    elif "could not create image from rect" in lowered:
-                        # Some macOS builds fail writing file for region capture; fallback to clipboard capture.
-                        clip_result = subprocess.run(
-                            ["screencapture", "-i", "-c"],
-                            check=False,
-                            capture_output=True,
-                            text=True,
-                        )
-                        clip_err = (clip_result.stderr or "").strip().lower()
-                        if clip_result.returncode == 0 and ImageGrab is not None:
-                            try:
-                                clip_img = ImageGrab.grabclipboard()  # type: ignore[union-attr]
-                                if clip_img is not None:
-                                    clip_img.save(path, format="PNG")
-                                    self._set_selected_image(path)
-                                    return
-                            except Exception:
-                                pass
-                        if "cancel" in clip_err:
-                            self._append_log("System", "Screenshot canceled")
-                        else:
-                            self._append_log(
-                                "Error",
-                                "Screenshot failed (rect capture error). Verifica i permessi Screen Recording.",
-                            )
-                    else:
-                        detail = stderr if stderr else f"exit code {result.returncode}"
-                        self._append_log("Error", f"Screenshot failed: {detail}")
-                    try:
-                        Path(path).unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    return
-                if not Path(path).exists() or Path(path).stat().st_size <= 0:
-                    self._append_log(
-                        "Error",
-                        "Screenshot non disponibile: nessun file creato. Controlla permessi Screen Recording.",
-                    )
-                    return
-                self._set_selected_image(path)
-            except Exception as exc:
-                self._append_log("Error", f"Screenshot failed: {exc}")
+        path = self._capture_area_screenshot_path(log_errors=True)
+        if path is None:
+            return
+        self._set_selected_image(path)
+
+    def on_hotkey_overlay_triggered(self) -> None:
+        if not self.connected:
+            self._show_overlay_message("Bridge non connesso", ttl_ms=3500)
             return
 
-        if ImageGrab is None:
-            self._append_log("Error", "Quick screenshot not supported on this OS without Pillow ImageGrab")
+        path = self._capture_area_screenshot_path(log_errors=False)
+        if path is None:
+            self._show_overlay_message("Screenshot annullato", ttl_ms=2500)
             return
 
+        selected_model = self.model_var.get().strip() if hasattr(self, "model_var") else MODEL_PRESETS[0]
+        model_override = selected_model if selected_model and selected_model != MODEL_PRESETS[0] else None
+        thinking_budget = self._get_thinking_budget()
+        thinking_enabled = self.thinking_enabled.get()
+        include_thoughts = thinking_enabled and self.show_thoughts_var.get()
+
+        prompt = "Analizza rapidamente questo screenshot. Rispondi in italiano con massimo 5 righe."
         try:
-            image = ImageGrab.grab()  # type: ignore[union-attr]
-            fd, path = tempfile.mkstemp(prefix="gemini-shot-", suffix=".png")
-            os.close(fd)
-            image.save(path, format="PNG")
-            self._set_selected_image(path)
+            request_id = self.client.send_prompt(
+                prompt,
+                model=model_override,
+                image_path=path,
+                enable_web_search=self.web_search_enabled.get(),
+                thinking_enabled=thinking_enabled,
+                thinking_budget=thinking_budget,
+                include_thoughts=include_thoughts,
+            )
         except Exception as exc:
-            self._append_log("Error", f"Screenshot failed: {exc}")
+            self._show_overlay_message(f"Invio screenshot fallito: {exc}", ttl_ms=5000)
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+
+        self._overlay_request_ids.add(request_id)
+        self._overlay_image_paths_by_request[request_id] = path
+        self._show_overlay_message("Analisi screenshot in corso...", ttl_ms=18000)
 
     def on_clipboard_send(self) -> None:
         text = ""
@@ -1010,6 +1201,10 @@ class DesktopChatApp:
     def _handle_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
 
+        if event_type == "hotkey_overlay":
+            self.on_hotkey_overlay_triggered()
+            return
+
         if event_type == "status":
             status = event.get("text", "")
             self.status_var.set(status)
@@ -1085,6 +1280,32 @@ class DesktopChatApp:
             message = event.get("message", {})
             message_type = message.get("type")
             message_id = str(message.get("messageId", "")).strip()
+            if message_id and message_id in self._overlay_request_ids:
+                if message_type == "partial":
+                    channel = str(message.get("channel", "answer")).strip().lower()
+                    if channel != "thought":
+                        partial_text = str(message.get("text", "")).strip()
+                        if partial_text:
+                            self._show_overlay_message(partial_text + "\n▌", ttl_ms=12000)
+                    return
+                if message_type == "result":
+                    response_text = str(message.get("text", "")).strip()
+                    if response_text:
+                        self._show_overlay_message(response_text, ttl_ms=20000)
+                    self._cleanup_overlay_request(message_id)
+                    return
+                if message_type == "error":
+                    error_text = str(message.get("error", "Unknown error")).strip()
+                    if error_text:
+                        self._show_overlay_message(f"Errore: {error_text}", ttl_ms=8000)
+                    self._cleanup_overlay_request(message_id)
+                    return
+                if message_type == "status":
+                    state = str(message.get("state", "processing")).strip()
+                    if state:
+                        self._show_overlay_message(state, ttl_ms=3000)
+                    return
+
             target_session = self._pending_request_session.get(message_id, self.active_session_id)
 
             if message_type == "status":
@@ -1155,6 +1376,13 @@ class DesktopChatApp:
             return
 
     def on_close(self) -> None:
+        if self._overlay_listener is not None:
+            try:
+                self._overlay_listener.stop()
+            except Exception:
+                pass
+            self._overlay_listener = None
+        self._hide_overlay_window()
         self.client.stop()
         self.root.destroy()
 
