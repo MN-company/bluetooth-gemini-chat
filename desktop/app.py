@@ -7,6 +7,7 @@ import queue
 import re
 import subprocess
 import tempfile
+import time
 import tkinter as tk
 import customtkinter as ctk
 import webbrowser
@@ -89,6 +90,9 @@ class DesktopChatApp:
         self._overlay_hotkey = "Apple Shortcut (Cmd+Shift+G)" if self._is_macos else "Ctrl+Shift+G"
         self._overlay_request_ids: set[str] = set()
         self._overlay_image_paths_by_request: dict[str, str] = {}
+        self._overlay_started_at: dict[str, float] = {}
+        self._overlay_last_update_at: dict[str, float] = {}
+        self._overlay_timeout_seconds = 95.0
         self._overlay_hide_after_id: str | None = None
         self._overlay_window: tk.Toplevel | None = None
         self._overlay_message_widget: tk.Message | None = None
@@ -1009,12 +1013,34 @@ class DesktopChatApp:
 
     def _cleanup_overlay_request(self, request_id: str) -> None:
         self._overlay_request_ids.discard(request_id)
+        self._overlay_started_at.pop(request_id, None)
+        self._overlay_last_update_at.pop(request_id, None)
         path = self._overlay_image_paths_by_request.pop(request_id, None)
         if path:
             try:
                 Path(path).unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def _cleanup_all_overlay_requests(self) -> None:
+        for request_id in list(self._overlay_request_ids):
+            self._cleanup_overlay_request(request_id)
+
+    def _check_overlay_request_timeouts(self) -> None:
+        if not self._overlay_request_ids:
+            return
+        now = time.monotonic()
+        timed_out: list[str] = []
+        for request_id in list(self._overlay_request_ids):
+            started_at = self._overlay_started_at.get(request_id, now)
+            if (now - started_at) >= self._overlay_timeout_seconds:
+                timed_out.append(request_id)
+        for request_id in timed_out:
+            self._show_overlay_message(
+                "Timeout Shot+Ask: nessuna risposta dal bridge. Riprova.",
+                ttl_ms=9000,
+            )
+            self._cleanup_overlay_request(request_id)
 
     def _select_area_rect(self) -> tuple[int, int, int, int] | None:
         selector = tk.Toplevel(self.root)
@@ -1466,6 +1492,9 @@ class DesktopChatApp:
             return
 
         self._overlay_request_ids.add(request_id)
+        now = time.monotonic()
+        self._overlay_started_at[request_id] = now
+        self._overlay_last_update_at[request_id] = now
         self._overlay_image_paths_by_request[request_id] = path
         self._show_overlay_message("Analisi screenshot in corso...", ttl_ms=0)
 
@@ -1885,6 +1914,7 @@ class DesktopChatApp:
         self._consume_quick_inbox()
         self._consume_toggle_flag()
         self._consume_clipboard_flag()
+        self._check_overlay_request_timeouts()
 
         while True:
             try:
@@ -1922,6 +1952,9 @@ class DesktopChatApp:
 
         if event_type == "error":
             message = event.get("text", "Unknown error")
+            if self._overlay_request_ids and isinstance(message, str) and message:
+                self._show_overlay_message(f"Errore bridge: {message}", ttl_ms=8000)
+                self._cleanup_all_overlay_requests()
             self._append_log("Error", message)
             return
 
@@ -1954,6 +1987,9 @@ class DesktopChatApp:
             self.connected = False
             self.status_var.set("Disconnected")
             self.link_var.set("Link: offline")
+            if self._overlay_request_ids:
+                self._show_overlay_message("Bridge disconnesso durante Shot+Ask", ttl_ms=8000)
+                self._cleanup_all_overlay_requests()
             self._append_log("System", "Disconnected")
             return
 
@@ -1980,6 +2016,12 @@ class DesktopChatApp:
             if isinstance(percent, int) and isinstance(current, int) and isinstance(total, int):
                 # Update status bar always
                 self.status_var.set(f"📡 Invio... {percent}% ({current}/{total} pacchetti)")
+                if request_id and request_id in self._overlay_request_ids:
+                    self._overlay_last_update_at[request_id] = time.monotonic()
+                    self._show_overlay_message(
+                        f"Invio screenshot... {percent}% ({current}/{total})",
+                        ttl_ms=0,
+                    )
                 # Update dedicated progress dialog if this is a container transfer
                 if request_id == self._container_transfer_request_id:
                     self._update_transfer_dialog(percent, current, total)
@@ -1994,7 +2036,11 @@ class DesktopChatApp:
             message = event.get("message", {})
             message_type = message.get("type")
             message_id = str(message.get("messageId", "")).strip()
+            if not message_id and message_type in {"status", "partial", "result", "error"} and len(self._overlay_request_ids) == 1:
+                # Fallback for malformed replies missing messageId.
+                message_id = next(iter(self._overlay_request_ids))
             if message_id and message_id in self._overlay_request_ids:
+                self._overlay_last_update_at[message_id] = time.monotonic()
                 if message_type == "partial":
                     channel = str(message.get("channel", "answer")).strip().lower()
                     if channel != "thought":
