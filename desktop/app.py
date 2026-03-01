@@ -33,12 +33,11 @@ except Exception:
 
 MODEL_PRESETS = [
     "phone-default",
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
+    "gemini-2.5-pro-preview-03-25",
+    "gemini-2.5-flash-preview-04-17",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
+    "gemini-2.0-pro-exp",
 ]
 
 
@@ -88,6 +87,7 @@ class DesktopChatApp:
 
         self._context_store = ContextStore(Path(__file__).parent)
         self._active_container_id: str | None = None
+        self._selected_container_idx: int | None = None  # persists across list refreshes
 
         self._configure_theme()
         self._build_ui()
@@ -149,7 +149,7 @@ class DesktopChatApp:
 
 
         # --- SIDEBAR (Row 1, Col 0) ---
-        self.sidebar_frame = ctk.CTkFrame(self.root, width=280, fg_color="transparent")
+        self.sidebar_frame = ctk.CTkFrame(self.root, width=310, fg_color="transparent")
         self.sidebar_frame.grid(row=1, column=0, sticky="ns", padx=(12, 6), pady=(0, 12))
         self.sidebar_frame.grid_propagate(False)
         
@@ -189,31 +189,68 @@ class DesktopChatApp:
         self.chats_list.bind("<<ListboxSelect>>", self._on_session_selected)
 
         # --- Knowledge Base Container Panel ---
+        separator = ctk.CTkFrame(self.sidebar_frame, height=1, fg_color="#2a2a2a")
+        separator.pack(fill=tk.X, pady=(6, 8))
+
         kb_header = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        kb_header.pack(fill=tk.X, pady=(4, 2))
-        ctk.CTkLabel(kb_header, text="📚 libreria", font=("Avenir", 14)).pack(side=tk.LEFT)
-        ctk.CTkButton(kb_header, text="+", command=self._on_create_container, width=28, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0").pack(side=tk.RIGHT)
+        kb_header.pack(fill=tk.X, pady=(0, 4))
+        ctk.CTkLabel(kb_header, text="📚 Libreria", font=("Avenir", 14, "bold"), text_color="#b0b0b0").pack(side=tk.LEFT)
+        ctk.CTkButton(
+            kb_header, text="＋ Nuovo", command=self._on_create_container,
+            width=72, height=24, fg_color="#1f538d", hover_color="#2a6bc7",
+            text_color="white", font=("Avenir", 11),
+        ).pack(side=tk.RIGHT)
 
         self.container_list = tk.Listbox(
             self.sidebar_frame,
-            bg="#1c1c1c",
-            fg="#aaaaaa",
-            selectbackground="#2a5c2a",
+            bg="#181818",
+            fg="#cccccc",
+            selectbackground="#1e5c1e",
+            selectforeground="#ffffff",
             activestyle=tk.NONE,
             borderwidth=1,
             relief=tk.SOLID,
             highlightthickness=0,
-            height=4,
+            height=5,
+            font=("Avenir", 12),
         )
         self.container_list.pack(fill=tk.X, pady=(0, 4))
-        self.container_list.bind("<<ListboxSelect>>", self._on_container_selected)
-        self.container_list.bind("<Double-Button-1>", lambda e: self._on_upload_container())
+        self.container_list.bind("<<ListboxSelect>>", self._on_container_list_click)
+        self.container_list.bind("<Double-Button-1>", self._on_activate_container)
 
-        kb_btn_row = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        kb_btn_row.pack(fill=tk.X, pady=(0, 8))
-        ctk.CTkButton(kb_btn_row, text="📤 Carica", command=self._on_upload_container, width=80, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0").pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(kb_btn_row, text="PDF+", command=self._on_add_pdf_to_container, width=55, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0").pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(kb_btn_row, text="✕", command=self._on_delete_container, width=30, fg_color="transparent", border_width=1, hover_color="#5c1a1a", text_color="#e0e0e0").pack(side=tk.LEFT)
+        # Row 1: Add PDF | Attiva | Upload
+        kb_row1 = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        kb_row1.pack(fill=tk.X, pady=(0, 3))
+        ctk.CTkButton(
+            kb_row1, text="📎 Aggiungi PDF", command=self._on_add_pdf_to_container,
+            height=30, fg_color="transparent", border_width=1, border_color="#444",
+            hover_color="#2a2a2a", text_color="#e0e0e0", font=("Avenir", 11),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+        ctk.CTkButton(
+            kb_row1, text="✓ Attiva", command=self._on_activate_container,
+            width=68, height=30, fg_color="#1e5c1e", hover_color="#2a7a2a",
+            text_color="white", font=("Avenir", 11),
+        ).pack(side=tk.LEFT, padx=(0, 3))
+        ctk.CTkButton(
+            kb_row1, text="📤", command=self._on_upload_container,
+            width=34, height=30, fg_color="transparent", border_width=1, border_color="#444",
+            hover_color="#2a2a2a", text_color="#d0d0d0", font=("Avenir", 13),
+        ).pack(side=tk.LEFT)
+
+        # Row 2: Active indicator + Delete
+        kb_row2 = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        kb_row2.pack(fill=tk.X, pady=(0, 8))
+        self._kb_active_label = ctk.CTkLabel(
+            kb_row2, text="nessun container attivo",
+            font=("Avenir", 10), text_color="#555555",
+        )
+        self._kb_active_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ctk.CTkButton(
+            kb_row2, text="🗑", command=self._on_delete_container,
+            width=30, height=24, fg_color="transparent", border_width=1, border_color="#5c1a1a",
+            hover_color="#5c1a1a", text_color="#e0e0e0", font=("Avenir", 12),
+        ).pack(side=tk.RIGHT)
+
         self._refresh_container_list()
         
         # Extra tool buttons collapsed at bottom of sidebar since sketch didn't strictly place them
@@ -414,20 +451,37 @@ class DesktopChatApp:
 
     def _refresh_container_list(self) -> None:
         self.container_list.delete(0, tk.END)
-        for c in self._context_store.all():
-            label = c.name
-            if c.id == self._active_container_id:
-                label = f"✓ {c.name} ({c.total_chunks()} chunk)"
-            else:
-                label = f"  {c.name} ({c.total_chunks()} chunk)"
+        containers = self._context_store.all()
+        for c in containers:
+            active_mark = "✓ " if c.id == self._active_container_id else "   "
+            label = f"{active_mark}{c.name}  ({c.total_chunks()} chunk)"
             self.container_list.insert(tk.END, label)
 
+        # Restore the highlighted selection
+        if self._selected_container_idx is not None and self._selected_container_idx < len(containers):
+            self.container_list.selection_set(self._selected_container_idx)
+            self.container_list.see(self._selected_container_idx)
+
+        # Update the active indicator label
+        active = next((c for c in containers if c.id == self._active_container_id), None)
+        if active:
+            self._kb_active_label.configure(
+                text=f"● {active.name} attivo", text_color="#4caf50"
+            )
+        else:
+            self._kb_active_label.configure(text="nessun container attivo", text_color="#555555")
+
     def _selected_container_id(self) -> str | None:
-        idxs = self.container_list.curselection()
-        if not idxs:
+        """Return the ID of the currently highlighted container (survives refresh)."""
+        # Prefer the tracked index (survives _refresh_container_list)
+        idx = self._selected_container_idx
+        if idx is None:
+            sel = self.container_list.curselection()
+            if sel:
+                idx = sel[0]
+        if idx is None:
             return None
         containers = self._context_store.all()
-        idx = idxs[0]
         if idx >= len(containers):
             return None
         return containers[idx].id
@@ -440,19 +494,29 @@ class DesktopChatApp:
         self._append_log("System", f"Container creato: '{c.name}' (id: {c.id[:8]})")
         self._refresh_container_list()
 
-    def _on_container_selected(self, _event=None) -> None:
+    def _on_container_list_click(self, _event=None) -> None:
+        """User clicked a container row — update the highlighted index."""
+        sel = self.container_list.curselection()
+        if not sel:
+            return
+        self._selected_container_idx = sel[0]
+        # Don't set active yet — user uses the ✓ toggle via double-click or separate activate button.
+        # Just refresh labels so the selection is visible.
+        self._refresh_container_list()
+
+    def _on_activate_container(self, _event=None) -> None:
+        """Double-click on container row → activate/deactivate it."""
         cid = self._selected_container_id()
         if cid is None:
             return
         if self._active_container_id == cid:
-            # Deselect on second click
             self._active_container_id = None
-            self._append_log("System", "Container deselezionato — il contesto PDF è disattivato")
+            self._append_log("System", "Container deattivato — contesto PDF disabilitato")
         else:
             self._active_container_id = cid
             c = self._context_store.get(cid)
             if c:
-                self._append_log("System", f"Container attivo: '{c.name}' ({c.total_chunks()} chunk) — sarà usato nelle prossime richieste")
+                self._append_log("System", f"Container attivo: '{c.name}' ({c.total_chunks()} chunk)")
         self._refresh_container_list()
 
     def _on_add_pdf_to_container(self) -> None:
