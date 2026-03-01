@@ -1396,6 +1396,7 @@ class DesktopChatApp:
 
         session_id = self.active_session_id
         memory_turns = self.sessions_store.recent_turns(session_id, max_items=10, max_chars=2600)
+        context_blocks = []
 
         # --- Active container takes priority over per-session PDFs ---
         use_container = self._active_container_id is not None
