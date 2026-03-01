@@ -3,7 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INBOX_FILE="$SCRIPT_DIR/quick_inbox.jsonl"
+HELPER_PY="$SCRIPT_DIR/macos_quick_ask.py"
 
+# Collect input text
 if [ "$#" -gt 0 ]; then
   INPUT_TEXT="$*"
 elif [ ! -t 0 ]; then
@@ -17,22 +19,5 @@ if [ -z "${INPUT_TEXT// }" ]; then
   exit 0
 fi
 
-printf '%s' "$INPUT_TEXT" | python3 - "$INBOX_FILE" <<'PY'
-import json
-import sys
-import time
-
-inbox = sys.argv[1]
-text = sys.stdin.read().strip()
-if not text:
-    raise SystemExit(0)
-
-payload = {
-    "type": "quick_send",
-    "text": text,
-    "ts": time.time(),
-}
-
-with open(inbox, "a", encoding="utf-8") as handle:
-    handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-PY
+# Pass text via env var to avoid pipe+heredoc stdin conflict
+GEMINI_INPUT_TEXT="$INPUT_TEXT" python3 "$HELPER_PY" "$INBOX_FILE"

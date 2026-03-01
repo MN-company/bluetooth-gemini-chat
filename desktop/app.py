@@ -81,7 +81,9 @@ class DesktopChatApp:
         self._clipboard_flag_mtime = 0.0
         
         self._settings_path = Path(__file__).with_name("settings.json")
-        self.system_instructions_var = tk.StringVar(value=self._load_settings().get("system_instructions", ""))
+        _saved = self._load_settings()
+        self.system_instructions_var = tk.StringVar(value=_saved.get("system_instructions", ""))
+        self.pinned_pdf_paths: list[str] = _saved.get("pinned_pdf_paths", [])
 
         self._configure_theme()
         self._build_ui()
@@ -308,26 +310,73 @@ class DesktopChatApp:
     def on_open_settings(self) -> None:
         dialog = ctk.CTkToplevel(self.root)
         dialog.title("Settings")
-        dialog.geometry("500x300")
+        dialog.geometry("540x540")
         dialog.transient(self.root)
         dialog.grab_set()
 
-        ctk.CTkLabel(dialog, text="System Instructions (Global Prompt):", font=("Avenir", 14, "bold")).pack(pady=(12, 6), padx=12, anchor=tk.W)
+        # --- Section 1: System Instructions ---
+        ctk.CTkLabel(dialog, text="System Instructions (Global Prompt):", font=("Avenir", 14, "bold")).pack(pady=(12, 4), padx=12, anchor=tk.W)
+        ctk.CTkLabel(dialog, text="Iniettate silenziosamente in ogni richiesta.", font=("Avenir", 11), text_color="#888888").pack(padx=12, anchor=tk.W)
 
-        textbox = ctk.CTkTextbox(dialog, height=180, font=("Avenir", 13), fg_color="#1e1e1e", border_width=1, border_color="#333333")
-        textbox.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+        textbox = ctk.CTkTextbox(dialog, height=120, font=("Avenir", 13), fg_color="#1e1e1e", border_width=1, border_color="#333333")
+        textbox.pack(fill=tk.X, padx=12, pady=(6, 12))
         textbox.insert("1.0", self.system_instructions_var.get())
+
+        # --- Section 2: Pinned PDFs ---
+        ctk.CTkLabel(dialog, text="📚 Documenti Fissi (PDF sempre attivi):", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        ctk.CTkLabel(dialog, text="Allegati automaticamente ad ogni messaggio senza doverli ricaricare.", font=("Avenir", 11), text_color="#888888").pack(padx=12, anchor=tk.W)
+
+        pinned_list_var = tk.Variable(value=list(self.pinned_pdf_paths))
+        pdf_listbox = tk.Listbox(
+            dialog,
+            listvariable=pinned_list_var,
+            height=5,
+            bg="#1e1e1e",
+            fg="#dddddd",
+            selectbackground="#1f538d",
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Avenir", 12),
+        )
+        pdf_listbox.pack(fill=tk.X, padx=12, pady=(6, 4))
+
+        def add_pdf() -> None:
+            from tkinter import filedialog
+            paths = filedialog.askopenfilenames(
+                parent=dialog, title="Seleziona PDF",
+                filetypes=[("PDF", "*.pdf"), ("All Files", "*")],
+            )
+            current = list(pinned_list_var.get())
+            for p in paths:
+                if p not in current:
+                    current.append(p)
+            pinned_list_var.set(current)
+
+        def remove_pdf() -> None:
+            idxs = pdf_listbox.curselection()
+            current = list(pinned_list_var.get())
+            for i in reversed(idxs):
+                del current[i]
+            pinned_list_var.set(current)
+
+        pdf_btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        pdf_btn_row.pack(fill=tk.X, padx=12, pady=(0, 12))
+        ctk.CTkButton(pdf_btn_row, text="+ Aggiungi PDF", command=add_pdf, width=120, fg_color="#1f538d").pack(side=tk.LEFT, padx=(0, 8))
+        ctk.CTkButton(pdf_btn_row, text="− Rimuovi selezionato", command=remove_pdf, width=160, fg_color="transparent", border_width=1, hover_color="#333333").pack(side=tk.LEFT)
 
         def save() -> None:
             text = textbox.get("1.0", tk.END).strip()
             self.system_instructions_var.set(text)
+            self.pinned_pdf_paths = list(pinned_list_var.get())
             old_settings = self._load_settings()
             old_settings["system_instructions"] = text
+            old_settings["pinned_pdf_paths"] = self.pinned_pdf_paths
             self._save_settings(old_settings)
             dialog.destroy()
-            self._append_log("System", "System instructions updated. These apply to all following messages.")
+            n = len(self.pinned_pdf_paths)
+            self._append_log("System", f"Settings saved. Pinned PDFs: {n}. System instructions: {'YES' if text else 'none'}.")
 
-        ctk.CTkButton(dialog, text="SAVE", command=save, fg_color="#1f538d").pack(pady=(0, 12))
+        ctk.CTkButton(dialog, text="💾 SALVA", command=save, fg_color="#1f538d").pack(pady=(0, 14))
 
     def _toggle_pip(self) -> None:
         if self.pip_enabled.get():
@@ -1093,10 +1142,16 @@ class DesktopChatApp:
         sys_instr = self.system_instructions_var.get().strip()
         if sys_instr:
             context_blocks.append({"type": "text", "text": f"System Instructions:\n{sys_instr}"})
+        
+        # --- Pinned PDFs (always attached) ---  
+        all_pdf_paths = list(self.pinned_pdf_paths)
+        for p in self.selected_pdf_paths:
+            if p not in all_pdf_paths:
+                all_pdf_paths.append(p)
             
-        if self.selected_pdf_paths:
+        if all_pdf_paths:
             try:
-                blocks = self.pdf_context_engine.build_context(prompt, self.selected_pdf_paths)
+                blocks = self.pdf_context_engine.build_context(prompt, all_pdf_paths)
                 context_blocks.extend(blocks)
             except ValueError as exc:
                 self._append_log("Error", str(exc))
