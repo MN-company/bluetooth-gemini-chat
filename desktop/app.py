@@ -66,7 +66,8 @@ class DesktopChatApp:
         self._md_link_urls: dict[str, str] = {}        
         self._pip_mode_active = False
         self._pre_pip_geometry = ""
-
+        self._toggle_flag_path = Path(__file__).with_name('toggle.flag')
+        self._toggle_flag_mtime = 0.0
 
         self._configure_theme()
         self._build_ui()
@@ -227,6 +228,7 @@ class DesktopChatApp:
         )
         self.prompt_entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.prompt_entry.bind("<Return>", self._on_prompt_return)
+        self.prompt_entry.bind("<KeyRelease>", self._adjust_input_height)
         self.prompt_entry.bind("<Command-BackSpace>", self._on_clear_composer_hotkey)
         self.prompt_entry.bind("<Command-Delete>", self._on_clear_composer_hotkey)
 
@@ -995,8 +997,23 @@ class DesktopChatApp:
         self.prompt_entry.delete("1.0", tk.END)
         self.on_clear_image()
 
+    def _consume_toggle_flag(self) -> None:
+        if not self._toggle_flag_path.exists():
+            return
+        try:
+            mtime = self._toggle_flag_path.stat().st_mtime
+            if self._toggle_flag_mtime == 0.0:
+                self._toggle_flag_mtime = mtime
+                return
+            if mtime > self._toggle_flag_mtime:
+                self._toggle_flag_mtime = mtime
+                self.events.put({"type": "toggle_visibility"})
+        except OSError:
+            pass
+
     def _poll_events(self) -> None:
         self._consume_quick_inbox()
+        self._consume_toggle_flag()
 
         while True:
             try:
@@ -1009,6 +1026,10 @@ class DesktopChatApp:
 
     def _handle_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
+
+        if event_type == "toggle_visibility":
+            self._toggle_app_visibility()
+            return
 
         if event_type == "status":
             status = event.get("text", "")
@@ -1153,6 +1174,33 @@ class DesktopChatApp:
             else:
                 self._append_log("System", "Quick request copied into composer (bridge not connected)")
             return
+
+    def _adjust_input_height(self, _event=None) -> None:
+        try:
+            content = self.prompt_entry.get("1.0", "end-1c")
+            lines = content.count("\n") + 1
+            width_chars = self.prompt_entry.winfo_width() // 8
+            if width_chars > 0:
+                for line in content.split("\n"):
+                    lines += len(line) // width_chars
+            target_lines = max(2, min(7, lines))
+            new_height = 60 + (target_lines - 2) * 20
+            self.prompt_entry.configure(height=new_height)
+        except Exception:
+            pass
+
+    def _toggle_app_visibility(self) -> None:
+        if self.root.state() == 'withdrawn' or self.root.state() == 'iconic':
+            self.root.deiconify()
+            self.root.lift()
+            if not self.pip_enabled.get():
+                self.pip_enabled.set(True)
+                self._toggle_pip()
+        else:
+            if self._pip_mode_active:
+                self.pip_enabled.set(False)
+                self._toggle_pip()
+            self.root.iconify()
 
     def on_close(self) -> None:
         self.client.stop()
