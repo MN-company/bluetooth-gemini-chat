@@ -90,6 +90,11 @@ class DesktopChatApp:
         self._context_store = ContextStore(Path(__file__).parent)
         self._active_container_id: str | None = None
         self._selected_container_idx: int | None = None  # persists across list refreshes
+        self._container_transfer_request_id: str | None = None  # tracks active upload
+        self._transfer_dialog: ctk.CTkToplevel | None = None
+        self._transfer_progress_var: tk.DoubleVar | None = None
+        self._transfer_label_var: tk.StringVar | None = None
+        self._transfer_started_time: float = 0.0
 
         self._configure_theme()
         self._build_ui()
@@ -569,12 +574,68 @@ class DesktopChatApp:
             return
         try:
             container_dict = self._context_store.export_for_transfer(cid)
-            size_kb = len(str(container_dict)) // 1024
+            payload_bytes = len(str(container_dict).encode("utf-8"))
+            size_kb = payload_bytes // 1024
             self._append_log("System", f"Avvio trasferimento container '{c.name}' (~{size_kb}KB, {c.total_chunks()} chunk)...")
             request_id = self.client.send_container(container_dict)
-            self._append_log("System", f"Container inviato (id: {request_id[:8]}). In attesa di conferma dal telefono...")
+            self._container_transfer_request_id = request_id
+            self._open_transfer_dialog(c.name, size_kb)
         except ValueError as exc:
             self._append_log("Error", str(exc))
+
+    # ── Transfer progress dialog ──────────────────────────────────────────────
+
+    def _open_transfer_dialog(self, container_name: str, size_kb: int) -> None:
+        import time as _time
+        self._transfer_started_time = _time.monotonic()
+
+        d = ctk.CTkToplevel(self.root)
+        d.title("Trasferimento BLE")
+        d.geometry("400x180")
+        d.resizable(False, False)
+        d.grab_set()
+        d.attributes("-topmost", True)
+        self._transfer_dialog = d
+
+        ctk.CTkLabel(d, text=f"📡 Caricamento libreria sul telefono", font=("Avenir", 14, "bold")).pack(pady=(18, 4))
+        ctk.CTkLabel(d, text=container_name, font=("Avenir", 12), text_color="#888888").pack()
+
+        self._transfer_progress_var = tk.DoubleVar(value=0.0)
+        bar = ctk.CTkProgressBar(d, variable=self._transfer_progress_var, width=340, height=14)
+        bar.pack(pady=(14, 6))
+
+        self._transfer_label_var = tk.StringVar(value=f"0%  —  0 / ? pacchetti  (~{size_kb} KB)")
+        ctk.CTkLabel(d, textvariable=self._transfer_label_var, font=("Avenir", 11), text_color="#aaaaaa").pack()
+
+    def _update_transfer_dialog(self, percent: int, current: int, total: int) -> None:
+        import time as _time
+        if self._transfer_progress_var is None or self._transfer_label_var is None:
+            return
+        self._transfer_progress_var.set(percent / 100.0)
+        elapsed = _time.monotonic() - self._transfer_started_time
+        if current > 0:
+            eta_sec = (elapsed / current) * (total - current)
+            eta_str = f"  —  ETA {eta_sec:.0f}s" if eta_sec > 1 else ""
+        else:
+            eta_str = ""
+        self._transfer_label_var.set(f"{percent}%  —  {current}/{total} pacchetti{eta_str}")
+        if percent >= 100:
+            self._close_transfer_dialog(success=True)
+
+    def _close_transfer_dialog(self, success: bool = True) -> None:
+        d = self._transfer_dialog
+        if d is None:
+            return
+        self._transfer_dialog = None
+        self._container_transfer_request_id = None
+        try:
+            d.grab_release()
+            d.destroy()
+        except Exception:
+            pass
+        if success:
+            self._append_log("System", "✅ Container trasferito e salvato sul telefono.")
+
 
     def _toggle_pip(self) -> None:
 
@@ -1550,8 +1611,13 @@ class DesktopChatApp:
             percent = event.get("percent")
             current = event.get("current_packets")
             total = event.get("total_packets")
+            request_id = event.get("request_id", "")
             if isinstance(percent, int) and isinstance(current, int) and isinstance(total, int):
-                self.status_var.set(f"Sending payload... {percent}% ({current}/{total} packets)")
+                # Update status bar always
+                self.status_var.set(f"📡 Invio... {percent}% ({current}/{total} pacchetti)")
+                # Update dedicated progress dialog if this is a container transfer
+                if request_id == self._container_transfer_request_id:
+                    self._update_transfer_dialog(percent, current, total)
             return
 
         if event_type == "sent":
@@ -1564,6 +1630,12 @@ class DesktopChatApp:
             message_type = message.get("type")
             message_id = str(message.get("messageId", "")).strip()
             target_session = self._pending_request_session.get(message_id, self.active_session_id)
+
+            if message_type == "container_ack":
+                chunk_count = message.get("chunkCount", "?")
+                self._close_transfer_dialog(success=False)  # dialog already logged via _close
+                self._append_log("System", f"📱 Container confermato dal telefono ({chunk_count} chunk salvati).")
+                return
 
             if message_type == "status":
                 state = str(message.get("state", "processing"))
