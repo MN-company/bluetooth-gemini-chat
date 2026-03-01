@@ -8,7 +8,7 @@ Chat PC <-> Android via BLE (senza Wi-Fi sul PC), con Gemini sul telefono.
 - Supporto multi-client BLE (piu desktop connessi allo stesso telefono, risposta routata al client corretto).
 - Selettore modello da PC (`phone-default` o override per richiesta).
 - Lista modelli disponibili da API direttamente nell'app Android.
-- Hotkey globale desktop per screenshot area -> invio diretto a Gemini -> overlay risposta semitrasparente.
+- Screenshot rapido con overlay risposta (Windows: hotkey globale, macOS: Apple Shortcuts wrapper).
 - APK pronta in `dist/app-debug.apk`.
 
 ## Installazione rapida (altri dispositivi)
@@ -21,7 +21,7 @@ Chat PC <-> Android via BLE (senza Wi-Fi sul PC), con Gemini sul telefono.
    - `desktop-Windows` -> `BluetoothGeminiChat-windows.zip`
 4. Estrai e avvia l'eseguibile (`BluetoothGeminiChat.app` su macOS, `BluetoothGeminiChat.exe` su Windows).
 
-Nota: su macOS devi concedere `Accessibility` e `Screen Recording` per la hotkey globale e gli screenshot area.
+Nota: su macOS devi concedere `Screen Recording` per gli screenshot area.
 
 ### 1) Android (APK)
 1. Abilita `USB debugging` sul telefono.
@@ -44,7 +44,9 @@ Nota: su macOS devi concedere `Accessibility` e `Screen Recording` per la hotkey
 2. Avvia app desktop.
 3. `Scan` -> seleziona telefono -> `Connect`.
 4. Scrivi prompt e `Send`.
-5. Hotkey rapida overlay: `Cmd+Shift+G` (macOS) o `Ctrl+Shift+G` (Windows).
+5. Overlay rapido:
+   - macOS: Shortcut Apple con `~/.gemini_ble/ask_gemini_ble_shot.sh` (es. `Cmd+Shift+G`)
+   - Windows: `Ctrl+Shift+G` (hotkey globale integrata)
 
 ## Script utili
 - `scripts/setup_desktop.sh`: crea venv e installa dipendenze desktop.

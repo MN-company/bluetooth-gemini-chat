@@ -128,10 +128,28 @@ class BleServerManager(
                         val payload = assembler.addFrame(frame)
                         if (payload != null) {
                             lastActiveDeviceAddress = device.address
-                            val json = payload.toString(Charsets.UTF_8)
-                            onLog("Received request JSON (${json.length} bytes) from ${device.address}")
-                            scope.launch {
-                                onPromptJson(json, device.address)
+                            val json = if (
+                                payload.size >= 3 &&
+                                payload[0] == 'g'.code.toByte() &&
+                                payload[1] == 'z'.code.toByte() &&
+                                payload[2] == 1.toByte()
+                            ) {
+                                onLog("Decompressing payload (${payload.size} bytes)")
+                                try {
+                                    java.util.zip.GZIPInputStream(java.io.ByteArrayInputStream(payload, 3, payload.size - 3)).bufferedReader(Charsets.UTF_8).use { it.readText() }
+                                } catch (e: Exception) {
+                                    onLog("Decompression failed: ${e.message}")
+                                    ""
+                                }
+                            } else {
+                                payload.toString(Charsets.UTF_8)
+                            }
+
+                            if (json.isNotEmpty()) {
+                                onLog("Received request JSON (${json.length} chars) from ${device.address}")
+                                scope.launch {
+                                    onPromptJson(json, device.address)
+                                }
                             }
                         }
                     }

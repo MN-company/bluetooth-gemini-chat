@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
 import io
 import json
 import mimetypes
@@ -104,6 +105,7 @@ class BleChatClient:
         thinking_enabled: bool = False,
         thinking_budget: int | None = None,
         include_thoughts: bool = False,
+        active_container_id: str | None = None,
     ) -> str:
         request_id = str(uuid.uuid4())
         message = {
@@ -118,6 +120,8 @@ class BleChatClient:
             message["model"] = model.strip()
         if isinstance(thinking_budget, int):
             message["thinkingBudget"] = thinking_budget
+        if active_container_id is not None:
+            message["activeContainerId"] = active_container_id
 
         if context_blocks:
             message["contextBlocks"] = context_blocks
@@ -137,6 +141,46 @@ class BleChatClient:
                 f"Reduce prompt/context/image (max {MAX_REQUEST_BYTES} bytes)."
             )
         self._run_coro(self._send_payload(payload, request_id))
+        return request_id
+
+    def send_container(self, container_dict: dict[str, Any]) -> str:
+        """Transfer a full container to Android. Returns request_id for ACK matching.
+
+        Payload is gzip-compressed (level 6) to minimise BLE packet count.
+        `terms` are stripped from chunks — Android recomputes them from `text`.
+        Android detects compression via the magic 4-byte prefix b'gz:\\x01'.
+        """
+        request_id = str(uuid.uuid4())
+
+        # Strip terms to reduce size; Android recomputes them on load
+        lean_chunks = [
+            {"source": ch["source"], "page": ch.get("page", 0), "text": ch["text"]}
+            for ch in container_dict.get("chunks", [])
+        ]
+        message = {
+            "type": "load_container",
+            "messageId": request_id,
+            "containerId": container_dict["id"],
+            "containerName": container_dict["name"],
+            "chunks": lean_chunks,
+        }
+        raw_json = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        compressed = gzip.compress(raw_json, compresslevel=6)
+        # Prefix so Android can detect this is compressed: magic b"gz\x01" + compressed bytes
+        payload = b"gz\x01" + compressed
+
+        raw_kb = len(raw_json) // 1024
+        cmp_kb = len(payload) // 1024
+        ratio = 100 - int(len(payload) / max(len(raw_json), 1) * 100)
+        self._emit({"type": "status", "text": f"Container compressed: {raw_kb}KB → {cmp_kb}KB (-{ratio}%)"})
+
+        MAX_CONTAINER_BYTES = 4 * 1024 * 1024
+        if len(payload) > MAX_CONTAINER_BYTES:
+            raise ValueError(
+                f"Container too large even after compression ({cmp_kb}KB). "
+                f"Split into smaller containers."
+            )
+        self._run_coro(self._send_payload(payload, request_id, reliable=True))
         return request_id
 
     def _run_loop(self) -> None:
@@ -340,7 +384,7 @@ class BleChatClient:
             await asyncio.sleep(backoff)
             attempt += 1
 
-    async def _send_payload(self, payload: bytes, request_id: str, emit_sent_event: bool = True) -> None:
+    async def _send_payload(self, payload: bytes, request_id: str, emit_sent_event: bool = True, reliable: bool = False) -> None:
         client = self._client
         if client is None or not client.is_connected:
             if emit_sent_event:
@@ -358,17 +402,18 @@ class BleChatClient:
             self._emit({"type": "status", "text": f"Sending large payload ({packet_count} BLE packets)..."})
 
         try:
-            throttle_every = 16 if packet_count > 140 else 4
-            throttle_delay = 0.0008 if packet_count > 140 else 0.0017
+            throttle_every = 12 if packet_count > 140 else 5
+            throttle_delay = 0.0015 if packet_count > 140 else 0.003
             progress_step = max(packet_count // 12, 1)
 
             for idx, packet in enumerate(packets, start=1):
                 try:
-                    await client.write_gatt_char(WRITE_CHAR_UUID, packet, response=False)
+                    # If reliable=True, force response=True for guaranteed delivery
+                    await client.write_gatt_char(WRITE_CHAR_UUID, packet, response=reliable)
                 except BleakError:
                     await client.write_gatt_char(WRITE_CHAR_UUID, packet, response=True)
 
-                if packet_count >= 90 and (idx % progress_step == 0 or idx == packet_count):
+                if idx % progress_step == 0 or idx == packet_count:
                     pct = int((idx / packet_count) * 100)
                     self._emit(
                         {
@@ -380,7 +425,7 @@ class BleChatClient:
                         }
                     )
 
-                if idx % throttle_every == 0:
+                if not reliable and idx % throttle_every == 0:
                     await asyncio.sleep(throttle_delay)
 
             if emit_sent_event:

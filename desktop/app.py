@@ -13,9 +13,17 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, simpledialog, ttk
 from typing import Any
+from tkinterdnd2 import TkinterDnD, DND_FILES
+
+class CTkinterDnD(ctk.CTk, TkinterDnD.DnDWrapper):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.TkdndVersion = TkinterDnD._require(self)
+
 
 from ble_client import BleChatClient
 from chat_sessions import ChatSessionsStore
+from context_store import ContextStore
 from pdf_context import PdfContextEngine
 
 try:
@@ -30,21 +38,24 @@ except Exception:
 
 MODEL_PRESETS = [
     "phone-default",
-    "gemini-2.5-flash",
     "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro-preview-03-25",
+    "gemini-2.5-flash-preview-04-17",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
+    "gemini-2.0-pro-exp",
 ]
 
 
 class DesktopChatApp:
     def __init__(self) -> None:
-        self.root = ctk.CTk()
+        self.root = CTkinterDnD()
         self.root.title("Gemini BLE Chat")
         self.root.geometry("1240x780")
         self.root.minsize(300, 400)
+        self.root.drop_target_register(DND_FILES)
+        self.root.dnd_bind('<<Drop>>', self._on_file_drop)
 
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.client = BleChatClient(self.events.put)
@@ -71,13 +82,32 @@ class DesktopChatApp:
         self._md_link_urls: dict[str, str] = {}
         self._pip_mode_active = False
         self._pre_pip_geometry = ""
+        self._is_macos = platform.system().lower() == "darwin"
         self._overlay_listener: Any | None = None
-        self._overlay_hotkey = "Cmd+Shift+G" if platform.system().lower() == "darwin" else "Ctrl+Shift+G"
+        self._overlay_hotkey = "Apple Shortcut (Cmd+Shift+G)" if self._is_macos else "Ctrl+Shift+G"
         self._overlay_request_ids: set[str] = set()
         self._overlay_image_paths_by_request: dict[str, str] = {}
         self._overlay_hide_after_id: str | None = None
         self._overlay_window: tk.Toplevel | None = None
         self._overlay_text_var = tk.StringVar(value="")
+        self._toggle_flag_path = Path(__file__).with_name("toggle.flag")
+        self._toggle_flag_mtime = 0.0
+        self._clipboard_flag_path = Path(__file__).with_name("clipboard.flag")
+        self._clipboard_flag_mtime = 0.0
+
+        self._settings_path = Path(__file__).with_name("settings.json")
+        _saved = self._load_settings()
+        self.system_instructions_var = tk.StringVar(value=_saved.get("system_instructions", ""))
+        self.pinned_pdf_paths: list[str] = _saved.get("pinned_pdf_paths", [])
+
+        self._context_store = ContextStore(Path(__file__).parent)
+        self._active_container_id: str | None = None
+        self._selected_container_idx: int | None = None
+        self._container_transfer_request_id: str | None = None
+        self._transfer_dialog: ctk.CTkToplevel | None = None
+        self._transfer_progress_var: tk.DoubleVar | None = None
+        self._transfer_label_var: tk.StringVar | None = None
+        self._transfer_started_time: float = 0.0
 
         self._configure_theme()
         self._build_ui()
@@ -122,7 +152,8 @@ class DesktopChatApp:
         
         ctk.CTkButton(header_left, text="ADD PDF", command=self.on_add_pdf, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT, padx=(0, 6))
         ctk.CTkButton(header_left, text="CLIPBOARD", command=self.on_clipboard_send, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT, padx=(0, 6))
-        ctk.CTkButton(header_left, text="SCREENSHOT", command=self.on_quick_screenshot, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT)
+        ctk.CTkButton(header_left, text="SCREENSHOT", command=self.on_quick_screenshot, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT, padx=(0, 6))
+        ctk.CTkButton(header_left, text="⚙️", command=self.on_open_settings, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=30).pack(side=tk.LEFT)
 
         # Header Right: Device Name / Connection info
         header_right = ctk.CTkFrame(self.header_frame, fg_color="transparent")
@@ -139,7 +170,7 @@ class DesktopChatApp:
 
 
         # --- SIDEBAR (Row 1, Col 0) ---
-        self.sidebar_frame = ctk.CTkFrame(self.root, width=280, fg_color="transparent")
+        self.sidebar_frame = ctk.CTkFrame(self.root, width=310, fg_color="transparent")
         self.sidebar_frame.grid(row=1, column=0, sticky="ns", padx=(12, 6), pady=(0, 12))
         self.sidebar_frame.grid_propagate(False)
         
@@ -148,6 +179,21 @@ class DesktopChatApp:
         chats_header.pack(fill=tk.X, pady=(0, 6))
         ctk.CTkLabel(chats_header, text="chats", font=("Avenir", 18)).pack(side=tk.LEFT)
         ctk.CTkButton(chats_header, text="+", command=self.on_new_chat, width=30, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0").pack(side=tk.RIGHT)
+
+        # Chat Search
+        self.search_var = tk.StringVar()
+        self.search_entry = ctk.CTkEntry(
+            self.sidebar_frame,
+            textvariable=self.search_var,
+            placeholder_text="Cerca chat...",
+            height=28,
+            font=("Avenir", 12),
+            fg_color="#1c1c1c",
+            border_width=1,
+            border_color="#333333"
+        )
+        self.search_entry.pack(fill=tk.X, pady=(0, 6))
+        self.search_entry.bind("<KeyRelease>", lambda e: self._refresh_sessions_list(self.active_session_id))
 
         # Chats listbox
         self.chats_list = tk.Listbox(
@@ -160,8 +206,73 @@ class DesktopChatApp:
             relief=tk.SOLID,
             highlightthickness=0,
         )
-        self.chats_list.pack(fill=tk.BOTH, expand=True, pady=(0, 16))
+        self.chats_list.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         self.chats_list.bind("<<ListboxSelect>>", self._on_session_selected)
+
+        # --- Knowledge Base Container Panel ---
+        separator = ctk.CTkFrame(self.sidebar_frame, height=1, fg_color="#2a2a2a")
+        separator.pack(fill=tk.X, pady=(6, 8))
+
+        kb_header = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        kb_header.pack(fill=tk.X, pady=(0, 4))
+        ctk.CTkLabel(kb_header, text="📚 Libreria", font=("Avenir", 14, "bold"), text_color="#b0b0b0").pack(side=tk.LEFT)
+        ctk.CTkButton(
+            kb_header, text="＋ Nuovo", command=self._on_create_container,
+            width=72, height=24, fg_color="#1f538d", hover_color="#2a6bc7",
+            text_color="white", font=("Avenir", 11),
+        ).pack(side=tk.RIGHT)
+
+        self.container_list = tk.Listbox(
+            self.sidebar_frame,
+            bg="#181818",
+            fg="#cccccc",
+            selectbackground="#1e5c1e",
+            selectforeground="#ffffff",
+            activestyle=tk.NONE,
+            borderwidth=1,
+            relief=tk.SOLID,
+            highlightthickness=0,
+            height=5,
+            font=("Avenir", 12),
+        )
+        self.container_list.pack(fill=tk.X, pady=(0, 4))
+        self.container_list.bind("<<ListboxSelect>>", self._on_container_list_click)
+        self.container_list.bind("<Double-Button-1>", self._on_activate_container)
+
+        # Row 1: Add PDF | Attiva | Upload
+        kb_row1 = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        kb_row1.pack(fill=tk.X, pady=(0, 3))
+        ctk.CTkButton(
+            kb_row1, text="📎 Aggiungi PDF", command=self._on_add_pdf_to_container,
+            height=30, fg_color="transparent", border_width=1, border_color="#444",
+            hover_color="#2a2a2a", text_color="#e0e0e0", font=("Avenir", 11),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+        ctk.CTkButton(
+            kb_row1, text="✓ Attiva", command=self._on_activate_container,
+            width=68, height=30, fg_color="#1e5c1e", hover_color="#2a7a2a",
+            text_color="white", font=("Avenir", 11),
+        ).pack(side=tk.LEFT, padx=(0, 3))
+        ctk.CTkButton(
+            kb_row1, text="📤", command=self._on_upload_container,
+            width=34, height=30, fg_color="transparent", border_width=1, border_color="#444",
+            hover_color="#2a2a2a", text_color="#d0d0d0", font=("Avenir", 13),
+        ).pack(side=tk.LEFT)
+
+        # Row 2: Active indicator + Delete
+        kb_row2 = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        kb_row2.pack(fill=tk.X, pady=(0, 8))
+        self._kb_active_label = ctk.CTkLabel(
+            kb_row2, text="nessun container attivo",
+            font=("Avenir", 10), text_color="#555555",
+        )
+        self._kb_active_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ctk.CTkButton(
+            kb_row2, text="🗑", command=self._on_delete_container,
+            width=30, height=24, fg_color="transparent", border_width=1, border_color="#5c1a1a",
+            hover_color="#5c1a1a", text_color="#e0e0e0", font=("Avenir", 12),
+        ).pack(side=tk.RIGHT)
+
+        self._refresh_container_list()
         
         # Extra tool buttons collapsed at bottom of sidebar since sketch didn't strictly place them
         self._build_button_grid(
@@ -185,7 +296,7 @@ class DesktopChatApp:
         self.devices_list.pack(fill=tk.X, pady=(0, 6))
         ctk.CTkLabel(
             self.sidebar_frame,
-            text=f"Hotkey: {self._overlay_hotkey}",
+            text=f"Trigger: {self._overlay_hotkey}",
             text_color="#a1a1a1",
             font=("Avenir", 10),
         ).pack(anchor=tk.W, pady=(0, 6))
@@ -246,6 +357,7 @@ class DesktopChatApp:
         )
         self.prompt_entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.prompt_entry.bind("<Return>", self._on_prompt_return)
+        self.prompt_entry.bind("<KeyRelease>", self._adjust_input_height)
         self.prompt_entry.bind("<Command-BackSpace>", self._on_clear_composer_hotkey)
         self.prompt_entry.bind("<Command-Delete>", self._on_clear_composer_hotkey)
 
@@ -258,9 +370,303 @@ class DesktopChatApp:
         self.memory_var = tk.StringVar(value="")
         
         self.root.bind("<Configure>", self._on_window_resize)
+        
+        # --- GLOBAL HOTKEYS BINDING ---
+        self.root.bind("<Command-n>", lambda e: [self.on_new_chat(), self.prompt_entry.focus()])
+        self.root.bind("<Command-r>", lambda e: self.on_rename_chat())
+        self.root.bind("<Command-BackSpace>", self._on_global_backspace_hotkey)
+        self.root.bind("<Command-k>", lambda e: self.search_entry.focus())
+        self.root.bind("<Command-f>", lambda e: self.search_entry.focus())
+        
         self._is_compact_mode = False
 
+    def _on_global_backspace_hotkey(self, event) -> str | None:
+        if event.widget == self.prompt_entry._textbox:
+            self._on_clear_composer_hotkey(event)
+            return "break"
+        # If we're not inside the textbox, attempt to delete the active chat
+        self.on_delete_chat()
+        return "break"
+
+    def _load_settings(self) -> dict[str, Any]:
+        if not self._settings_path.exists():
+            return {}
+        try:
+            with self._settings_path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_settings(self, data: dict[str, Any]) -> None:
+        try:
+            with self._settings_path.open("w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    def on_open_settings(self) -> None:
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Settings")
+        dialog.geometry("540x540")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # --- Section 1: System Instructions ---
+        ctk.CTkLabel(dialog, text="System Instructions (Global Prompt):", font=("Avenir", 14, "bold")).pack(pady=(12, 4), padx=12, anchor=tk.W)
+        ctk.CTkLabel(dialog, text="Iniettate silenziosamente in ogni richiesta.", font=("Avenir", 11), text_color="#888888").pack(padx=12, anchor=tk.W)
+
+        textbox = ctk.CTkTextbox(dialog, height=120, font=("Avenir", 13), fg_color="#1e1e1e", border_width=1, border_color="#333333")
+        textbox.pack(fill=tk.X, padx=12, pady=(6, 12))
+        textbox.insert("1.0", self.system_instructions_var.get())
+
+        # --- Section 2: Pinned PDFs ---
+        ctk.CTkLabel(dialog, text="📚 Documenti Fissi (PDF sempre attivi):", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        ctk.CTkLabel(dialog, text="Allegati automaticamente ad ogni messaggio senza doverli ricaricare.", font=("Avenir", 11), text_color="#888888").pack(padx=12, anchor=tk.W)
+
+        pinned_list_var = tk.Variable(value=list(self.pinned_pdf_paths))
+        pdf_listbox = tk.Listbox(
+            dialog,
+            listvariable=pinned_list_var,
+            height=5,
+            bg="#1e1e1e",
+            fg="#dddddd",
+            selectbackground="#1f538d",
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Avenir", 12),
+        )
+        pdf_listbox.pack(fill=tk.X, padx=12, pady=(6, 4))
+
+        def add_pdf() -> None:
+            from tkinter import filedialog
+            paths = filedialog.askopenfilenames(
+                parent=dialog, title="Seleziona PDF",
+                filetypes=[("PDF", "*.pdf"), ("All Files", "*")],
+            )
+            current = list(pinned_list_var.get())
+            for p in paths:
+                if p not in current:
+                    current.append(p)
+            pinned_list_var.set(current)
+
+        def remove_pdf() -> None:
+            idxs = pdf_listbox.curselection()
+            current = list(pinned_list_var.get())
+            for i in reversed(idxs):
+                del current[i]
+            pinned_list_var.set(current)
+
+        pdf_btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        pdf_btn_row.pack(fill=tk.X, padx=12, pady=(0, 12))
+        ctk.CTkButton(pdf_btn_row, text="+ Aggiungi PDF", command=add_pdf, width=120, fg_color="#1f538d").pack(side=tk.LEFT, padx=(0, 8))
+        ctk.CTkButton(pdf_btn_row, text="− Rimuovi selezionato", command=remove_pdf, width=160, fg_color="transparent", border_width=1, hover_color="#333333").pack(side=tk.LEFT)
+
+        def save() -> None:
+            text = textbox.get("1.0", tk.END).strip()
+            self.system_instructions_var.set(text)
+            self.pinned_pdf_paths = list(pinned_list_var.get())
+            old_settings = self._load_settings()
+            old_settings["system_instructions"] = text
+            old_settings["pinned_pdf_paths"] = self.pinned_pdf_paths
+            self._save_settings(old_settings)
+            dialog.destroy()
+            n = len(self.pinned_pdf_paths)
+            self._append_log("System", f"Settings saved. Pinned PDFs: {n}. System instructions: {'YES' if text else 'none'}.")
+
+        ctk.CTkButton(dialog, text="💾 SALVA", command=save, fg_color="#1f538d").pack(pady=(0, 14))
+
+    # ── Knowledge Base Container handlers ─────────────────────────────────────
+
+    def _refresh_container_list(self) -> None:
+        self.container_list.delete(0, tk.END)
+        containers = self._context_store.all()
+        for c in containers:
+            active_mark = "✓ " if c.id == self._active_container_id else "   "
+            label = f"{active_mark}{c.name}  ({c.total_chunks()} chunk)"
+            self.container_list.insert(tk.END, label)
+
+        # Restore the highlighted selection
+        if self._selected_container_idx is not None and self._selected_container_idx < len(containers):
+            self.container_list.selection_set(self._selected_container_idx)
+            self.container_list.see(self._selected_container_idx)
+
+        # Update the active indicator label
+        active = next((c for c in containers if c.id == self._active_container_id), None)
+        if active:
+            self._kb_active_label.configure(
+                text=f"● {active.name} attivo", text_color="#4caf50"
+            )
+        else:
+            self._kb_active_label.configure(text="nessun container attivo", text_color="#555555")
+
+    def _selected_container_id(self) -> str | None:
+        """Return the ID of the currently highlighted container (survives refresh)."""
+        # Prefer the tracked index (survives _refresh_container_list)
+        idx = self._selected_container_idx
+        if idx is None:
+            sel = self.container_list.curselection()
+            if sel:
+                idx = sel[0]
+        if idx is None:
+            return None
+        containers = self._context_store.all()
+        if idx >= len(containers):
+            return None
+        return containers[idx].id
+
+    def _on_create_container(self) -> None:
+        name = simpledialog.askstring("Nuovo Container", "Nome della libreria:", parent=self.root)
+        if not name or not name.strip():
+            return
+        c = self._context_store.create(name.strip())
+        self._append_log("System", f"Container creato: '{c.name}' (id: {c.id[:8]})")
+        self._refresh_container_list()
+
+    def _on_container_list_click(self, _event=None) -> None:
+        """User clicked a container row — update the highlighted index."""
+        sel = self.container_list.curselection()
+        if not sel:
+            return
+        self._selected_container_idx = sel[0]
+        # Don't set active yet — user uses the ✓ toggle via double-click or separate activate button.
+        # Just refresh labels so the selection is visible.
+        self._refresh_container_list()
+
+    def _on_activate_container(self, _event=None) -> None:
+        """Double-click on container row → activate/deactivate it."""
+        cid = self._selected_container_id()
+        if cid is None:
+            return
+        if self._active_container_id == cid:
+            self._active_container_id = None
+            self._append_log("System", "Container deattivato — contesto PDF disabilitato")
+        else:
+            self._active_container_id = cid
+            c = self._context_store.get(cid)
+            if c:
+                self._append_log("System", f"Container attivo: '{c.name}' ({c.total_chunks()} chunk)")
+        self._refresh_container_list()
+
+    def _on_add_pdf_to_container(self) -> None:
+        cid = self._selected_container_id()
+        if cid is None:
+            self._append_log("System", "Seleziona prima un container dalla lista 📚")
+            return
+        paths = filedialog.askopenfilenames(
+            parent=self.root, title="Aggiungi PDF al container",
+            filetypes=[("PDF", "*.pdf"), ("All Files", "*")],
+        )
+        if not paths:
+            return
+        c = self._context_store.get(cid)
+        for p in paths:
+            try:
+                n = self._context_store.add_pdf(cid, p)
+                self._append_log("System", f"PDF aggiunto: {Path(p).name} → {n} chunk estratti")
+            except ValueError as exc:
+                self._append_log("Error", str(exc))
+        self._refresh_container_list()
+
+    def _on_delete_container(self) -> None:
+        from tkinter import messagebox
+        cid = self._selected_container_id()
+        if cid is None:
+            return
+        c = self._context_store.get(cid)
+        if not messagebox.askyesno("Elimina Container", f"Eliminare '{c.name if c else cid}'?", parent=self.root):
+            return
+        self._context_store.delete(cid)
+        if self._active_container_id == cid:
+            self._active_container_id = None
+        self._refresh_container_list()
+        self._append_log("System", "Container eliminato")
+
+    def _on_upload_container(self) -> None:
+        cid = self._selected_container_id()
+        if cid is None:
+            self._append_log("System", "Seleziona un container da caricare sul telefono")
+            return
+        if not self.connected:
+            self._append_log("System", "Non connesso — connetti il bridge Android prima di caricare")
+            return
+        c = self._context_store.get(cid)
+        if c is None or c.total_chunks() == 0:
+            self._append_log("System", "Container vuoto — aggiungi prima dei PDF")
+            return
+        try:
+            container_dict = self._context_store.export_for_transfer(cid)
+            payload_bytes = len(str(container_dict).encode("utf-8"))
+            size_kb = payload_bytes // 1024
+            self._append_log("System", f"Avvio trasferimento container '{c.name}' (~{size_kb}KB, {c.total_chunks()} chunk)...")
+            request_id = self.client.send_container(container_dict)
+            self._container_transfer_request_id = request_id
+            self._open_transfer_dialog(c.name, size_kb)
+        except ValueError as exc:
+            self._append_log("Error", str(exc))
+
+    # ── Transfer progress dialog ──────────────────────────────────────────────
+
+    def _open_transfer_dialog(self, container_name: str, size_kb: int) -> None:
+        import time as _time
+        self._transfer_started_time = _time.monotonic()
+
+        d = ctk.CTkToplevel(self.root)
+        d.title("Trasferimento BLE")
+        d.geometry("400x180")
+        d.resizable(False, False)
+        d.grab_set()
+        d.attributes("-topmost", True)
+        self._transfer_dialog = d
+
+        ctk.CTkLabel(d, text=f"📡 Caricamento libreria sul telefono", font=("Avenir", 14, "bold")).pack(pady=(18, 4))
+        ctk.CTkLabel(d, text=container_name, font=("Avenir", 12), text_color="#888888").pack()
+
+        self._transfer_progress_var = tk.DoubleVar(value=0.0)
+        bar = ctk.CTkProgressBar(d, variable=self._transfer_progress_var, width=340, height=14)
+        bar.pack(pady=(14, 6))
+
+        self._transfer_label_var = tk.StringVar(value=f"0%  —  0 / ? pacchetti  (~{size_kb} KB)")
+        ctk.CTkLabel(d, textvariable=self._transfer_label_var, font=("Avenir", 11), text_color="#aaaaaa").pack()
+
+    def _update_transfer_dialog(self, percent: int, current: int, total: int) -> None:
+        import time as _time
+        if self._transfer_progress_var is None or self._transfer_label_var is None:
+            return
+        self._transfer_progress_var.set(percent / 100.0)
+        elapsed = _time.monotonic() - self._transfer_started_time
+        if current > 0:
+            eta_sec = (elapsed / current) * (total - current)
+            eta_str = f"  —  ETA {eta_sec:.0f}s" if eta_sec > 1 else ""
+        else:
+            eta_str = ""
+        self._transfer_label_var.set(f"{percent}%  —  {current}/{total} pacchetti{eta_str}")
+        if percent >= 100:
+            self._close_transfer_dialog(success=True)
+
+    def _close_transfer_dialog(self, success: bool = True) -> None:
+        d = self._transfer_dialog
+        if d is None:
+            return
+        self._transfer_dialog = None
+        self._container_transfer_request_id = None
+        try:
+            d.grab_release()
+            d.destroy()
+        except Exception:
+            pass
+        if success:
+            self._append_log("System", "➜ Pacchetti inviati. In attesa di conferma di salvataggio dal telefono...")
+            # Auto-activate the container that was just uploaded
+            cid = self._selected_container_id()
+            if cid:
+                self._active_container_id = cid
+                c = self._context_store.get(cid)
+                self._append_log("System", f"Container auto-attivato: {c.name if c else cid}")
+                self._refresh_container_list()
+
+
     def _toggle_pip(self) -> None:
+
         if self.pip_enabled.get():
             self._pip_mode_active = True
             self._pre_pip_geometry = self.root.geometry()
@@ -383,11 +789,18 @@ class DesktopChatApp:
         return "break"
 
     def _start_overlay_hotkey_listener(self) -> None:
+        if self._is_macos:
+            self._append_log(
+                "System",
+                "Overlay trigger su macOS via Apple Shortcuts: ~/.gemini_ble/ask_gemini_ble_shot.sh",
+            )
+            return
+
         if pynput_keyboard is None:
             self._append_log("System", "Global hotkey disabled: install 'pynput' to enable overlay shortcut")
             return
 
-        combo = "<cmd>+<shift>+g" if platform.system().lower() == "darwin" else "<ctrl>+<shift>+g"
+        combo = "<ctrl>+<shift>+g"
         try:
             listener = pynput_keyboard.GlobalHotKeys(
                 {
@@ -611,12 +1024,40 @@ class DesktopChatApp:
             role_tag, msg_tag = "role_system", "msg_system"
 
         self.chat_log.configure(state='normal')
-        self.chat_log.insert(tk.END, f"{role}\n", role_tag)
-        if role_key in {"gemini", "assistant"}:
-            self._insert_markdown_message(clean, msg_tag)
-            self.chat_log.insert(tk.END, "\n", msg_tag)
+        
+        if role_key == "thought":
+            is_streaming = clean.endswith("▌")
+            word_count = len(clean.split())
+            btn_text = f"[-] Thinking... ({word_count} w)" if is_streaming else f"[+] Mostra Ragionamento ({word_count} parole)"
+            
+            tag_name = f"thought_block_{self._md_link_seq}"
+            btn_tag = f"thought_btn_{self._md_link_seq}"
+            self._md_link_seq += 1
+            
+            self.chat_log.insert(tk.END, f"{btn_text}\n", (role_tag, btn_tag))
+            
+            # Config block element initially hidden if not streaming
+            self.chat_log._textbox.tag_configure(tag_name, elide=not is_streaming)
+            self.chat_log.insert(tk.END, f"{clean}\n\n", (msg_tag, tag_name))
+            
+            # Click bound to button
+            def toggle_thought(e, t=tag_name):
+                # get direct tag conf from actual text widget
+                state = self.chat_log._textbox.tag_cget(t, "elide")
+                new_state = False if str(state) == "1" else True
+                self.chat_log._textbox.tag_configure(t, elide=new_state)
+
+            self.chat_log._textbox.tag_bind(btn_tag, "<Button-1>", toggle_thought)
+            self.chat_log._textbox.tag_bind(btn_tag, "<Enter>", lambda _e: self.chat_log.configure(cursor="hand2"))
+            self.chat_log._textbox.tag_bind(btn_tag, "<Leave>", lambda _e: self.chat_log.configure(cursor="xterm"))
         else:
-            self.chat_log.insert(tk.END, f"{clean}\n\n", msg_tag)
+            self.chat_log.insert(tk.END, f"{role}\n", role_tag)
+            if role_key in {"gemini", "assistant"}:
+                self._insert_markdown_message(clean, msg_tag)
+                self.chat_log.insert(tk.END, "\n", msg_tag)
+            else:
+                self.chat_log.insert(tk.END, f"{clean}\n\n", msg_tag)
+
         self.chat_log.see(tk.END)
         self.chat_log.configure(state='disabled')
 
@@ -767,6 +1208,10 @@ class DesktopChatApp:
         self._refresh_sessions_list(self.active_session_id)
 
     def on_delete_chat(self) -> None:
+        from tkinter import messagebox
+        if not messagebox.askyesno("Delete Chat", "Are you sure you want to delete this conversation?", parent=self.root):
+            return
+            
         removed = self.sessions_store.delete_session(self.active_session_id)
         if not removed:
             return
@@ -782,13 +1227,24 @@ class DesktopChatApp:
         self._session_ids_in_view = []
         selected_idx: int | None = None
         target = selected_session_id or self.active_session_id
+        
+        try:
+            query = self.search_var.get().lower().strip()
+        except AttributeError:
+            query = ""
+            
         for idx, session in enumerate(sessions):
             title = str(session["title"])
             count = int(session["messageCount"])
+            
+            if query and query not in title.lower():
+                continue
+                
             self.chats_list.insert(tk.END, f"{title} ({count})")
             self._session_ids_in_view.append(session["id"])
             if session["id"] == target:
-                selected_idx = idx
+                selected_idx = len(self._session_ids_in_view) - 1
+                
         if selected_idx is not None:
             self.chats_list.selection_clear(0, tk.END)
             self.chats_list.selection_set(selected_idx)
@@ -836,7 +1292,7 @@ class DesktopChatApp:
             return
         self._set_selected_image(path)
 
-    def on_hotkey_overlay_triggered(self) -> None:
+    def on_hotkey_overlay_triggered(self, prompt_override: str | None = None) -> None:
         if not self.connected:
             self._show_overlay_message("Bridge non connesso", ttl_ms=3500)
             return
@@ -852,7 +1308,11 @@ class DesktopChatApp:
         thinking_enabled = self.thinking_enabled.get()
         include_thoughts = thinking_enabled and self.show_thoughts_var.get()
 
-        prompt = "Analizza rapidamente questo screenshot. Rispondi in italiano con massimo 5 righe."
+        prompt = (
+            prompt_override.strip()
+            if prompt_override and prompt_override.strip()
+            else "Analizza rapidamente questo screenshot. Rispondi in italiano con massimo 5 righe."
+        )
         try:
             request_id = self.client.send_prompt(
                 prompt,
@@ -973,10 +1433,19 @@ class DesktopChatApp:
                 continue
             if not isinstance(payload, dict):
                 continue
-            text = str(payload.get("text", "")).strip()
-            if not text:
+            payload_type = str(payload.get("type", "quick_send")).strip().lower()
+            if payload_type == "quick_send":
+                text = str(payload.get("text", "")).strip()
+                if not text:
+                    continue
+                self.events.put({"type": "quick_send", "text": text})
                 continue
-            self.events.put({"type": "quick_send", "text": text})
+            if payload_type in {"quick_overlay", "quick_shot_ask", "hotkey_overlay"}:
+                prompt = str(payload.get("prompt", "")).strip()
+                self.events.put({"type": "quick_overlay", "prompt": prompt})
+                continue
+            if payload_type == "toggle_visibility":
+                self.events.put({"type": "toggle_visibility"})
 
     def on_clear_image(self) -> None:
         self.selected_image_path = None
@@ -1007,6 +1476,44 @@ class DesktopChatApp:
         self._refresh_pdf_label()
         self._refresh_context_preview()
         self._append_log("System", "PDF context cleared")
+
+    def _on_file_drop(self, event) -> None:
+        data = getattr(event, 'data', "")
+        if not data:
+            return
+        
+        paths = []
+        if "{" in data:
+            matches = re.findall(r'\{([^}]+)\}', data)
+            if matches:
+                 paths = matches
+            else:
+                 paths = data.split()
+        else:
+            import shlex
+            try:
+                paths = shlex.split(data)
+            except ValueError:
+                paths = [data]
+                
+        added_pdfs = 0
+        for path in paths:
+            path = path.strip()
+            if not os.path.isfile(path):
+                continue
+            
+            ext = path.lower().split('.')[-1]
+            if ext == "pdf":
+                if path not in self.selected_pdf_paths:
+                    self.selected_pdf_paths.append(path)
+                    added_pdfs += 1
+            elif ext in ["png", "jpg", "jpeg", "webp", "gif", "bmp"]:
+                self._set_selected_image(path)
+                
+        if added_pdfs > 0:
+            self._append_log("System", f"Added {added_pdfs} PDF(s) to context via drag & drop")
+            self._refresh_pdf_label()
+            self._refresh_context_preview()
 
     def _refresh_pdf_label(self) -> None:
         if not self.selected_pdf_paths:
@@ -1109,14 +1616,34 @@ class DesktopChatApp:
 
         session_id = self.active_session_id
         memory_turns = self.sessions_store.recent_turns(session_id, max_items=10, max_chars=2600)
+        context_blocks = []
 
-        context_blocks: list[dict[str, Any]] = []
-        if self.selected_pdf_paths:
-            try:
-                context_blocks = self.pdf_context_engine.build_context(prompt, self.selected_pdf_paths)
-            except ValueError as exc:
-                self._append_log("Error", str(exc))
-                return
+        # --- Active container takes priority over per-session PDFs ---
+        use_container = self._active_container_id is not None
+
+        if not use_container:
+            # Legacy: system instructions + pinned PDFs + session PDFs
+            sys_instr = self.system_instructions_var.get().strip()
+            if sys_instr:
+                context_blocks.append({"type": "text", "text": f"System Instructions:\n{sys_instr}"})
+
+            all_pdf_paths = list(self.pinned_pdf_paths)
+            for p in self.selected_pdf_paths:
+                if p not in all_pdf_paths:
+                    all_pdf_paths.append(p)
+
+            if all_pdf_paths:
+                try:
+                    blocks = self.pdf_context_engine.build_context(prompt, all_pdf_paths)
+                    context_blocks.extend(blocks)
+                except ValueError as exc:
+                    self._append_log("Error", str(exc))
+                    return
+        else:
+            # Container mode: inject system instructions only; Android does retrieval
+            sys_instr = self.system_instructions_var.get().strip()
+            if sys_instr:
+                context_blocks.append({"type": "text", "text": f"System Instructions:\n{sys_instr}"})
 
         est_total, est_text, est_image = self._estimate_input_tokens(prompt, memory_turns, context_blocks)
         if est_image > 0:
@@ -1150,9 +1677,12 @@ class DesktopChatApp:
                 thinking_enabled=thinking_enabled,
                 thinking_budget=thinking_budget,
                 include_thoughts=include_thoughts,
+                active_container_id=self._active_container_id,
             )
         except ValueError as exc:
             self._append_log("Error", str(exc))
+            from tkinter import messagebox
+            messagebox.showerror("Errore di Invio", str(exc), parent=self.root)
             return
 
         self._streaming_preview_by_session.pop(session_id, None)
@@ -1186,8 +1716,41 @@ class DesktopChatApp:
         self.prompt_entry.delete("1.0", tk.END)
         self.on_clear_image()
 
+    def _consume_toggle_flag(self) -> None:
+        if not self._toggle_flag_path.exists():
+            return
+        try:
+            mtime = self._toggle_flag_path.stat().st_mtime
+            if self._toggle_flag_mtime == 0.0:
+                self._toggle_flag_mtime = mtime
+                return
+            if mtime > self._toggle_flag_mtime:
+                self._toggle_flag_mtime = mtime
+                self.events.put({"type": "toggle_visibility"})
+        except OSError:
+            pass
+    def _consume_clipboard_flag(self) -> None:
+        if not self._clipboard_flag_path.exists():
+            return
+        try:
+            mtime = self._clipboard_flag_path.stat().st_mtime
+            if self._clipboard_flag_mtime == 0.0:
+                self._clipboard_flag_mtime = mtime
+                return
+            if mtime > self._clipboard_flag_mtime:
+                self._clipboard_flag_mtime = mtime
+                import pyperclip
+                text = pyperclip.paste().strip()
+                if text:
+                    self.events.put({"type": "force_visibility"})
+                    self.events.put({"type": "quick_send", "text": f"Analizza e rispondi a questo testo copiato negli appunti:\n\n{text}"})
+        except OSError:
+            pass
+
     def _poll_events(self) -> None:
         self._consume_quick_inbox()
+        self._consume_toggle_flag()
+        self._consume_clipboard_flag()
 
         while True:
             try:
@@ -1201,8 +1764,20 @@ class DesktopChatApp:
     def _handle_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
 
+        if event_type == "force_visibility":
+            self._force_app_visibility()
+            return
+
+        if event_type == "toggle_visibility":
+            self._toggle_app_visibility()
+            return
+
         if event_type == "hotkey_overlay":
             self.on_hotkey_overlay_triggered()
+            return
+
+        if event_type == "quick_overlay":
+            self.on_hotkey_overlay_triggered(str(event.get("prompt", "")))
             return
 
         if event_type == "status":
@@ -1267,8 +1842,13 @@ class DesktopChatApp:
             percent = event.get("percent")
             current = event.get("current_packets")
             total = event.get("total_packets")
+            request_id = event.get("request_id", "")
             if isinstance(percent, int) and isinstance(current, int) and isinstance(total, int):
-                self.status_var.set(f"Sending payload... {percent}% ({current}/{total} packets)")
+                # Update status bar always
+                self.status_var.set(f"📡 Invio... {percent}% ({current}/{total} pacchetti)")
+                # Update dedicated progress dialog if this is a container transfer
+                if request_id == self._container_transfer_request_id:
+                    self._update_transfer_dialog(percent, current, total)
             return
 
         if event_type == "sent":
@@ -1307,6 +1887,12 @@ class DesktopChatApp:
                     return
 
             target_session = self._pending_request_session.get(message_id, self.active_session_id)
+
+            if message_type == "container_ack":
+                chunk_count = message.get("chunkCount", "?")
+                self._close_transfer_dialog(success=False)  # dialog already logged via _close
+                self._append_log("System", f"📱 Container confermato dal telefono ({chunk_count} chunk salvati).")
+                return
 
             if message_type == "status":
                 state = str(message.get("state", "processing"))
@@ -1374,6 +1960,41 @@ class DesktopChatApp:
             else:
                 self._append_log("System", "Quick request copied into composer (bridge not connected)")
             return
+
+    def _adjust_input_height(self, _event=None) -> None:
+        try:
+            content = self.prompt_entry.get("1.0", "end-1c")
+            lines = content.count("\n") + 1
+            width_chars = self.prompt_entry.winfo_width() // 8
+            if width_chars > 0:
+                for line in content.split("\n"):
+                    lines += len(line) // width_chars
+            target_lines = max(2, min(7, lines))
+            new_height = 60 + (target_lines - 2) * 20
+            self.prompt_entry.configure(height=new_height)
+        except Exception:
+            pass
+
+    def _force_app_visibility(self) -> None:
+        if self.root.state() == 'withdrawn' or self.root.state() == 'iconic':
+            self.root.deiconify()
+        self.root.lift()
+        if not self.pip_enabled.get():
+            self.pip_enabled.set(True)
+            self._toggle_pip()
+
+    def _toggle_app_visibility(self) -> None:
+        if self.root.state() == 'withdrawn' or self.root.state() == 'iconic':
+            self.root.deiconify()
+            self.root.lift()
+            if not self.pip_enabled.get():
+                self.pip_enabled.set(True)
+                self._toggle_pip()
+        else:
+            if self._pip_mode_active:
+                self.pip_enabled.set(False)
+                self._toggle_pip()
+            self.root.iconify()
 
     def on_close(self) -> None:
         if self._overlay_listener is not None:

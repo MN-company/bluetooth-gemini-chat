@@ -24,6 +24,12 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 class BleKeepAliveService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -37,6 +43,7 @@ class BleKeepAliveService : Service() {
     private var watchdogJob: Job? = null
     private var restartJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private lateinit var containerStore: ContainerStore
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -52,6 +59,14 @@ class BleKeepAliveService : Service() {
         BridgeRuntimeState.setServiceRunning(true)
         appendLog("Foreground BLE service created")
         updateBridgeStatus("Starting BLE bridge...")
+
+        // Load persisted containers from disk into memory
+        containerStore = ContainerStore(applicationContext)
+        val loaded = containerStore.loadAll()
+        loaded.values.forEach { BridgeRuntimeState.addOrUpdateContainer(it) }
+        if (loaded.isNotEmpty()) {
+            appendLog("Loaded ${loaded.size} container(s) from disk")
+        }
 
         startBridgeIfNeeded()
         startWatchdog()
@@ -196,6 +211,7 @@ class BleKeepAliveService : Service() {
         when (envelope.type) {
             "prompt" -> handlePromptRequest(rawJson, sourceAddress)
             "ping" -> handlePing(rawJson, sourceAddress)
+            "load_container" -> handleLoadContainer(rawJson, sourceAddress)
             else -> {
                 val messageId = envelope.messageId.ifBlank { "unknown" }
                 sendError(messageId, "Unsupported request type: ${envelope.type}", sourceAddress)
@@ -210,6 +226,51 @@ class BleKeepAliveService : Service() {
             return
         }
         sendPong(messageId = ping.messageId, clientTsMs = ping.clientTsMs, targetAddress = sourceAddress)
+    }
+
+    private suspend fun handleLoadContainer(rawJson: String, sourceAddress: String) {
+        val root: JsonObject = try {
+            json.parseToJsonElement(rawJson).jsonObject
+        } catch (t: Throwable) {
+            appendLog("load_container parse error: ${t.message}")
+            return
+        }
+        val messageId = root["messageId"]?.jsonPrimitive?.contentOrNull ?: "unknown"
+        val containerId = root["containerId"]?.jsonPrimitive?.contentOrNull
+        val containerName = root["containerName"]?.jsonPrimitive?.contentOrNull
+        if (containerId.isNullOrBlank() || containerName.isNullOrBlank()) {
+            sendError(messageId, "load_container: missing containerId or containerName", sourceAddress)
+            return
+        }
+        val chunksArray = root["chunks"]?.jsonArray ?: run {
+            sendError(messageId, "load_container: missing chunks", sourceAddress)
+            return
+        }
+        val chunks = chunksArray.mapNotNull { element ->
+            val obj = element.jsonObject
+            val source = obj["source"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+            val page = obj["page"]?.jsonPrimitive?.intOrNull ?: 0
+            val text = obj["text"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
+            var terms: List<String> = obj["terms"]?.jsonArray
+                ?.mapNotNull { it.jsonPrimitive.contentOrNull }
+                ?: emptyList()
+
+            // If terms were stripped by Mac to save bandwidth, recompute them
+            if (terms.isEmpty() && text.isNotBlank()) {
+                terms = tokenizeForBm25(text)
+            }
+
+            StoredChunk(source = source, page = page, text = text, terms = terms)
+        }
+
+        val container = StoredContainer(id = containerId, name = containerName, chunks = chunks)
+        BridgeRuntimeState.addOrUpdateContainer(container)
+        containerStore.save(container)
+        appendLog("load_container: saved '${container.name}' (${chunks.size} chunks)")
+        val ackPayload = json.encodeToString(
+            ContainerAckResponse(containerId = containerId, chunkCount = chunks.size, messageId = messageId)
+        )
+        sendToPc(ackPayload, "container_ack", messageId, sourceAddress)
     }
 
     private suspend fun handlePromptRequest(rawJson: String, sourceAddress: String) {
@@ -345,6 +406,7 @@ class BleKeepAliveService : Service() {
                 imageMimeType = request.imageMimeType?.takeIf { it.isNotBlank() },
                 contextBlocks = sanitizedContextBlocks,
                 conversationMemory = sanitizedMemoryTurns,
+                activeContainerId = request.activeContainerId?.takeIf { it.isNotBlank() },
                 onPartialText = { partial ->
                     val now = System.currentTimeMillis()
                     val longEnough = partial.length >= (lastPartialLength + 12)
@@ -547,6 +609,15 @@ class BleKeepAliveService : Service() {
             .setContentIntent(pendingIntent)
 
         return builder.build()
+    }
+    private fun tokenizeForBm25(text: String): List<String> {
+        val result = mutableSetOf<String>()
+        val tokenRegex = Regex("[A-Za-z0-9_\\u00C0-\\u024F]{2,}")
+        tokenRegex.findAll(text.lowercase()).forEach { match ->
+            val token = match.value
+            if (token.length >= 3) result.add(token)
+        }
+        return result.toList()
     }
 
     companion object {
