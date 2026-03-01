@@ -13,6 +13,13 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, simpledialog, ttk
 from typing import Any
+from tkinterdnd2 import TkinterDnD, DND_FILES
+
+class CTkinterDnD(ctk.CTk, TkinterDnD.DnDWrapper):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.TkdndVersion = TkinterDnD._require(self)
+
 
 from ble_client import BleChatClient
 from chat_sessions import ChatSessionsStore
@@ -36,10 +43,12 @@ MODEL_PRESETS = [
 
 class DesktopChatApp:
     def __init__(self) -> None:
-        self.root = ctk.CTk()
+        self.root = CTkinterDnD()
         self.root.title("Gemini BLE Chat")
         self.root.geometry("1240x780")
         self.root.minsize(300, 400)
+        self.root.drop_target_register(DND_FILES)
+        self.root.dnd_bind('<<Drop>>', self._on_file_drop)
 
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.client = BleChatClient(self.events.put)
@@ -68,6 +77,8 @@ class DesktopChatApp:
         self._pre_pip_geometry = ""
         self._toggle_flag_path = Path(__file__).with_name('toggle.flag')
         self._toggle_flag_mtime = 0.0
+        self._clipboard_flag_path = Path(__file__).with_name('clipboard.flag')
+        self._clipboard_flag_mtime = 0.0
 
         self._configure_theme()
         self._build_ui()
@@ -137,6 +148,21 @@ class DesktopChatApp:
         chats_header.pack(fill=tk.X, pady=(0, 6))
         ctk.CTkLabel(chats_header, text="chats", font=("Avenir", 18)).pack(side=tk.LEFT)
         ctk.CTkButton(chats_header, text="+", command=self.on_new_chat, width=30, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0").pack(side=tk.RIGHT)
+
+        # Chat Search
+        self.search_var = tk.StringVar()
+        search_entry = ctk.CTkEntry(
+            self.sidebar_frame,
+            textvariable=self.search_var,
+            placeholder_text="Cerca chat...",
+            height=28,
+            font=("Avenir", 12),
+            fg_color="#1c1c1c",
+            border_width=1,
+            border_color="#333333"
+        )
+        search_entry.pack(fill=tk.X, pady=(0, 6))
+        search_entry.bind("<KeyRelease>", lambda e: self._refresh_sessions_list(self.active_session_id))
 
         # Chats listbox
         self.chats_list = tk.Listbox(
@@ -385,12 +411,40 @@ class DesktopChatApp:
             role_tag, msg_tag = "role_system", "msg_system"
 
         self.chat_log.configure(state='normal')
-        self.chat_log.insert(tk.END, f"{role}\n", role_tag)
-        if role_key in {"gemini", "assistant"}:
-            self._insert_markdown_message(clean, msg_tag)
-            self.chat_log.insert(tk.END, "\n", msg_tag)
+        
+        if role_key == "thought":
+            is_streaming = clean.endswith("▌")
+            word_count = len(clean.split())
+            btn_text = f"[-] Thinking... ({word_count} w)" if is_streaming else f"[+] Mostra Ragionamento ({word_count} parole)"
+            
+            tag_name = f"thought_block_{self._md_link_seq}"
+            btn_tag = f"thought_btn_{self._md_link_seq}"
+            self._md_link_seq += 1
+            
+            self.chat_log.insert(tk.END, f"{btn_text}\n", (role_tag, btn_tag))
+            
+            # Config block element initially hidden if not streaming
+            self.chat_log._textbox.tag_configure(tag_name, elide=not is_streaming)
+            self.chat_log.insert(tk.END, f"{clean}\n\n", (msg_tag, tag_name))
+            
+            # Click bound to button
+            def toggle_thought(e, t=tag_name):
+                # get direct tag conf from actual text widget
+                state = self.chat_log._textbox.tag_cget(t, "elide")
+                new_state = False if str(state) == "1" else True
+                self.chat_log._textbox.tag_configure(t, elide=new_state)
+
+            self.chat_log._textbox.tag_bind(btn_tag, "<Button-1>", toggle_thought)
+            self.chat_log._textbox.tag_bind(btn_tag, "<Enter>", lambda _e: self.chat_log.configure(cursor="hand2"))
+            self.chat_log._textbox.tag_bind(btn_tag, "<Leave>", lambda _e: self.chat_log.configure(cursor="xterm"))
         else:
-            self.chat_log.insert(tk.END, f"{clean}\n\n", msg_tag)
+            self.chat_log.insert(tk.END, f"{role}\n", role_tag)
+            if role_key in {"gemini", "assistant"}:
+                self._insert_markdown_message(clean, msg_tag)
+                self.chat_log.insert(tk.END, "\n", msg_tag)
+            else:
+                self.chat_log.insert(tk.END, f"{clean}\n\n", msg_tag)
+
         self.chat_log.see(tk.END)
         self.chat_log.configure(state='disabled')
 
@@ -556,13 +610,24 @@ class DesktopChatApp:
         self._session_ids_in_view = []
         selected_idx: int | None = None
         target = selected_session_id or self.active_session_id
+        
+        try:
+            query = self.search_var.get().lower().strip()
+        except AttributeError:
+            query = ""
+            
         for idx, session in enumerate(sessions):
             title = str(session["title"])
             count = int(session["messageCount"])
+            
+            if query and query not in title.lower():
+                continue
+                
             self.chats_list.insert(tk.END, f"{title} ({count})")
             self._session_ids_in_view.append(session["id"])
             if session["id"] == target:
-                selected_idx = idx
+                selected_idx = len(self._session_ids_in_view) - 1
+                
         if selected_idx is not None:
             self.chats_list.selection_clear(0, tk.END)
             self.chats_list.selection_set(selected_idx)
@@ -819,6 +884,44 @@ class DesktopChatApp:
         self._refresh_context_preview()
         self._append_log("System", "PDF context cleared")
 
+    def _on_file_drop(self, event) -> None:
+        data = getattr(event, 'data', "")
+        if not data:
+            return
+        
+        paths = []
+        if "{" in data:
+            matches = re.findall(r'\{([^}]+)\}', data)
+            if matches:
+                 paths = matches
+            else:
+                 paths = data.split()
+        else:
+            import shlex
+            try:
+                paths = shlex.split(data)
+            except ValueError:
+                paths = [data]
+                
+        added_pdfs = 0
+        for path in paths:
+            path = path.strip()
+            if not os.path.isfile(path):
+                continue
+            
+            ext = path.lower().split('.')[-1]
+            if ext == "pdf":
+                if path not in self.selected_pdf_paths:
+                    self.selected_pdf_paths.append(path)
+                    added_pdfs += 1
+            elif ext in ["png", "jpg", "jpeg", "webp", "gif", "bmp"]:
+                self._set_selected_image(path)
+                
+        if added_pdfs > 0:
+            self._append_log("System", f"Added {added_pdfs} PDF(s) to context via drag & drop")
+            self._refresh_pdf_label()
+            self._refresh_context_preview()
+
     def _refresh_pdf_label(self) -> None:
         if not self.selected_pdf_paths:
             self.pdf_var.set("PDF: none")
@@ -1010,10 +1113,28 @@ class DesktopChatApp:
                 self.events.put({"type": "toggle_visibility"})
         except OSError:
             pass
+    def _consume_clipboard_flag(self) -> None:
+        if not self._clipboard_flag_path.exists():
+            return
+        try:
+            mtime = self._clipboard_flag_path.stat().st_mtime
+            if self._clipboard_flag_mtime == 0.0:
+                self._clipboard_flag_mtime = mtime
+                return
+            if mtime > self._clipboard_flag_mtime:
+                self._clipboard_flag_mtime = mtime
+                import pyperclip
+                text = pyperclip.paste().strip()
+                if text:
+                    self.events.put({"type": "force_visibility"})
+                    self.events.put({"type": "quick_send", "text": f"Analizza e rispondi a questo testo copiato negli appunti:\n\n{text}"})
+        except OSError:
+            pass
 
     def _poll_events(self) -> None:
         self._consume_quick_inbox()
         self._consume_toggle_flag()
+        self._consume_clipboard_flag()
 
         while True:
             try:
@@ -1027,6 +1148,10 @@ class DesktopChatApp:
     def _handle_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
 
+        if event_type == "force_visibility":
+            self._force_app_visibility()
+            return
+            
         if event_type == "toggle_visibility":
             self._toggle_app_visibility()
             return
@@ -1188,6 +1313,14 @@ class DesktopChatApp:
             self.prompt_entry.configure(height=new_height)
         except Exception:
             pass
+
+    def _force_app_visibility(self) -> None:
+        if self.root.state() == 'withdrawn' or self.root.state() == 'iconic':
+            self.root.deiconify()
+        self.root.lift()
+        if not self.pip_enabled.get():
+            self.pip_enabled.set(True)
+            self._toggle_pip()
 
     def _toggle_app_visibility(self) -> None:
         if self.root.state() == 'withdrawn' or self.root.state() == 'iconic':
