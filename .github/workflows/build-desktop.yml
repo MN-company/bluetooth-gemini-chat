@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [macos-latest, windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -26,11 +26,31 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
       - name: Install dependencies
         shell: bash
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r desktop/requirements.txt pyinstaller
+
+      - name: Read app version
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          APP_VERSION=$(python - <<'PY'
+          import pathlib, re
+          text = pathlib.Path("desktop/app.py").read_text(encoding="utf-8")
+          m = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', text)
+          print(m.group(1) if m else "0.1.0")
+          PY
+          )
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
 
       - name: Build desktop app (macOS)
         if: runner.os == 'macOS'
@@ -41,6 +61,7 @@ jobs:
             --clean \
             --windowed \
             --name BluetoothGeminiChat \
+            --osx-bundle-identifier com.mncompany.bluetoothgeminichat \
             --paths desktop \
             --collect-submodules bleak \
             --collect-submodules pystray \
@@ -49,8 +70,32 @@ jobs:
             --add-data "desktop/macos_quick_ask.py:." \
             desktop/app.py
 
+      - name: Patch macOS app metadata
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          INFO_PLIST="dist/BluetoothGeminiChat.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$INFO_PLIST" >/dev/null 2>&1 \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $APP_VERSION" "$INFO_PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_VERSION" "$INFO_PLIST" >/dev/null 2>&1 \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $APP_VERSION" "$INFO_PLIST"
+
       - name: Build desktop app (Windows)
         if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python -m PyInstaller \
+            --noconfirm \
+            --clean \
+            --windowed \
+            --name BluetoothGeminiChat \
+            --paths desktop \
+            --collect-submodules bleak \
+            --collect-submodules pystray \
+            desktop/app.py
+
+      - name: Build desktop app (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           python -m PyInstaller \
@@ -83,6 +128,12 @@ jobs:
         run: |
           Compress-Archive -Path dist/BluetoothGeminiChat/* -DestinationPath dist/BluetoothGeminiChat-windows.zip
 
+      - name: Package artifact (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          tar -C dist -czf dist/BluetoothGeminiChat-linux.tar.gz BluetoothGeminiChat
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -90,3 +141,4 @@ jobs:
           path: |
             dist/BluetoothGeminiChat-macos.dmg
             dist/BluetoothGeminiChat-windows.zip
+            dist/BluetoothGeminiChat-linux.tar.gz

@@ -55,12 +55,15 @@ class BleChatClient:
         self._thread_started = False
         self._closing = False
         self._last_connected_address: str | None = None
+        self._last_connected_name: str | None = None
         self._heartbeat_task: asyncio.Task[Any] | None = None
         self._reconnect_task: asyncio.Task[Any] | None = None
         self._pending_pings: dict[str, float] = {}
         self._last_pong_monotonic = time.monotonic()
         self._auto_reconnect_enabled = True
         self._is_windows = platform.system().lower().startswith("windows")
+        self._discovered_devices: dict[str, Any] = {}
+        self._known_device_names: dict[str, str] = {}
 
     def start(self) -> None:
         if self._thread_started:
@@ -161,10 +164,10 @@ class BleChatClient:
         self._run_coro(self._send_payload(payload, request_id))
         return request_id
 
-    def request_container_list(self) -> str:
+    def request_container_list(self, request_type: str = "list_containers") -> str:
         request_id = str(uuid.uuid4())
         message = {
-            "type": "list_containers",
+            "type": request_type,
             "messageId": request_id,
         }
         payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -235,40 +238,121 @@ class BleChatClient:
     def _emit(self, event: dict[str, Any]) -> None:
         self._event_sink(event)
 
+    def _normalize_address(self, value: str) -> str:
+        return value.strip().lower()
+
+    def _is_device_not_found_error(self, exc: Exception) -> bool:
+        text = str(exc).strip().lower()
+        if not text:
+            return False
+        markers = (
+            "not found",
+            "not available",
+            "device with address",
+            "unknown device",
+            "could not be found",
+        )
+        return any(marker in text for marker in markers)
+
+    async def _discover_ble_devices(self, timeout: float = 6.0) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        target_uuid = SERVICE_UUID.lower()
+        seen: set[str] = set()
+
+        try:
+            discovered = await BleakScanner.discover(
+                timeout=timeout,
+                return_adv=True,
+                service_uuids=[SERVICE_UUID],
+            )
+            for device, adv_data in discovered.values():
+                service_uuids = {uuid.lower() for uuid in (adv_data.service_uuids or [])}
+                if service_uuids and target_uuid not in service_uuids:
+                    continue
+                address = str(getattr(device, "address", "")).strip()
+                if not address:
+                    continue
+                key = self._normalize_address(address)
+                if key in seen:
+                    continue
+                seen.add(key)
+                name = str(getattr(device, "name", "") or adv_data.local_name or "Gemini Bridge").strip() or "Gemini Bridge"
+                self._discovered_devices[key] = device
+                self._known_device_names[key] = name
+                results.append({"name": name, "address": address, "device": device})
+            return results
+        except TypeError:
+            pass
+
+        devices = await BleakScanner.discover(timeout=timeout, service_uuids=[SERVICE_UUID])
+        for device in devices:
+            address = str(getattr(device, "address", "")).strip()
+            if not address:
+                continue
+            key = self._normalize_address(address)
+            if key in seen:
+                continue
+            seen.add(key)
+            name = str(getattr(device, "name", "") or "Gemini Bridge").strip() or "Gemini Bridge"
+            self._discovered_devices[key] = device
+            self._known_device_names[key] = name
+            results.append({"name": name, "address": address, "device": device})
+        return results
+
+    async def _resolve_connect_target(self, address: str, allow_scan: bool = False) -> tuple[Any, str]:
+        raw_address = str(address).strip()
+        normalized = self._normalize_address(raw_address)
+        if not normalized:
+            return raw_address, raw_address
+
+        cached = self._discovered_devices.get(normalized)
+        if cached is not None:
+            cached_address = str(getattr(cached, "address", "")).strip() or raw_address
+            return cached, cached_address
+
+        if allow_scan:
+            discovered = await self._discover_ble_devices(timeout=4.5)
+            exact = next((item for item in discovered if self._normalize_address(item["address"]) == normalized), None)
+            if exact is not None:
+                return exact["device"], exact["address"]
+
+            # Addresses can rotate on some platforms: fallback by known device name.
+            expected_name = self._known_device_names.get(normalized) or self._last_connected_name
+            if expected_name:
+                name_matches = [
+                    item for item in discovered if str(item["name"]).strip().lower() == expected_name.strip().lower()
+                ]
+                if len(name_matches) == 1:
+                    return name_matches[0]["device"], name_matches[0]["address"]
+
+        return raw_address, raw_address
+
+    async def _connect_once(self, target: Any, address_hint: str) -> tuple[BleakClient, str, str, int]:
+        client = BleakClient(target, disconnected_callback=self._on_disconnected)
+        await client.connect(timeout=15.0)
+        await client.get_services()
+
+        write_char = client.services.get_characteristic(WRITE_CHAR_UUID)
+        if write_char is None:
+            raise RuntimeError("Write characteristic not found on device")
+
+        write_size = getattr(write_char, "max_write_without_response_size", DEFAULT_MAX_PACKET_SIZE)
+        if not isinstance(write_size, int) or write_size < DEFAULT_MAX_PACKET_SIZE:
+            write_size = DEFAULT_MAX_PACKET_SIZE
+
+        max_packet_size = min(write_size, MAX_GATT_ATTRIBUTE_VALUE_BYTES)
+        await client.start_notify(NOTIFY_CHAR_UUID, self._on_notification)
+
+        resolved_address = str(getattr(client, "address", "")).strip() or str(address_hint).strip()
+        target_name = str(getattr(target, "name", "")).strip()
+        device_name = target_name or resolved_address or str(address_hint).strip() or "device"
+        return client, resolved_address, device_name, max_packet_size
+
     async def _scan_devices(self) -> None:
         self._emit({"type": "status", "text": "Scanning BLE devices..."})
         try:
-            payload = []
-            target_uuid = SERVICE_UUID.lower()
-
-            # Prefer scanning with explicit service UUID to avoid large unrelated device lists.
-            try:
-                discovered = await BleakScanner.discover(
-                    timeout=6.0,
-                    return_adv=True,
-                    service_uuids=[SERVICE_UUID],
-                )
-                for device, adv_data in discovered.values():
-                    service_uuids = {uuid.lower() for uuid in (adv_data.service_uuids or [])}
-                    if service_uuids and target_uuid not in service_uuids:
-                        continue
-
-                    payload.append(
-                        {
-                            "name": device.name or adv_data.local_name or "Gemini Bridge",
-                            "address": device.address,
-                        }
-                    )
-            except TypeError:
-                # Backward-compatible fallback if bleak backend does not support return_adv.
-                devices = await BleakScanner.discover(timeout=6.0, service_uuids=[SERVICE_UUID])
-                for device in devices:
-                    payload.append(
-                        {
-                            "name": device.name or "Unknown",
-                            "address": device.address,
-                        }
-                    )
+            discovered = await self._discover_ble_devices(timeout=6.0)
+            payload = [{"name": item["name"], "address": item["address"]} for item in discovered]
 
             self._emit({"type": "scan_result", "devices": payload})
             if not payload:
@@ -289,32 +373,54 @@ class BleChatClient:
             self._emit({"type": "status", "text": f"Connecting to {address}..."})
 
         try:
-            client = BleakClient(address, disconnected_callback=self._on_disconnected)
-            await client.connect(timeout=15.0)
-            await client.get_services()
+            target, resolved_address = await self._resolve_connect_target(address, allow_scan=from_reconnect)
+            client, resolved_address, device_name, max_packet_size = await self._connect_once(target, resolved_address)
+        except Exception as first_exc:
+            if from_reconnect and self._is_device_not_found_error(first_exc):
+                try:
+                    retry_target, retry_address = await self._resolve_connect_target(address, allow_scan=True)
+                    if self._normalize_address(retry_address) != self._normalize_address(address):
+                        self._emit(
+                            {
+                                "type": "status",
+                                "text": f"Address updated: {address} -> {retry_address}. Retrying...",
+                            }
+                        )
+                    client, resolved_address, device_name, max_packet_size = await self._connect_once(
+                        retry_target,
+                        retry_address,
+                    )
+                except Exception as exc:
+                    first_exc = exc
+                else:
+                    first_exc = None  # type: ignore[assignment]
+            if first_exc is not None:
+                self._client = None
+                if from_reconnect:
+                    self._emit({"type": "status", "text": f"Reconnect failed: {first_exc}"})
+                else:
+                    self._emit({"type": "error", "text": f"Connection failed: {first_exc}"})
+                    if self._auto_reconnect_enabled and self._last_connected_address == address:
+                        self._start_reconnect()
+                return
 
-            write_char = client.services.get_characteristic(WRITE_CHAR_UUID)
-            if write_char is None:
-                raise RuntimeError("Write characteristic not found on device")
-
-            write_size = getattr(write_char, "max_write_without_response_size", DEFAULT_MAX_PACKET_SIZE)
-            if not isinstance(write_size, int) or write_size < DEFAULT_MAX_PACKET_SIZE:
-                write_size = DEFAULT_MAX_PACKET_SIZE
-
-            self._max_packet_size = min(write_size, MAX_GATT_ATTRIBUTE_VALUE_BYTES)
-            await client.start_notify(NOTIFY_CHAR_UUID, self._on_notification)
+        try:
+            self._max_packet_size = max_packet_size
             self._client = client
-            self._last_connected_address = address
+            self._last_connected_address = resolved_address
+            self._last_connected_name = device_name
+            if resolved_address:
+                self._known_device_names[self._normalize_address(resolved_address)] = device_name
+            if address:
+                self._known_device_names[self._normalize_address(address)] = device_name
             self._pending_pings.clear()
             self._last_pong_monotonic = time.monotonic()
             self._stop_reconnect()
             self._start_heartbeat()
-
-            device_name = (client.address or address).strip()
             self._emit(
                 {
                     "type": "connected",
-                    "address": address,
+                    "address": resolved_address,
                     "device": device_name,
                     "max_packet_size": self._max_packet_size,
                 }

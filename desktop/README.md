@@ -9,6 +9,11 @@ pip install -r requirements.txt
 python app.py
 ```
 
+### Linux note rapide
+- Screenshot area: installa `grim+slurp` (Wayland) oppure `gnome-screenshot`/`maim`/`scrot` (X11).
+- Clipboard immagini: installa `wl-clipboard` (Wayland) oppure `xclip` (X11).
+- Hotkey globali Linux/Windows: `Ctrl+Shift+G` (Shot+Ask), `Ctrl+Shift+H` (Clipboard+Ask).
+
 ## Uso
 
 1. `Scan` per trovare dispositivi BLE.
@@ -36,6 +41,7 @@ python app.py
    - abilita/disabilita `Auto-connect all'avvio` e `Auto-retry su disconnessione`
    - abilita/disabilita `Auto-check updates`
    - su macOS puoi attivare `menu bar mode` e `nascondi Dock icon`.
+18. Al primo avvio su macOS compare una schermata guidata permessi (Bluetooth, Screen Recording, Accessibility).
 
 ## Dettagli
 
@@ -60,4 +66,6 @@ python app.py
 - Tenta install automatica della Quick Action macOS all'avvio; bottone `Install Right-click` per reinstall.
 - Supporta hotkey globale via `pynput` su Windows/Linux; su macOS usa Apple Shortcuts.
 - Su macOS lo screenshot richiede permesso `Screen Recording` per Terminal/Python.
-- Supporta tray/menu bar via `pystray` (macOS/Windows) con azioni rapide: show/hide, shot+ask, clipboard+ask, reconnect.
+- Su Linux usa fallback automatico tool di sistema per screenshot/clipboard (grim/slurp, gnome-screenshot, maim, scrot, wl-paste, xclip).
+- Supporta tray/menu bar con azioni rapide: show/hide, shot+ask, clipboard+ask, reconnect.
+- Su macOS la menu bar usa integrazione nativa AppKit (evita crash thread off-main).

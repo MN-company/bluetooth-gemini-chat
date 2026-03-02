@@ -5,7 +5,9 @@ import os
 import platform
 import queue
 import re
+import shlex
 import shutil
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -18,12 +20,22 @@ from tkinter import colorchooser, filedialog, simpledialog, ttk
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
-from tkinterdnd2 import TkinterDnD, DND_FILES
 
-class CTkinterDnD(ctk.CTk, TkinterDnD.DnDWrapper):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.TkdndVersion = TkinterDnD._require(self)
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+except Exception:
+    TkinterDnD = None
+    DND_FILES = "DND_FILES"
+
+
+if TkinterDnD is not None:
+    class CTkinterDnD(ctk.CTk, TkinterDnD.DnDWrapper):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.TkdndVersion = TkinterDnD._require(self)
+else:
+    class CTkinterDnD(ctk.CTk):
+        pass
 
 
 from ble_client import BleChatClient
@@ -44,15 +56,62 @@ except Exception:
     pystray = None
 
 try:
+    import certifi
+except Exception:
+    certifi = None
+
+try:
+    import objc
+except Exception:
+    objc = None
+
+try:
     from AppKit import (
         NSApplication,
         NSApplicationActivationPolicyAccessory,
         NSApplicationActivationPolicyRegular,
+        NSImage,
+        NSMenu,
+        NSMenuItem,
+        NSStatusBar,
+        NSVariableStatusItemLength,
     )
 except Exception:
     NSApplication = None
     NSApplicationActivationPolicyAccessory = None
     NSApplicationActivationPolicyRegular = None
+    NSImage = None
+    NSMenu = None
+    NSMenuItem = None
+    NSStatusBar = None
+    NSVariableStatusItemLength = None
+
+try:
+    from Foundation import NSObject
+except Exception:
+    NSObject = None
+
+try:
+    from ApplicationServices import (
+        AXIsProcessTrusted,
+        AXIsProcessTrustedWithOptions,
+        kAXTrustedCheckOptionPrompt,
+    )
+except Exception:
+    AXIsProcessTrusted = None
+    AXIsProcessTrustedWithOptions = None
+    kAXTrustedCheckOptionPrompt = None
+
+try:
+    from Quartz import CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess
+except Exception:
+    CGPreflightScreenCaptureAccess = None
+    CGRequestScreenCaptureAccess = None
+
+try:
+    from CoreBluetooth import CBCentralManager
+except Exception:
+    CBCentralManager = None
 
 try:
     from pynput import keyboard as pynput_keyboard
@@ -70,8 +129,28 @@ MODEL_PRESETS = [
     "gemini-2.0-pro-exp",
 ]
 
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.10"
 GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
+
+
+if objc is not None and NSObject is not None:
+    class _MacMenuActionTarget(NSObject):
+        def initWithCallback_(self, callback: Any) -> Any:
+            self = objc.super(_MacMenuActionTarget, self).init()
+            if self is None:
+                return None
+            self._callback = callback
+            return self
+
+        def onAction_(self, _sender: Any) -> None:
+            try:
+                cb = getattr(self, "_callback", None)
+                if cb is not None:
+                    cb()
+            except Exception:
+                pass
+else:
+    _MacMenuActionTarget = None
 
 
 class DesktopChatApp:
@@ -80,8 +159,14 @@ class DesktopChatApp:
         self.root.title("Gemini BLE Chat")
         self.root.geometry("1240x780")
         self.root.minsize(300, 400)
-        self.root.drop_target_register(DND_FILES)
-        self.root.dnd_bind('<<Drop>>', self._on_file_drop)
+        self._dnd_available = False
+        if TkinterDnD is not None:
+            try:
+                self.root.drop_target_register(DND_FILES)
+                self.root.dnd_bind("<<Drop>>", self._on_file_drop)
+                self._dnd_available = True
+            except Exception:
+                self._dnd_available = False
 
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.client = BleChatClient(self.events.put)
@@ -113,7 +198,11 @@ class DesktopChatApp:
         self._pre_pip_geometry = ""
         self._is_macos = platform.system().lower() == "darwin"
         self._overlay_listener: Any | None = None
-        self._overlay_hotkey = "Apple Shortcut (Cmd+Shift+G)" if self._is_macos else "Ctrl+Shift+G"
+        self._overlay_hotkey = (
+            "Apple Shortcut (Cmd+Shift+G)"
+            if self._is_macos
+            else "Ctrl+Shift+G (shot) / Ctrl+Shift+H (clipboard)"
+        )
         self._overlay_request_ids: set[str] = set()
         self._overlay_image_paths_by_request: dict[str, str] = {}
         self._overlay_started_at: dict[str, float] = {}
@@ -145,8 +234,22 @@ class DesktopChatApp:
         self._overlay_resizable = bool(_saved.get("overlay_resizable", True))
         self._tray_icon: Any | None = None
         self._tray_thread: threading.Thread | None = None
+        self._mac_status_item: Any | None = None
+        self._mac_status_menu: Any | None = None
+        self._mac_status_targets: list[Any] = []
+        self._permissions_dialog: ctk.CTkToplevel | None = None
+        self._bluetooth_probe_manager: Any | None = None
         self._macos_policy_applied = False
-        self._menu_bar_available = self._is_macos and pystray is not None and PILImage is not None
+        if self._is_macos:
+            self._menu_bar_available = (
+                NSStatusBar is not None
+                and NSMenu is not None
+                and NSMenuItem is not None
+                and NSApplication is not None
+                and _MacMenuActionTarget is not None
+            )
+        else:
+            self._menu_bar_available = pystray is not None and PILImage is not None
 
         self._context_store = ContextStore(Path(__file__).parent)
         self._active_container_id: str | None = None
@@ -154,6 +257,9 @@ class DesktopChatApp:
         self._container_transfer_request_id: str | None = None
         self._container_transfer_container_id_by_request: dict[str, str] = {}
         self._remote_containers: list[dict[str, Any]] = []
+        self._pending_remote_container_requests: set[str] = set()
+        self._remote_list_feature_supported = True
+        self._remote_list_legacy_attempted = False
         self._transfer_dialog: ctk.CTkToplevel | None = None
         self._transfer_progress_var: tk.DoubleVar | None = None
         self._transfer_label_var: tk.StringVar | None = None
@@ -168,11 +274,17 @@ class DesktopChatApp:
         self._render_active_chat()
         self._refresh_memory_label()
         self._refresh_context_preview()
+        if not self._dnd_available:
+            self._append_log(
+                "System",
+                "Drag & drop non disponibile su questo sistema: usa i pulsanti Add PDF / Screenshot / Clipboard.",
+            )
         self._auto_install_quick_action()
         self._start_overlay_hotkey_listener()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self._poll_events)
         self.root.after(1200, self._maybe_auto_connect_on_start)
+        self.root.after(1500, self._maybe_show_permissions_onboarding)
         if self._auto_check_updates:
             self.root.after(2200, lambda: self.on_check_updates(background=True))
 
@@ -252,9 +364,11 @@ class DesktopChatApp:
         self.search_entry.pack(fill=tk.X, pady=(0, 6))
         self.search_entry.bind("<KeyRelease>", lambda e: self._refresh_sessions_list(self.active_session_id))
 
-        # Chats listbox
+        # Chats listbox (scrollable)
+        chats_list_wrap = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        chats_list_wrap.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         self.chats_list = tk.Listbox(
-            self.sidebar_frame,
+            chats_list_wrap,
             bg="#1c1c1c",
             fg="#e0e0e0",
             selectbackground="#1f538d",
@@ -263,8 +377,12 @@ class DesktopChatApp:
             relief=tk.SOLID,
             highlightthickness=0,
         )
-        self.chats_list.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        chats_scroll = ctk.CTkScrollbar(chats_list_wrap, orientation="vertical", command=self.chats_list.yview)
+        self.chats_list.configure(yscrollcommand=chats_scroll.set)
+        self.chats_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        chats_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.chats_list.bind("<<ListboxSelect>>", self._on_session_selected)
+        self._bind_listbox_mousewheel(self.chats_list)
 
         # --- Knowledge Base Container Panel ---
         separator = ctk.CTkFrame(self.sidebar_frame, height=1, fg_color="#2a2a2a")
@@ -279,8 +397,10 @@ class DesktopChatApp:
             text_color="white", font=("Avenir", 11),
         ).pack(side=tk.RIGHT)
 
+        container_wrap = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        container_wrap.pack(fill=tk.X, pady=(0, 4))
         self.container_list = tk.Listbox(
-            self.sidebar_frame,
+            container_wrap,
             bg="#181818",
             fg="#cccccc",
             selectbackground="#1e5c1e",
@@ -292,9 +412,13 @@ class DesktopChatApp:
             height=5,
             font=("Avenir", 12),
         )
-        self.container_list.pack(fill=tk.X, pady=(0, 4))
+        container_scroll = ctk.CTkScrollbar(container_wrap, orientation="vertical", command=self.container_list.yview)
+        self.container_list.configure(yscrollcommand=container_scroll.set)
+        self.container_list.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        container_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.container_list.bind("<<ListboxSelect>>", self._on_container_list_click)
         self.container_list.bind("<Double-Button-1>", self._on_activate_container)
+        self._bind_listbox_mousewheel(self.container_list)
 
         # Row 1: Add PDF | Attiva | Upload
         kb_row1 = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
@@ -315,8 +439,8 @@ class DesktopChatApp:
             hover_color="#2a2a2a", text_color="#d0d0d0", font=("Avenir", 13),
         ).pack(side=tk.LEFT)
         ctk.CTkButton(
-            kb_row1, text="☁", command=self._on_sync_remote_containers,
-            width=34, height=30, fg_color="transparent", border_width=1, border_color="#444",
+            kb_row1, text="Sync", command=self._on_sync_remote_containers,
+            width=52, height=30, fg_color="transparent", border_width=1, border_color="#444",
             hover_color="#2a2a2a", text_color="#d0d0d0", font=("Avenir", 13),
         ).pack(side=tk.LEFT, padx=(3, 0))
 
@@ -340,29 +464,47 @@ class DesktopChatApp:
         self._build_button_grid(
             self.sidebar_frame,
             [
-                ("Rename", self.on_rename_chat),
-                ("Delete", self.on_delete_chat),
-                ("Scan", self.on_scan),
-                ("Connect", self.on_connect),
-                ("Disconnect", self.on_disconnect),
-                ("Clear Mem", self.on_clear_memory),
-                ("Shot+Ask", self.on_hotkey_overlay_triggered),
-                ("Clip+Ask", self.on_hotkey_clipboard_triggered),
+                ("Rinomina chat", self.on_rename_chat),
+                ("Elimina chat", self.on_delete_chat),
+                ("Scan bridge", self.on_scan),
+                ("Connetti", self.on_connect),
+                ("Disconnetti", self.on_disconnect),
+                ("Svuota memoria", self.on_clear_memory),
             ],
             columns=2,
             pady=(8, 8),
         )
-        
+
+        devices_wrap = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        devices_wrap.pack(fill=tk.X, pady=(0, 6))
         self.devices_list = tk.Listbox(
-            self.sidebar_frame, height=3, bg="#1c1c1c", fg="#e0e0e0", selectbackground="#1f538d", activestyle=tk.NONE, borderwidth=1, relief=tk.SOLID, highlightthickness=0,
+            devices_wrap,
+            height=3,
+            bg="#1c1c1c",
+            fg="#e0e0e0",
+            selectbackground="#1f538d",
+            activestyle=tk.NONE,
+            borderwidth=1,
+            relief=tk.SOLID,
+            highlightthickness=0,
         )
-        self.devices_list.pack(fill=tk.X, pady=(0, 6))
+        devices_scroll = ctk.CTkScrollbar(devices_wrap, orientation="vertical", command=self.devices_list.yview)
+        self.devices_list.configure(yscrollcommand=devices_scroll.set)
+        self.devices_list.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        devices_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._bind_listbox_mousewheel(self.devices_list)
         ctk.CTkLabel(
             self.sidebar_frame,
             text=f"Trigger: {self._overlay_hotkey}",
             text_color="#a1a1a1",
             font=("Avenir", 10),
         ).pack(anchor=tk.W, pady=(0, 6))
+        ctk.CTkLabel(
+            self.sidebar_frame,
+            text="Setup rapido: 1) Scan  2) Seleziona telefono  3) Connetti",
+            text_color="#7f7f7f",
+            font=("Avenir", 10),
+        ).pack(anchor=tk.W, pady=(0, 4))
 
 
         # --- MAIN CHAT AREA (Row 1, Col 1) ---
@@ -500,6 +642,289 @@ class DesktopChatApp:
         current.update(patch)
         self._save_settings(current)
 
+    def _open_macos_privacy_pane(self, pane_suffix: str) -> None:
+        if not self._is_macos:
+            return
+        url = f"x-apple.systempreferences:com.apple.preference.security?{pane_suffix}"
+        try:
+            subprocess.Popen(["open", url])
+        except Exception as exc:
+            self._append_log("Error", f"Cannot open macOS privacy settings: {exc}")
+
+    def _has_screen_recording_permission(self) -> bool | None:
+        if not self._is_macos:
+            return True
+        if CGPreflightScreenCaptureAccess is None:
+            return None
+        try:
+            return bool(CGPreflightScreenCaptureAccess())
+        except Exception:
+            return None
+
+    def _request_screen_recording_permission(self) -> bool | None:
+        if not self._is_macos:
+            return True
+        if CGRequestScreenCaptureAccess is None:
+            return None
+        try:
+            return bool(CGRequestScreenCaptureAccess())
+        except Exception:
+            return None
+
+    def _has_accessibility_permission(self) -> bool | None:
+        if not self._is_macos:
+            return True
+        if AXIsProcessTrusted is None:
+            return None
+        try:
+            return bool(AXIsProcessTrusted())
+        except Exception:
+            return None
+
+    def _request_accessibility_permission(self) -> bool | None:
+        if not self._is_macos:
+            return True
+        if AXIsProcessTrustedWithOptions is None:
+            return None
+        try:
+            options: dict[Any, Any]
+            if kAXTrustedCheckOptionPrompt is not None:
+                options = {kAXTrustedCheckOptionPrompt: True}
+            else:
+                options = {"AXTrustedCheckOptionPrompt": True}
+            return bool(AXIsProcessTrustedWithOptions(options))
+        except Exception:
+            return None
+
+    def _bluetooth_authorization_state(self) -> str | None:
+        if not self._is_macos:
+            return "granted"
+        if CBCentralManager is None:
+            return None
+        try:
+            auth_value = int(CBCentralManager.authorization())
+            if auth_value == 3:
+                return "granted"
+            if auth_value == 2:
+                return "denied"
+            if auth_value == 1:
+                return "restricted"
+            if auth_value == 0:
+                return "not_determined"
+            return f"unknown({auth_value})"
+        except Exception:
+            return None
+
+    def _request_bluetooth_permission(self) -> None:
+        if not self._is_macos:
+            return
+        # Instantiate a central manager once to trigger the OS prompt on first run.
+        if CBCentralManager is not None and self._bluetooth_probe_manager is None:
+            try:
+                self._bluetooth_probe_manager = CBCentralManager.alloc().init()
+            except Exception:
+                self._bluetooth_probe_manager = None
+        try:
+            self.client.scan_devices()
+        except Exception:
+            pass
+
+    def _format_permission_state(self, state: bool | None, label: str) -> str:
+        if state is True:
+            return f"{label}: OK"
+        if state is False:
+            return f"{label}: Missing"
+        return f"{label}: Unknown"
+
+    def _maybe_show_permissions_onboarding(self) -> None:
+        if not self._is_macos:
+            return
+        settings = self._load_settings()
+        if bool(settings.get("permissions_onboarding_done", False)):
+            return
+        self._show_permissions_onboarding(force=False)
+
+    def _show_permissions_onboarding(self, force: bool = False) -> None:
+        if not self._is_macos:
+            return
+        if self._permissions_dialog is not None and self._permissions_dialog.winfo_exists():
+            self._permissions_dialog.lift()
+            return
+        if not force:
+            settings = self._load_settings()
+            if bool(settings.get("permissions_onboarding_done", False)):
+                return
+
+        from tkinter import messagebox
+
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Setup permessi macOS")
+        dialog.geometry("680x560")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        self._permissions_dialog = dialog
+
+        ctk.CTkLabel(
+            dialog,
+            text="Primo avvio: abilita i permessi richiesti",
+            font=("Avenir", 18, "bold"),
+        ).pack(anchor=tk.W, padx=16, pady=(14, 6))
+        ctk.CTkLabel(
+            dialog,
+            text=(
+                "L'app usa Bluetooth (bridge), Screen Recording (Shot+Ask) e "
+                "Accessibility (shortcut globali/overlay)."
+            ),
+            justify=tk.LEFT,
+            wraplength=640,
+            text_color="#b0b0b0",
+        ).pack(anchor=tk.W, padx=16, pady=(0, 12))
+
+        screen_state_var = tk.StringVar()
+        access_state_var = tk.StringVar()
+        bt_state_var = tk.StringVar()
+        bt_manual_confirm = tk.BooleanVar(value=False)
+
+        panel = ctk.CTkFrame(dialog, fg_color="#151515", border_width=1, border_color="#2a2a2a")
+        panel.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 10))
+
+        def section_row(
+            title: str,
+            subtitle: str,
+            status_var: tk.StringVar,
+            request_cmd: Any,
+            open_cmd: Any,
+        ) -> None:
+            row = ctk.CTkFrame(panel, fg_color="transparent")
+            row.pack(fill=tk.X, padx=12, pady=(12, 2))
+            ctk.CTkLabel(row, text=title, font=("Avenir", 14, "bold")).pack(anchor=tk.W)
+            ctk.CTkLabel(
+                row,
+                text=subtitle,
+                justify=tk.LEFT,
+                wraplength=620,
+                text_color="#b0b0b0",
+            ).pack(anchor=tk.W, pady=(0, 4))
+            ctk.CTkLabel(row, textvariable=status_var, font=("Avenir", 12)).pack(anchor=tk.W, pady=(0, 4))
+            btn_row = ctk.CTkFrame(row, fg_color="transparent")
+            btn_row.pack(anchor=tk.W, pady=(0, 2))
+            ctk.CTkButton(btn_row, text="Richiedi", width=96, command=request_cmd).pack(side=tk.LEFT, padx=(0, 8))
+            ctk.CTkButton(
+                btn_row,
+                text="Apri Impostazioni",
+                width=156,
+                command=open_cmd,
+                fg_color="transparent",
+                border_width=1,
+                hover_color="#2a2a2a",
+            ).pack(side=tk.LEFT)
+
+        def refresh_states() -> tuple[bool, bool, bool]:
+            screen_state = self._has_screen_recording_permission()
+            access_state = self._has_accessibility_permission()
+            bt_state = self._bluetooth_authorization_state()
+            bt_ok = bt_state == "granted" or bt_manual_confirm.get()
+
+            screen_state_var.set(self._format_permission_state(screen_state, "Screen Recording"))
+            access_state_var.set(self._format_permission_state(access_state, "Accessibility"))
+
+            if bt_state == "granted":
+                bt_manual_confirm.set(True)
+                bt_state_var.set("Bluetooth: OK")
+            elif bt_state in {"denied", "restricted"}:
+                bt_state_var.set(f"Bluetooth: {bt_state}")
+            elif bt_state == "not_determined":
+                bt_state_var.set("Bluetooth: in attesa autorizzazione")
+            else:
+                bt_state_var.set("Bluetooth: verifica manuale (premi Richiedi)")
+
+            return (screen_state is True, access_state is True, bt_ok)
+
+        section_row(
+            "1) Screen Recording",
+            "Necessario per Shot+Ask e screenshot area su macOS.",
+            screen_state_var,
+            lambda: (self._request_screen_recording_permission(), refresh_states()),
+            lambda: self._open_macos_privacy_pane("Privacy_ScreenCapture"),
+        )
+        section_row(
+            "2) Accessibility",
+            "Necessario per integrazione shortcut globali e overlay affidabile.",
+            access_state_var,
+            lambda: (self._request_accessibility_permission(), refresh_states()),
+            lambda: self._open_macos_privacy_pane("Privacy_Accessibility"),
+        )
+        section_row(
+            "3) Bluetooth",
+            "Necessario per scan e connessione BLE col telefono.",
+            bt_state_var,
+            lambda: (self._request_bluetooth_permission(), refresh_states()),
+            lambda: self._open_macos_privacy_pane("Privacy_Bluetooth"),
+        )
+        ctk.CTkCheckBox(
+            panel,
+            text="Ho autorizzato il Bluetooth (se lo stato non è rilevabile automaticamente)",
+            variable=bt_manual_confirm,
+            command=refresh_states,
+        ).pack(anchor=tk.W, padx=12, pady=(2, 12))
+
+        footer = ctk.CTkFrame(dialog, fg_color="transparent")
+        footer.pack(fill=tk.X, padx=16, pady=(0, 14))
+
+        def finish_setup() -> None:
+            screen_ok, access_ok, bt_ok = refresh_states()
+            if not (screen_ok and access_ok and bt_ok):
+                proceed = messagebox.askyesno(
+                    "Permessi incompleti",
+                    (
+                        "Alcuni permessi risultano mancanti.\n"
+                        "Se continui ora alcune funzioni (scan BLE/screenshot/shortcut) possono fallire.\n\n"
+                        "Vuoi comunque chiudere il setup?"
+                    ),
+                    parent=dialog,
+                )
+                if not proceed:
+                    return
+            self._update_settings(
+                {
+                    "permissions_onboarding_done": True,
+                    "permissions_screen_recording_ok": screen_ok,
+                    "permissions_accessibility_ok": access_ok,
+                    "permissions_bluetooth_ok": bt_ok,
+                }
+            )
+            self._append_log("System", "Setup permessi macOS completato")
+            dialog.destroy()
+            self._permissions_dialog = None
+
+        def remind_later() -> None:
+            self._append_log("System", "Setup permessi rimandato")
+            dialog.destroy()
+            self._permissions_dialog = None
+
+        ctk.CTkButton(
+            footer,
+            text="Ricarica stato",
+            width=120,
+            command=refresh_states,
+            fg_color="transparent",
+            border_width=1,
+            hover_color="#2a2a2a",
+        ).pack(side=tk.LEFT)
+        ctk.CTkButton(
+            footer,
+            text="Ricorda dopo",
+            width=120,
+            command=remind_later,
+            fg_color="transparent",
+            border_width=1,
+            hover_color="#2a2a2a",
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+        ctk.CTkButton(footer, text="Completa setup", width=140, command=finish_setup).pack(side=tk.RIGHT, padx=(0, 8))
+
+        dialog.protocol("WM_DELETE_WINDOW", remind_later)
+        refresh_states()
+
     def _parse_version_tuple(self, value: str) -> tuple[int, ...]:
         clean = value.strip().lower()
         if clean.startswith("v"):
@@ -521,24 +946,48 @@ class DesktopChatApp:
             names = ["BluetoothGeminiChat-macos.dmg", "BluetoothGeminiChat-macos.zip"]
         elif platform.system().lower().startswith("windows"):
             names = ["BluetoothGeminiChat-windows.zip"]
+        elif platform.system().lower().startswith("linux"):
+            names = ["BluetoothGeminiChat-linux.tar.gz", "BluetoothGeminiChat-linux.zip"]
         for wanted in names:
             for asset in assets:
                 if str(asset.get("name", "")) == wanted:
                     return asset
         return None
 
+    def _open_url(self, url: str, timeout: int = 30) -> Any:
+        req = urlrequest.Request(
+            url,
+            headers={
+                "User-Agent": f"BluetoothGeminiChat/{APP_VERSION}",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        try:
+            return urlrequest.urlopen(req, timeout=timeout)
+        except ssl.SSLCertVerificationError:
+            if certifi is None:
+                raise
+            ctx = ssl.create_default_context(cafile=certifi.where())
+            return urlrequest.urlopen(req, timeout=timeout, context=ctx)
+        except urlerror.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, ssl.SSLCertVerificationError) and certifi is not None:
+                ctx = ssl.create_default_context(cafile=certifi.where())
+                return urlrequest.urlopen(req, timeout=timeout, context=ctx)
+            raise
+
     def _download_update_asset(self, url: str, filename: str) -> Path:
         download_dir = Path.home() / "Downloads" / "GeminiBLEUpdates"
         download_dir.mkdir(parents=True, exist_ok=True)
         target = download_dir / filename
-        with urlrequest.urlopen(url, timeout=30) as response:
+        with self._open_url(url, timeout=30) as response:
             target.write_bytes(response.read())
         return target
 
     def on_check_updates(self, background: bool = True) -> None:
         api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
         try:
-            with urlrequest.urlopen(api_url, timeout=15) as response:
+            with self._open_url(api_url, timeout=15) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except (urlerror.URLError, TimeoutError, json.JSONDecodeError) as exc:
             if not background:
@@ -656,8 +1105,13 @@ class DesktopChatApp:
             return
         if not self._menu_bar_available:
             if self._is_macos:
-                self._append_log("System", "Menu bar mode unavailable: install 'pystray'")
+                self._append_log("System", "Menu bar mode unavailable: missing AppKit bridge")
             return
+
+        if self._is_macos:
+            self._start_macos_menu_bar_item()
+            return
+
         if self._tray_icon is not None:
             return
 
@@ -699,7 +1153,75 @@ class DesktopChatApp:
         self._tray_thread = threading.Thread(target=run_icon, daemon=True)
         self._tray_thread.start()
 
+    def _start_macos_menu_bar_item(self) -> None:
+        if not self._is_macos:
+            return
+        if self._mac_status_item is not None:
+            return
+        if NSStatusBar is None or NSMenu is None or NSMenuItem is None or _MacMenuActionTarget is None:
+            self._append_log("System", "Menu bar mode unavailable on this build")
+            return
+
+        status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+        if status_item is None:
+            self._append_log("System", "Cannot create macOS status item")
+            return
+
+        button = status_item.button()
+        if button is not None:
+            if NSImage is not None:
+                try:
+                    image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                        "bubble.left.and.bubble.right.fill",
+                        "Gemini BLE Chat",
+                    )
+                    if image is not None:
+                        button.setImage_(image)
+                    else:
+                        button.setTitle_("G")
+                except Exception:
+                    button.setTitle_("G")
+            else:
+                button.setTitle_("G")
+
+        menu = NSMenu.alloc().init()
+        targets: list[Any] = []
+
+        def add_item(title: str, callback: Any) -> None:
+            target = _MacMenuActionTarget.alloc().initWithCallback_(callback)
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, "onAction:", "")
+            item.setTarget_(target)
+            menu.addItem_(item)
+            targets.append(target)
+
+        add_item("Show/Hide Window", lambda: self.root.after(0, self._toggle_app_visibility))
+        add_item("Shot+Ask", lambda: self.root.after(0, self.on_hotkey_overlay_triggered))
+        add_item("Clipboard+Ask", lambda: self.root.after(0, self.on_hotkey_clipboard_triggered))
+        add_item("Reconnect", lambda: self.root.after(0, self._reconnect_last_or_selected))
+        menu.addItem_(NSMenuItem.separatorItem())
+        add_item("Quit", lambda: self.root.after(0, self.on_close))
+
+        status_item.setMenu_(menu)
+        self._mac_status_item = status_item
+        self._mac_status_menu = menu
+        self._mac_status_targets = targets
+
+    def _stop_macos_menu_bar_item(self) -> None:
+        item = self._mac_status_item
+        self._mac_status_item = None
+        self._mac_status_menu = None
+        self._mac_status_targets = []
+        if item is None:
+            return
+        try:
+            NSStatusBar.systemStatusBar().removeStatusItem_(item)
+        except Exception:
+            pass
+
     def _stop_menu_bar_icon(self) -> None:
+        if self._is_macos:
+            self._stop_macos_menu_bar_item()
+            return
         icon = self._tray_icon
         self._tray_icon = None
         if icon is None:
@@ -744,40 +1266,69 @@ class DesktopChatApp:
     def on_open_settings(self) -> None:
         dialog = ctk.CTkToplevel(self.root)
         dialog.title("Settings")
-        dialog.geometry("560x700")
+        dialog.geometry("620x720")
         dialog.transient(self.root)
         dialog.grab_set()
+        dialog.grid_rowconfigure(0, weight=1)
+        dialog.grid_columnconfigure(0, weight=1)
 
-        # --- Section 1: System Instructions ---
-        ctk.CTkLabel(dialog, text="System Instructions (Global Prompt):", font=("Avenir", 14, "bold")).pack(pady=(12, 4), padx=12, anchor=tk.W)
-        ctk.CTkLabel(dialog, text="Iniettate silenziosamente in ogni richiesta.", font=("Avenir", 11), text_color="#888888").pack(padx=12, anchor=tk.W)
+        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        body.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 0))
+        body.grid_columnconfigure(0, weight=1)
 
-        textbox = ctk.CTkTextbox(dialog, height=120, font=("Avenir", 13), fg_color="#1e1e1e", border_width=1, border_color="#333333")
-        textbox.pack(fill=tk.X, padx=12, pady=(6, 12))
+        ctk.CTkLabel(body, text="Impostazioni principali", font=("Avenir", 18, "bold")).pack(
+            pady=(4, 10), padx=12, anchor=tk.W
+        )
+        ctk.CTkLabel(
+            body,
+            text="Le opzioni sotto sono pensate per un setup rapido e stabile su macOS/Windows/Linux.",
+            font=("Avenir", 11),
+            text_color="#888888",
+        ).pack(padx=12, anchor=tk.W)
+
+        # --- Global instructions ---
+        ctk.CTkLabel(body, text="Prompt di sistema (globale):", font=("Avenir", 14, "bold")).pack(
+            pady=(14, 4), padx=12, anchor=tk.W
+        )
+        textbox = ctk.CTkTextbox(
+            body,
+            height=120,
+            font=("Avenir", 13),
+            fg_color="#1e1e1e",
+            border_width=1,
+            border_color="#333333",
+        )
+        textbox.pack(fill=tk.X, padx=12, pady=(6, 10))
         textbox.insert("1.0", self.system_instructions_var.get())
 
-        # --- Section 2: Pinned PDFs ---
-        ctk.CTkLabel(dialog, text="📚 Documenti Fissi (PDF sempre attivi):", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
-        ctk.CTkLabel(dialog, text="Allegati automaticamente ad ogni messaggio senza doverli ricaricare.", font=("Avenir", 11), text_color="#888888").pack(padx=12, anchor=tk.W)
-
+        # --- Pinned PDFs ---
+        ctk.CTkLabel(body, text="PDF fissi (sempre attivi):", font=("Avenir", 14, "bold")).pack(
+            pady=(8, 4), padx=12, anchor=tk.W
+        )
         pinned_list_var = tk.Variable(value=list(self.pinned_pdf_paths))
+        pinned_wrap = ctk.CTkFrame(body, fg_color="transparent")
+        pinned_wrap.pack(fill=tk.X, padx=12, pady=(4, 4))
         pdf_listbox = tk.Listbox(
-            dialog,
+            pinned_wrap,
             listvariable=pinned_list_var,
-            height=5,
+            height=6,
             bg="#1e1e1e",
             fg="#dddddd",
             selectbackground="#1f538d",
-            borderwidth=0,
+            borderwidth=1,
+            relief=tk.SOLID,
             highlightthickness=0,
             font=("Avenir", 12),
         )
-        pdf_listbox.pack(fill=tk.X, padx=12, pady=(6, 4))
+        pdf_scroll = ctk.CTkScrollbar(pinned_wrap, orientation="vertical", command=pdf_listbox.yview)
+        pdf_listbox.configure(yscrollcommand=pdf_scroll.set)
+        pdf_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        pdf_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         def add_pdf() -> None:
-            from tkinter import filedialog
             paths = filedialog.askopenfilenames(
-                parent=dialog, title="Seleziona PDF",
+                parent=dialog,
+                title="Seleziona PDF",
                 filetypes=[("PDF", "*.pdf"), ("All Files", "*")],
             )
             current = list(pinned_list_var.get())
@@ -793,28 +1344,33 @@ class DesktopChatApp:
                 del current[i]
             pinned_list_var.set(current)
 
-        pdf_btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-        pdf_btn_row.pack(fill=tk.X, padx=12, pady=(0, 12))
-        ctk.CTkButton(pdf_btn_row, text="+ Aggiungi PDF", command=add_pdf, width=120, fg_color="#1f538d").pack(side=tk.LEFT, padx=(0, 8))
-        ctk.CTkButton(pdf_btn_row, text="− Rimuovi selezionato", command=remove_pdf, width=160, fg_color="transparent", border_width=1, hover_color="#333333").pack(side=tk.LEFT)
+        pdf_btn_row = ctk.CTkFrame(body, fg_color="transparent")
+        pdf_btn_row.pack(fill=tk.X, padx=12, pady=(2, 10))
+        ctk.CTkButton(pdf_btn_row, text="+ Aggiungi PDF", command=add_pdf, width=140, fg_color="#1f538d").pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        ctk.CTkButton(
+            pdf_btn_row,
+            text="− Rimuovi selezionato",
+            command=remove_pdf,
+            width=170,
+            fg_color="transparent",
+            border_width=1,
+            hover_color="#333333",
+        ).pack(side=tk.LEFT)
 
-        # --- Section 3: Shot+Ask Overlay ---
-        ctk.CTkLabel(dialog, text="🪟 Shot+Ask Overlay:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
-        ctk.CTkLabel(
-            dialog,
-            text="Scegli sfondo e dimensioni della finestra risposta.",
-            font=("Avenir", 11),
-            text_color="#888888",
-        ).pack(padx=12, anchor=tk.W)
-
+        # --- Overlay ---
+        ctk.CTkLabel(body, text="Overlay Shot+Ask:", font=("Avenir", 14, "bold")).pack(
+            pady=(8, 4), padx=12, anchor=tk.W
+        )
         overlay_bg_var = tk.StringVar(value=self._overlay_bg_color)
         overlay_width_var = tk.StringVar(value=str(self._overlay_width))
         overlay_height_var = tk.StringVar(value=str(self._overlay_height))
         overlay_resizable_var = tk.BooleanVar(value=self._overlay_resizable)
 
-        overlay_bg_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        overlay_bg_row = ctk.CTkFrame(body, fg_color="transparent")
         overlay_bg_row.pack(fill=tk.X, padx=12, pady=(6, 6))
-        ctk.CTkLabel(overlay_bg_row, text="Sfondo (#RRGGBB):", width=120).pack(side=tk.LEFT)
+        ctk.CTkLabel(overlay_bg_row, text="Sfondo (#RRGGBB):", width=130).pack(side=tk.LEFT)
         ctk.CTkEntry(overlay_bg_row, textvariable=overlay_bg_var, width=120).pack(side=tk.LEFT, padx=(0, 8))
         color_swatch = tk.Frame(
             overlay_bg_row,
@@ -843,53 +1399,74 @@ class DesktopChatApp:
 
         overlay_bg_var.trace_add("write", on_overlay_bg_changed)
 
-        overlay_size_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        overlay_size_row = ctk.CTkFrame(body, fg_color="transparent")
         overlay_size_row.pack(fill=tk.X, padx=12, pady=(0, 8))
-        ctk.CTkLabel(overlay_size_row, text="Larghezza:", width=120).pack(side=tk.LEFT)
+        ctk.CTkLabel(overlay_size_row, text="Larghezza:", width=130).pack(side=tk.LEFT)
         ctk.CTkEntry(overlay_size_row, textvariable=overlay_width_var, width=80).pack(side=tk.LEFT, padx=(0, 12))
         ctk.CTkLabel(overlay_size_row, text="Altezza:", width=70).pack(side=tk.LEFT)
         ctk.CTkEntry(overlay_size_row, textvariable=overlay_height_var, width=80).pack(side=tk.LEFT)
 
         ctk.CTkCheckBox(
-            dialog,
-            text="Consenti ridimensionamento manuale finestra overlay",
+            body,
+            text="Consenti ridimensionamento manuale overlay",
             variable=overlay_resizable_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 12))
 
-        # --- Section 4: Connection & macOS Shell ---
-        ctk.CTkLabel(dialog, text="🔗 Connessione:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        # --- Connection ---
+        ctk.CTkLabel(body, text="Connessione:", font=("Avenir", 14, "bold")).pack(
+            pady=(8, 4), padx=12, anchor=tk.W
+        )
         auto_connect_var = tk.BooleanVar(value=self._auto_connect_on_start)
         auto_retry_var = tk.BooleanVar(value=self._auto_retry_known_device)
         auto_updates_var = tk.BooleanVar(value=self._auto_check_updates)
         ctk.CTkCheckBox(
-            dialog,
+            body,
             text="Auto-connect all'avvio (ultimo telefono noto)",
             variable=auto_connect_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 4))
         ctk.CTkCheckBox(
-            dialog,
-            text="Auto-retry su disconnessione (backoff)",
+            body,
+            text="Auto-retry su disconnessione",
             variable=auto_retry_var,
-        ).pack(anchor=tk.W, padx=12, pady=(0, 12))
+        ).pack(anchor=tk.W, padx=12, pady=(0, 4))
         ctk.CTkCheckBox(
-            dialog,
+            body,
             text="Controlla aggiornamenti automaticamente",
             variable=auto_updates_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 12))
 
-        ctk.CTkLabel(dialog, text="🍎 macOS Shell:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        # --- OS integration ---
+        ctk.CTkLabel(body, text="Integrazione sistema:", font=("Avenir", 14, "bold")).pack(
+            pady=(8, 4), padx=12, anchor=tk.W
+        )
         menu_bar_mode_var = tk.BooleanVar(value=self._menu_bar_mode_enabled)
         hide_dock_var = tk.BooleanVar(value=self._hide_dock_icon_enabled)
         ctk.CTkCheckBox(
-            dialog,
-            text="Mostra icona nella barra in alto (menu bar)",
+            body,
+            text="Mostra icona nella barra in alto / tray",
             variable=menu_bar_mode_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 4))
-        ctk.CTkCheckBox(
-            dialog,
-            text="Nascondi icona nella Dock",
+        dock_checkbox = ctk.CTkCheckBox(
+            body,
+            text="Nascondi icona Dock (solo macOS)",
             variable=hide_dock_var,
-        ).pack(anchor=tk.W, padx=12, pady=(0, 12))
+        )
+        dock_checkbox.pack(anchor=tk.W, padx=12, pady=(0, 8))
+        if not self._is_macos:
+            dock_checkbox.configure(state="disabled")
+        if self._is_macos:
+            ctk.CTkButton(
+                body,
+                text="Configura permessi macOS",
+                command=lambda: self._show_permissions_onboarding(force=True),
+                fg_color="transparent",
+                border_width=1,
+                hover_color="#333333",
+            ).pack(anchor=tk.W, padx=12, pady=(0, 10))
+
+        footer = ctk.CTkFrame(dialog, fg_color="transparent")
+        footer.grid(row=1, column=0, sticky="ew", padx=10, pady=(8, 10))
+        footer.grid_columnconfigure(0, weight=1)
 
         def save() -> None:
             text = textbox.get("1.0", tk.END).strip()
@@ -905,6 +1482,7 @@ class DesktopChatApp:
             self._menu_bar_mode_enabled = bool(menu_bar_mode_var.get())
             self._hide_dock_icon_enabled = bool(hide_dock_var.get())
             self.client.set_auto_reconnect(self._auto_retry_known_device)
+
             old_settings = self._load_settings()
             old_settings["system_instructions"] = text
             old_settings["pinned_pdf_paths"] = self.pinned_pdf_paths
@@ -919,6 +1497,7 @@ class DesktopChatApp:
             old_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
             old_settings["last_connected_address"] = self._last_connected_address
             self._save_settings(old_settings)
+
             self._apply_overlay_window_preferences()
             if self._menu_bar_mode_enabled:
                 self._start_menu_bar_icon_if_needed()
@@ -926,19 +1505,9 @@ class DesktopChatApp:
                 self._stop_menu_bar_icon()
             self._apply_macos_activation_policy()
             dialog.destroy()
-            n = len(self.pinned_pdf_paths)
-            self._append_log(
-                "System",
-                (
-                    f"Settings saved. Pinned PDFs: {n}. "
-                    f"System instructions: {'YES' if text else 'none'}. "
-                    f"Overlay: {self._overlay_width}x{self._overlay_height}, bg {self._overlay_bg_color}. "
-                    f"Auto-connect: {'on' if self._auto_connect_on_start else 'off'}. "
-                    f"Auto-retry: {'on' if self._auto_retry_known_device else 'off'}."
-                ),
-            )
+            self._append_log("System", "Settings saved")
 
-        ctk.CTkButton(dialog, text="💾 SALVA", command=save, fg_color="#1f538d").pack(pady=(0, 14))
+        ctk.CTkButton(footer, text="Salva", command=save, fg_color="#1f538d", width=140).pack(side=tk.RIGHT)
 
     # ── Knowledge Base Container handlers ─────────────────────────────────────
 
@@ -1059,18 +1628,15 @@ class DesktopChatApp:
         self._refresh_container_list()
 
     def _on_delete_container(self) -> None:
-        from tkinter import messagebox
         cid = self._selected_container_id()
         if cid is None:
             return
         c = self._context_store.get(cid)
-        if not messagebox.askyesno("Elimina Container", f"Eliminare '{c.name if c else cid}'?", parent=self.root):
-            return
         self._context_store.delete(cid)
         if self._active_container_id == cid:
             self._active_container_id = None
         self._refresh_container_list()
-        self._append_log("System", "Container eliminato")
+        self._append_log("System", f"Container eliminato: {c.name if c else cid}")
 
     def _on_upload_container(self) -> None:
         cid = self._selected_container_id()
@@ -1100,11 +1666,53 @@ class DesktopChatApp:
         if not self.connected:
             self._append_log("System", "Non connesso — connetti il bridge Android prima di sincronizzare")
             return
+        if not self._remote_list_feature_supported:
+            self._append_log(
+                "System",
+                "Listing container remoti non supportato da questa versione Android. Aggiorna l'app sul telefono.",
+            )
+            return
+
+        self._request_remote_container_list(legacy=False)
+
+    def _request_remote_container_list(self, legacy: bool) -> None:
+        request_type = "container_list" if legacy else "list_containers"
+        mode = "legacy" if legacy else "default"
         try:
-            request_id = self.client.request_container_list()
-            self._append_log("System", f"Richiesta lista container remoti ({request_id})")
+            request_id = self.client.request_container_list(request_type=request_type)
+            self._pending_remote_container_requests.add(request_id)
+            self._append_log("System", f"Richiesta lista container remoti ({mode}, {request_id})")
         except Exception as exc:
             self._append_log("Error", f"Sync container remoti fallita: {exc}")
+
+    def _handle_remote_container_error(self, message_id: str, error_text: str) -> bool:
+        lowered = error_text.strip().lower()
+        if message_id:
+            if message_id not in self._pending_remote_container_requests:
+                return False
+            self._pending_remote_container_requests.discard(message_id)
+        elif not (self._pending_remote_container_requests and "unsupported request type" in lowered):
+            return False
+        else:
+            self._pending_remote_container_requests.clear()
+
+        unsupported = "unsupported request type" in lowered
+        if unsupported and "list_containers" in lowered and not self._remote_list_legacy_attempted:
+            self._remote_list_legacy_attempted = True
+            self._append_log("System", "Bridge Android legacy rilevato: provo fallback compatibile...")
+            self._request_remote_container_list(legacy=True)
+            return True
+
+        if unsupported and ("list_containers" in lowered or "container_list" in lowered):
+            self._remote_list_feature_supported = False
+            self._append_log(
+                "System",
+                "Container remoti non supportati da questa versione Android. Aggiorna l'app bridge.",
+            )
+            return True
+
+        self._append_log("Error", f"Sync container remoti fallita: {error_text}")
+        return True
 
     def _open_remote_container_picker(self) -> None:
         if not self._remote_containers:
@@ -1234,15 +1842,21 @@ class DesktopChatApp:
 
 
     def _toggle_pip(self) -> None:
-
         if self.pip_enabled.get():
             self._pip_mode_active = True
             self._pre_pip_geometry = self.root.geometry()
-            self.root.attributes('-topmost', True)
-            self.root.geometry("400x500")
+            try:
+                self.root.attributes("-topmost", True)
+            except Exception:
+                pass
+            self.root.geometry("430x560")
+            self.root.minsize(300, 380)
         else:
             self._pip_mode_active = False
-            self.root.attributes('-topmost', False)
+            try:
+                self.root.attributes("-topmost", False)
+            except Exception:
+                pass
             if self._pre_pip_geometry:
                 self.root.geometry(self._pre_pip_geometry)
 
@@ -1251,14 +1865,14 @@ class DesktopChatApp:
             return
         width = event.width
         # Threshold for compact mode
-        if width < 750 and not self._is_compact_mode:
+        if width < 620 and not self._is_compact_mode:
             self._is_compact_mode = True
             self.header_frame.grid_remove()
             self.sidebar_frame.grid_remove()
             self.chat_area_frame.grid(row=0, column=0, rowspan=2, columnspan=2, sticky="nsew", padx=0, pady=0)
             # Remove padding for pure chat view
             self.root.configure(padx=0, pady=0)
-        elif width >= 750 and self._is_compact_mode:
+        elif width >= 620 and self._is_compact_mode:
             self._is_compact_mode = False
             self.header_frame.grid()
             self.sidebar_frame.grid()
@@ -1294,6 +1908,18 @@ class DesktopChatApp:
             )
 
         return frame
+
+    def _bind_listbox_mousewheel(self, widget: tk.Listbox) -> None:
+        def on_mousewheel(event: tk.Event[Any]) -> str:
+            delta = getattr(event, "delta", 0)
+            if delta:
+                widget.yview_scroll(int(-delta / 120), "units")
+                return "break"
+            return ""
+
+        widget.bind("<MouseWheel>", on_mousewheel)
+        widget.bind("<Button-4>", lambda _e: (widget.yview_scroll(-1, "units"), "break")[1])
+        widget.bind("<Button-5>", lambda _e: (widget.yview_scroll(1, "units"), "break")[1])
 
     def _configure_chat_tags(self) -> None:
         self.chat_log._textbox.tag_configure("role_you", foreground="#6ba5ff", font=("Avenir", 10, "bold"), spacing1=10)
@@ -1369,15 +1995,17 @@ class DesktopChatApp:
             return
 
         combo = "<ctrl>+<shift>+g"
+        combo_clip = "<ctrl>+<shift>+h"
         try:
             listener = pynput_keyboard.GlobalHotKeys(
                 {
                     combo: lambda: self.events.put({"type": "hotkey_overlay"}),
+                    combo_clip: lambda: self.events.put({"type": "quick_clipboard_overlay", "prompt": ""}),
                 }
             )
             listener.start()
             self._overlay_listener = listener
-            self._append_log("System", f"Global hotkey ready: {self._overlay_hotkey}")
+            self._append_log("System", "Global hotkeys ready: Ctrl+Shift+G (shot), Ctrl+Shift+H (clipboard)")
         except Exception as exc:
             self._append_log("Error", f"Global hotkey unavailable: {exc}")
 
@@ -1614,7 +2242,7 @@ class DesktopChatApp:
                         elif "not authorized" in lowered or "permission" in lowered:
                             self._append_log(
                                 "Error",
-                                "Screenshot blocked: abilita Screen Recording per Terminal/Python in macOS Settings.",
+                                "Screenshot blocked: abilita Screen Recording per BluetoothGeminiChat in macOS Settings.",
                             )
                         else:
                             detail = stderr if stderr else f"exit code {result.returncode}"
@@ -1635,6 +2263,8 @@ class DesktopChatApp:
                 except OSError:
                     pass
                 return None
+        if system_name == "linux":
+            return self._capture_area_screenshot_path_linux(log_errors=log_errors)
 
         if ImageGrab is None:
             if log_errors:
@@ -1657,6 +2287,52 @@ class DesktopChatApp:
             if log_errors:
                 self._append_log("Error", f"Screenshot failed: {exc}")
             return None
+
+    def _capture_area_screenshot_path_linux(self, log_errors: bool = True) -> str | None:
+        fd, path = tempfile.mkstemp(prefix="gemini-shot-", suffix=".png")
+        os.close(fd)
+        Path(path).unlink(missing_ok=True)
+        quoted = shlex.quote(path)
+
+        commands: list[tuple[str, list[str]]] = []
+        if shutil.which("grim") and shutil.which("slurp"):
+            commands.append(("grim/slurp", ["sh", "-lc", f'grim -g "$(slurp)" {quoted}']))
+        if shutil.which("gnome-screenshot"):
+            commands.append(("gnome-screenshot", ["gnome-screenshot", "-a", "-f", path]))
+        if shutil.which("maim"):
+            commands.append(("maim", ["maim", "-s", path]))
+        if shutil.which("scrot"):
+            commands.append(("scrot", ["scrot", "-s", path]))
+
+        if not commands:
+            if log_errors:
+                self._append_log(
+                    "Error",
+                    "Screenshot Linux non configurato: installa grim+slurp (Wayland) o gnome-screenshot/maim/scrot (X11).",
+                )
+            Path(path).unlink(missing_ok=True)
+            return None
+
+        for label, cmd in commands:
+            try:
+                Path(path).unlink(missing_ok=True)
+                result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+                stderr = str(result.stderr or "").strip().lower()
+                if result.returncode == 0 and Path(path).exists() and Path(path).stat().st_size > 0:
+                    return path
+                if any(token in stderr for token in ("cancel", "annull", "aborted")):
+                    Path(path).unlink(missing_ok=True)
+                    if log_errors:
+                        self._append_log("System", "Screenshot canceled")
+                    return None
+            except Exception:
+                continue
+
+        if log_errors:
+            tried = ", ".join(label for label, _ in commands)
+            self._append_log("Error", f"Screenshot Linux failed (tried: {tried})")
+        Path(path).unlink(missing_ok=True)
+        return None
 
     def _append_log(self, role: str, text: str) -> None:
         clean = str(text).strip()
@@ -2032,6 +2708,11 @@ class DesktopChatApp:
         return True
 
     def _capture_clipboard_image_path(self, log_errors: bool = True) -> str | None:
+        if platform.system().lower() == "linux":
+            linux_path = self._capture_clipboard_image_path_linux(log_errors=log_errors)
+            if linux_path:
+                return linux_path
+
         if ImageGrab is None:
             if log_errors:
                 self._append_log("System", "Clipboard image unavailable: install Pillow")
@@ -2049,6 +2730,35 @@ class DesktopChatApp:
             if log_errors:
                 self._append_log("Error", f"Clipboard import failed: {exc}")
             return None
+
+    def _capture_clipboard_image_path_linux(self, log_errors: bool = True) -> str | None:
+        fd, path = tempfile.mkstemp(prefix="gemini-clip-", suffix=".png")
+        os.close(fd)
+        Path(path).unlink(missing_ok=True)
+        quoted = shlex.quote(path)
+
+        commands: list[tuple[str, list[str]]] = []
+        if shutil.which("wl-paste"):
+            commands.append(("wl-paste", ["sh", "-lc", f"wl-paste --type image/png > {quoted}"]))
+        if shutil.which("xclip"):
+            commands.append(("xclip", ["sh", "-lc", f"xclip -selection clipboard -t image/png -o > {quoted}"]))
+
+        for _label, cmd in commands:
+            try:
+                Path(path).unlink(missing_ok=True)
+                result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+                if result.returncode == 0 and Path(path).exists() and Path(path).stat().st_size > 0:
+                    return path
+            except Exception:
+                continue
+
+        if log_errors:
+            self._append_log(
+                "System",
+                "Clipboard immagine non disponibile su Linux (installa wl-clipboard o xclip).",
+            )
+        Path(path).unlink(missing_ok=True)
+        return None
 
     def on_hotkey_overlay_triggered(self, prompt_override: str | None = None) -> None:
         if not self.connected:
@@ -2540,8 +3250,15 @@ class DesktopChatApp:
                 return
             if mtime > self._clipboard_flag_mtime:
                 self._clipboard_flag_mtime = mtime
-                import pyperclip
-                text = pyperclip.paste().strip()
+                text = ""
+                try:
+                    import pyperclip
+                    text = pyperclip.paste().strip()
+                except Exception:
+                    try:
+                        text = self.root.clipboard_get().strip()
+                    except Exception:
+                        text = ""
                 if text:
                     self.events.put({"type": "force_visibility"})
                     self.events.put({"type": "quick_send", "text": f"Analizza e rispondi a questo testo copiato negli appunti:\n\n{text}"})
@@ -2595,6 +3312,15 @@ class DesktopChatApp:
 
         if event_type == "error":
             message = event.get("text", "Unknown error")
+            lowered = str(message).strip().lower()
+            if "unsupported request type: list_containers" in lowered:
+                self._remote_list_feature_supported = False
+                self._pending_remote_container_requests.clear()
+                self._append_log(
+                    "System",
+                    "Il bridge Android non supporta i container remoti (list_containers). Aggiorna l'app Android.",
+                )
+                return
             if self._overlay_request_ids and isinstance(message, str) and message:
                 self._show_overlay_message(f"Errore bridge: {message}", ttl_ms=8000)
                 self._cleanup_all_overlay_requests()
@@ -2625,6 +3351,9 @@ class DesktopChatApp:
 
         if event_type == "connected":
             self.connected = True
+            self._pending_remote_container_requests.clear()
+            self._remote_list_feature_supported = True
+            self._remote_list_legacy_attempted = False
             address = str(event.get("address", "")).strip()
             if address:
                 self._last_connected_address = address
@@ -2641,6 +3370,7 @@ class DesktopChatApp:
             self.connected = False
             self.status_var.set("Disconnected")
             self.link_var.set("Link: offline")
+            self._pending_remote_container_requests.clear()
             if self._overlay_request_ids:
                 self._show_overlay_message("Bridge disconnesso durante Shot+Ask", ttl_ms=8000)
                 self._cleanup_all_overlay_requests()
@@ -2754,6 +3484,11 @@ class DesktopChatApp:
                                 "chunkCount": int(item.get("chunkCount", 0) or 0),
                             }
                         )
+                if message_id:
+                    self._pending_remote_container_requests.discard(message_id)
+                else:
+                    self._pending_remote_container_requests.clear()
+                self._remote_list_feature_supported = True
                 self._remote_containers = parsed
                 self._append_log("System", f"Container remoti disponibili: {len(parsed)}")
                 if parsed:
@@ -2807,6 +3542,8 @@ class DesktopChatApp:
 
             if message_type == "error":
                 error_text = str(message.get("error", "Unknown error"))
+                if self._handle_remote_container_error(message_id, error_text):
+                    return
                 self._streaming_preview_by_session.pop(target_session, None)
                 self._streaming_thought_by_session.pop(target_session, None)
                 self.sessions_store.add_message(target_session, "error", error_text)
