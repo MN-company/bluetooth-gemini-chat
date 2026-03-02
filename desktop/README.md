@@ -35,6 +35,7 @@ python app.py
 17. In `Settings`:
    - abilita/disabilita `Auto-connect all'avvio` e `Auto-retry su disconnessione`
    - abilita/disabilita `Auto-check updates`
+   - abilita/disabilita `Con la X chiudi solo la finestra (app resta in background)`
    - su macOS puoi attivare `menu bar mode` e `nascondi Dock icon`.
 18. Al primo avvio su macOS compare una schermata guidata permessi (Bluetooth, Screen Recording, Accessibility).
 
@@ -57,6 +58,7 @@ python app.py
 - Supporta Thinking Mode + Think Budget + thought trace (`includeThoughts`) nel payload API.
 - Supporta stop generazione (`cancel`) dal bottone `STOP`.
 - Supporta updater desktop (check release + download asset).
+- Fix SSL updater: fallback certificati per ambienti dove il trust store non e disponibile nel bundle.
 - Supporta quick action/shortcuts macOS via script `macos_quick_ask.sh` (vedi `QUICK_ACTION_SETUP.md`).
 - Tenta install automatica della Quick Action macOS all'avvio; bottone `Install Right-click` per reinstall.
 - Supporta hotkey globale via `pynput` su Windows/Linux; su macOS usa Apple Shortcuts.
