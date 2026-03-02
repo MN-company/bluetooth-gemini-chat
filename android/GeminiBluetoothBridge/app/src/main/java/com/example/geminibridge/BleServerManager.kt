@@ -23,6 +23,9 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.yield
 
 @SuppressLint("MissingPermission")
 class BleServerManager(
@@ -42,6 +45,7 @@ class BleServerManager(
 
     private val mtuByDevice = ConcurrentHashMap<String, Int>()
     private val connectedDevices = ConcurrentHashMap<String, BluetoothDevice>()
+    private val sendMutexByDevice = ConcurrentHashMap<String, Mutex>()
 
     private var gattServer: BluetoothGattServer? = null
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
@@ -58,8 +62,10 @@ class BleServerManager(
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     connectedDevices[device.address] = device
+                    sendMutexByDevice.putIfAbsent(device.address, Mutex())
                     lastActiveDeviceAddress = device.address
                     onLog("BLE connected: ${device.address}")
+                    requestLowLatencyPhy(device)
                     onBridgeStatus("Connected clients: ${connectedDevices.size}")
                 }
 
@@ -70,6 +76,7 @@ class BleServerManager(
                     }
                     mtuByDevice.remove(device.address)
                     frameAssemblersByDevice.remove(device.address)
+                    sendMutexByDevice.remove(device.address)
                     onLog("BLE disconnected: ${device.address}")
                     if (connectedDevices.isNotEmpty()) {
                         onBridgeStatus("Connected clients: ${connectedDevices.size}")
@@ -89,6 +96,18 @@ class BleServerManager(
         override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
             mtuByDevice[device.address] = mtu
             onLog("MTU changed (${device.address}): $mtu")
+        }
+
+        override fun onPhyUpdate(device: BluetoothDevice, txPhy: Int, rxPhy: Int, status: Int) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+            val statusText = if (status == BluetoothGatt.GATT_SUCCESS) "ok" else "status=$status"
+            onLog("PHY update (${device.address}): tx=${phyToText(txPhy)} rx=${phyToText(rxPhy)} ($statusText)")
+        }
+
+        override fun onPhyRead(device: BluetoothDevice, txPhy: Int, rxPhy: Int, status: Int) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+            val statusText = if (status == BluetoothGatt.GATT_SUCCESS) "ok" else "status=$status"
+            onLog("PHY read (${device.address}): tx=${phyToText(txPhy)} rx=${phyToText(rxPhy)} ($statusText)")
         }
 
         override fun onDescriptorWriteRequest(
@@ -216,6 +235,7 @@ class BleServerManager(
         connectedDevices.clear()
         mtuByDevice.clear()
         frameAssemblersByDevice.clear()
+        sendMutexByDevice.clear()
         onBridgeStatus("BLE bridge stopped")
     }
 
@@ -249,7 +269,11 @@ class BleServerManager(
         return startAdvertisingInternal(advertiser)
     }
 
-    suspend fun sendJson(jsonMessage: String, targetAddress: String? = null) {
+    suspend fun sendJson(
+        jsonMessage: String,
+        targetAddress: String? = null,
+        highPriority: Boolean = false,
+    ) {
         val device = if (!targetAddress.isNullOrBlank()) {
             connectedDevices[targetAddress]
         } else {
@@ -257,27 +281,46 @@ class BleServerManager(
             active ?: connectedDevices.values.firstOrNull()
         } ?: throw IllegalStateException("No connected BLE central device")
 
-        val mtu = mtuByDevice[device.address] ?: BleConstants.defaultAttMtu
-        val mtuPayloadMax = maxOf(BleConstants.defaultMaxPacketSize, mtu - 3)
-        val maxPacketSize = minOf(BleConstants.maxGattAttributeValueBytes, mtuPayloadMax)
-        val transportId = transportIds.next()
+        val sendLock = sendMutexByDevice.getOrPut(device.address) { Mutex() }
+        sendLock.withLock {
+            val mtu = mtuByDevice[device.address] ?: BleConstants.defaultAttMtu
+            val mtuPayloadMax = maxOf(BleConstants.defaultMaxPacketSize, mtu - 3)
+            val maxPacketSize = minOf(BleConstants.maxGattAttributeValueBytes, mtuPayloadMax)
+            val transportId = transportIds.next()
 
-        val packets = BleFrameCodec.encodeMessage(
-            transportId = transportId,
-            payload = jsonMessage.toByteArray(Charsets.UTF_8),
-            maxPacketSize = maxPacketSize,
-        )
+            val packets = BleFrameCodec.encodeMessage(
+                transportId = transportId,
+                payload = jsonMessage.toByteArray(Charsets.UTF_8),
+                maxPacketSize = maxPacketSize,
+            )
 
-        val throttleEvery = if (packets.size > 140) 14 else 4
-        val throttleDelayMs = if (packets.size > 140) 1L else 2L
-
-        packets.forEachIndexed { idx, packet ->
-            val notified = notifyPacket(device, packet)
-            if (!notified) {
-                throw IllegalStateException("Failed to notify BLE packet")
+            val multiClient = connectedDevices.size > 1
+            val throttleEvery = when {
+                highPriority || packets.size <= 12 -> 0
+                multiClient && packets.size > 140 -> 6
+                multiClient -> 4
+                packets.size > 180 -> 14
+                packets.size > 90 -> 10
+                else -> 6
             }
-            if ((idx + 1) % throttleEvery == 0) {
-                delay(throttleDelayMs)
+            val throttleDelayMs = when {
+                highPriority || throttleEvery == 0 -> 0L
+                multiClient -> 1L
+                else -> 1L
+            }
+
+            packets.forEachIndexed { idx, packet ->
+                val notified = notifyPacket(device, packet)
+                if (!notified) {
+                    throw IllegalStateException("Failed to notify BLE packet")
+                }
+                if (throttleEvery > 0 && (idx + 1) % throttleEvery == 0) {
+                    if (throttleDelayMs > 0L) {
+                        delay(throttleDelayMs)
+                    } else {
+                        yield()
+                    }
+                }
             }
         }
     }
@@ -364,6 +407,32 @@ class BleServerManager(
             characteristic.value = packet
             @Suppress("DEPRECATION")
             server.notifyCharacteristicChanged(device, characteristic, false)
+        }
+    }
+
+    private fun requestLowLatencyPhy(device: BluetoothDevice) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val server = gattServer ?: return
+        runCatching {
+            server.setPreferredPhy(
+                device,
+                BluetoothDevice.PHY_LE_2M_MASK,
+                BluetoothDevice.PHY_LE_2M_MASK,
+                BluetoothDevice.PHY_OPTION_NO_PREFERRED,
+            )
+            server.readPhy(device)
+        }.onFailure {
+            onLog("setPreferredPhy failed (${device.address}): ${it.message}")
+        }
+    }
+
+    private fun phyToText(phy: Int): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return phy.toString()
+        return when (phy) {
+            BluetoothDevice.PHY_LE_1M -> "1M"
+            BluetoothDevice.PHY_LE_2M -> "2M"
+            BluetoothDevice.PHY_LE_CODED -> "CODED"
+            else -> phy.toString()
         }
     }
 

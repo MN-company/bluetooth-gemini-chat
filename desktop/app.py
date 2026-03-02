@@ -7,6 +7,7 @@ import queue
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import tkinter as tk
 import customtkinter as ctk
@@ -28,9 +29,27 @@ from context_store import ContextStore
 from pdf_context import PdfContextEngine
 
 try:
-    from PIL import ImageGrab
+    from PIL import ImageGrab, Image as PILImage, ImageDraw
 except Exception:
     ImageGrab = None
+    PILImage = None
+    ImageDraw = None
+
+try:
+    import pystray
+except Exception:
+    pystray = None
+
+try:
+    from AppKit import (
+        NSApplication,
+        NSApplicationActivationPolicyAccessory,
+        NSApplicationActivationPolicyRegular,
+    )
+except Exception:
+    NSApplication = None
+    NSApplicationActivationPolicyAccessory = None
+    NSApplicationActivationPolicyRegular = None
 
 try:
     from pynput import keyboard as pynput_keyboard
@@ -107,10 +126,19 @@ class DesktopChatApp:
         _saved = self._load_settings()
         self.system_instructions_var = tk.StringVar(value=_saved.get("system_instructions", ""))
         self.pinned_pdf_paths: list[str] = _saved.get("pinned_pdf_paths", [])
+        self._last_connected_address = str(_saved.get("last_connected_address", "")).strip() or None
+        self._auto_connect_on_start = bool(_saved.get("auto_connect_on_start", True))
+        self._auto_retry_known_device = bool(_saved.get("auto_retry_known_device", True))
+        self._menu_bar_mode_enabled = bool(_saved.get("menu_bar_mode_enabled", self._is_macos))
+        self._hide_dock_icon_enabled = bool(_saved.get("hide_dock_icon_enabled", self._is_macos))
         self._overlay_bg_color = self._normalize_hex_color(_saved.get("overlay_bg_color"), "#0f172a")
         self._overlay_width = self._parse_int_setting(_saved.get("overlay_width"), 460, 320, 1280)
         self._overlay_height = self._parse_int_setting(_saved.get("overlay_height"), 220, 160, 900)
         self._overlay_resizable = bool(_saved.get("overlay_resizable", True))
+        self._tray_icon: Any | None = None
+        self._tray_thread: threading.Thread | None = None
+        self._macos_policy_applied = False
+        self._menu_bar_available = self._is_macos and pystray is not None and PILImage is not None
 
         self._context_store = ContextStore(Path(__file__).parent)
         self._active_container_id: str | None = None
@@ -123,6 +151,9 @@ class DesktopChatApp:
 
         self._configure_theme()
         self._build_ui()
+        self.client.set_auto_reconnect(self._auto_retry_known_device)
+        self._start_menu_bar_icon_if_needed()
+        self._apply_macos_activation_policy()
         self._refresh_sessions_list(self.active_session_id)
         self._render_active_chat()
         self._refresh_memory_label()
@@ -131,6 +162,7 @@ class DesktopChatApp:
         self._start_overlay_hotkey_listener()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self._poll_events)
+        self.root.after(1200, self._maybe_auto_connect_on_start)
 
     def _configure_theme(self) -> None:
         ctk.set_appearance_mode("dark")
@@ -432,6 +464,125 @@ class DesktopChatApp:
         except Exception:
             pass
 
+    def _update_settings(self, patch: dict[str, Any]) -> None:
+        current = self._load_settings()
+        current.update(patch)
+        self._save_settings(current)
+
+    def _maybe_auto_connect_on_start(self) -> None:
+        if not self._auto_connect_on_start:
+            return
+        if self.connected:
+            return
+        if not self._last_connected_address:
+            return
+        self._append_log("System", f"Auto-connect to known bridge: {self._last_connected_address}")
+        self.client.connect(self._last_connected_address)
+
+    def _create_menu_bar_icon_image(self) -> Any | None:
+        if PILImage is None or ImageDraw is None:
+            return None
+        try:
+            size = 64
+            icon = PILImage.new("RGBA", (size, size), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(icon)
+            draw.rounded_rectangle((8, 8, size - 8, size - 8), radius=14, fill=(28, 28, 30, 255))
+            draw.ellipse((18, 22, 34, 38), fill=(71, 160, 255, 255))
+            draw.rectangle((32, 27, 46, 33), fill=(213, 213, 214, 255))
+            return icon
+        except Exception:
+            return None
+
+    def _start_menu_bar_icon_if_needed(self) -> None:
+        if not self._menu_bar_mode_enabled:
+            return
+        if not self._menu_bar_available:
+            if self._is_macos:
+                self._append_log("System", "Menu bar mode unavailable: install 'pystray'")
+            return
+        if self._tray_icon is not None:
+            return
+
+        image = self._create_menu_bar_icon_image()
+        if image is None:
+            return
+
+        def on_toggle(_icon: Any, _item: Any) -> None:
+            self.root.after(0, self._toggle_app_visibility)
+
+        def on_shot(_icon: Any, _item: Any) -> None:
+            self.root.after(0, self.on_hotkey_overlay_triggered)
+
+        def on_clip(_icon: Any, _item: Any) -> None:
+            self.root.after(0, self.on_hotkey_clipboard_triggered)
+
+        def on_reconnect(_icon: Any, _item: Any) -> None:
+            self.root.after(0, self._reconnect_last_or_selected)
+
+        def on_quit(_icon: Any, _item: Any) -> None:
+            self.root.after(0, self.on_close)
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Show/Hide Window", on_toggle),
+            pystray.MenuItem("Shot+Ask", on_shot),
+            pystray.MenuItem("Clipboard+Ask", on_clip),
+            pystray.MenuItem("Reconnect", on_reconnect),
+            pystray.MenuItem("Quit", on_quit),
+        )
+        icon = pystray.Icon("gemini_ble_chat", image, "Gemini BLE Chat", menu)
+        self._tray_icon = icon
+
+        def run_icon() -> None:
+            try:
+                icon.run()
+            except Exception:
+                pass
+
+        self._tray_thread = threading.Thread(target=run_icon, daemon=True)
+        self._tray_thread.start()
+
+    def _stop_menu_bar_icon(self) -> None:
+        icon = self._tray_icon
+        self._tray_icon = None
+        if icon is None:
+            return
+        try:
+            icon.stop()
+        except Exception:
+            pass
+
+    def _apply_macos_activation_policy(self) -> None:
+        if not self._is_macos:
+            return
+        if NSApplication is None:
+            if not self._macos_policy_applied:
+                self._append_log("System", "Dock policy control unavailable (missing AppKit bridge)")
+            self._macos_policy_applied = True
+            return
+        try:
+            app = NSApplication.sharedApplication()
+            if self._hide_dock_icon_enabled:
+                app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+            else:
+                app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+            self._macos_policy_applied = True
+        except Exception as exc:
+            if not self._macos_policy_applied:
+                self._append_log("System", f"Dock policy update failed: {exc}")
+            self._macos_policy_applied = True
+
+    def _reconnect_last_or_selected(self) -> None:
+        if self.connected:
+            self.client.disconnect()
+        selected = self.devices_list.curselection()
+        if selected:
+            idx = selected[0]
+            if 0 <= idx < len(self.devices):
+                self.client.connect(self.devices[idx]["address"])
+                return
+        if self._last_connected_address:
+            self.client.connect(self._last_connected_address)
+
     def on_open_settings(self) -> None:
         dialog = ctk.CTkToplevel(self.root)
         dialog.title("Settings")
@@ -547,6 +698,35 @@ class DesktopChatApp:
             variable=overlay_resizable_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 12))
 
+        # --- Section 4: Connection & macOS Shell ---
+        ctk.CTkLabel(dialog, text="🔗 Connessione:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        auto_connect_var = tk.BooleanVar(value=self._auto_connect_on_start)
+        auto_retry_var = tk.BooleanVar(value=self._auto_retry_known_device)
+        ctk.CTkCheckBox(
+            dialog,
+            text="Auto-connect all'avvio (ultimo telefono noto)",
+            variable=auto_connect_var,
+        ).pack(anchor=tk.W, padx=12, pady=(0, 4))
+        ctk.CTkCheckBox(
+            dialog,
+            text="Auto-retry su disconnessione (backoff)",
+            variable=auto_retry_var,
+        ).pack(anchor=tk.W, padx=12, pady=(0, 12))
+
+        ctk.CTkLabel(dialog, text="🍎 macOS Shell:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        menu_bar_mode_var = tk.BooleanVar(value=self._menu_bar_mode_enabled)
+        hide_dock_var = tk.BooleanVar(value=self._hide_dock_icon_enabled)
+        ctk.CTkCheckBox(
+            dialog,
+            text="Mostra icona nella barra in alto (menu bar)",
+            variable=menu_bar_mode_var,
+        ).pack(anchor=tk.W, padx=12, pady=(0, 4))
+        ctk.CTkCheckBox(
+            dialog,
+            text="Nascondi icona nella Dock",
+            variable=hide_dock_var,
+        ).pack(anchor=tk.W, padx=12, pady=(0, 12))
+
         def save() -> None:
             text = textbox.get("1.0", tk.END).strip()
             self.system_instructions_var.set(text)
@@ -555,6 +735,11 @@ class DesktopChatApp:
             self._overlay_width = self._parse_int_setting(overlay_width_var.get(), self._overlay_width, 320, 1280)
             self._overlay_height = self._parse_int_setting(overlay_height_var.get(), self._overlay_height, 160, 900)
             self._overlay_resizable = bool(overlay_resizable_var.get())
+            self._auto_connect_on_start = bool(auto_connect_var.get())
+            self._auto_retry_known_device = bool(auto_retry_var.get())
+            self._menu_bar_mode_enabled = bool(menu_bar_mode_var.get())
+            self._hide_dock_icon_enabled = bool(hide_dock_var.get())
+            self.client.set_auto_reconnect(self._auto_retry_known_device)
             old_settings = self._load_settings()
             old_settings["system_instructions"] = text
             old_settings["pinned_pdf_paths"] = self.pinned_pdf_paths
@@ -562,8 +747,18 @@ class DesktopChatApp:
             old_settings["overlay_width"] = self._overlay_width
             old_settings["overlay_height"] = self._overlay_height
             old_settings["overlay_resizable"] = self._overlay_resizable
+            old_settings["auto_connect_on_start"] = self._auto_connect_on_start
+            old_settings["auto_retry_known_device"] = self._auto_retry_known_device
+            old_settings["menu_bar_mode_enabled"] = self._menu_bar_mode_enabled
+            old_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
+            old_settings["last_connected_address"] = self._last_connected_address
             self._save_settings(old_settings)
             self._apply_overlay_window_preferences()
+            if self._menu_bar_mode_enabled:
+                self._start_menu_bar_icon_if_needed()
+            else:
+                self._stop_menu_bar_icon()
+            self._apply_macos_activation_policy()
             dialog.destroy()
             n = len(self.pinned_pdf_paths)
             self._append_log(
@@ -571,7 +766,9 @@ class DesktopChatApp:
                 (
                     f"Settings saved. Pinned PDFs: {n}. "
                     f"System instructions: {'YES' if text else 'none'}. "
-                    f"Overlay: {self._overlay_width}x{self._overlay_height}, bg {self._overlay_bg_color}"
+                    f"Overlay: {self._overlay_width}x{self._overlay_height}, bg {self._overlay_bg_color}. "
+                    f"Auto-connect: {'on' if self._auto_connect_on_start else 'off'}. "
+                    f"Auto-retry: {'on' if self._auto_retry_known_device else 'off'}."
                 ),
             )
 
@@ -1366,6 +1563,10 @@ class DesktopChatApp:
     def on_connect(self) -> None:
         selected = self.devices_list.curselection()
         if not selected:
+            if self._last_connected_address:
+                self._append_log("System", f"Connecting to last known device: {self._last_connected_address}")
+                self.client.connect(self._last_connected_address)
+                return
             self._append_log("System", "Select a device first")
             return
 
@@ -2111,9 +2312,15 @@ class DesktopChatApp:
         if event_type == "scan_result":
             self.devices = event.get("devices", [])
             self.devices_list.delete(0, tk.END)
-            for device in self.devices:
+            selected_idx: int | None = None
+            for idx, device in enumerate(self.devices):
                 label = f"{device['name']} ({device['address']})"
                 self.devices_list.insert(tk.END, label)
+                if self._last_connected_address and device.get("address") == self._last_connected_address:
+                    selected_idx = idx
+            if selected_idx is not None:
+                self.devices_list.selection_clear(0, tk.END)
+                self.devices_list.selection_set(selected_idx)
             if self.devices:
                 self._append_log("System", f"Found {len(self.devices)} Gemini bridge device(s)")
             else:
@@ -2125,6 +2332,10 @@ class DesktopChatApp:
 
         if event_type == "connected":
             self.connected = True
+            address = str(event.get("address", "")).strip()
+            if address:
+                self._last_connected_address = address
+                self._update_settings({"last_connected_address": address})
             device = event.get("device", "device")
             packet = event.get("max_packet_size", "?")
             self.status_var.set(f"Connected: {device}")
@@ -2309,6 +2520,11 @@ class DesktopChatApp:
         if self.root.state() == 'withdrawn' or self.root.state() == 'iconic':
             self.root.deiconify()
         self.root.lift()
+        if self._is_macos and NSApplication is not None:
+            try:
+                NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            except Exception:
+                pass
         if not self.pip_enabled.get():
             self.pip_enabled.set(True)
             self._toggle_pip()
@@ -2317,6 +2533,11 @@ class DesktopChatApp:
         if self.root.state() == 'withdrawn' or self.root.state() == 'iconic':
             self.root.deiconify()
             self.root.lift()
+            if self._is_macos and NSApplication is not None:
+                try:
+                    NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+                except Exception:
+                    pass
             if not self.pip_enabled.get():
                 self.pip_enabled.set(True)
                 self._toggle_pip()
@@ -2333,11 +2554,17 @@ class DesktopChatApp:
             except Exception:
                 pass
             self._overlay_listener = None
+        self._stop_menu_bar_icon()
         latest_settings = self._load_settings()
         latest_settings["overlay_bg_color"] = self._overlay_bg_color
         latest_settings["overlay_width"] = self._overlay_width
         latest_settings["overlay_height"] = self._overlay_height
         latest_settings["overlay_resizable"] = self._overlay_resizable
+        latest_settings["auto_connect_on_start"] = self._auto_connect_on_start
+        latest_settings["auto_retry_known_device"] = self._auto_retry_known_device
+        latest_settings["menu_bar_mode_enabled"] = self._menu_bar_mode_enabled
+        latest_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
+        latest_settings["last_connected_address"] = self._last_connected_address
         self._save_settings(latest_settings)
         self._hide_overlay_window()
         self.client.stop()

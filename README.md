@@ -6,9 +6,11 @@ Chat PC <-> Android via BLE (senza Wi-Fi sul PC), con Gemini sul telefono.
 - Desktop app (Python/Tkinter) con chat multipla, PDF, immagini, markdown, streaming.
 - Bridge Android BLE + chiamata Gemini API.
 - Supporto multi-client BLE (piu desktop connessi allo stesso telefono, risposta routata al client corretto).
+- Ottimizzazione multi-client: coda invio per-device, priorita messaggi critici (pong/result/error), preferenza PHY 2M.
 - Selettore modello da PC (`phone-default` o override per richiesta).
 - Lista modelli disponibili da API direttamente nell'app Android.
 - Screenshot rapido con overlay risposta (Windows: hotkey globale, macOS: Apple Shortcuts wrapper).
+- Modalita macOS menu bar + opzione nascondi icona Dock.
 - APK pronta in `dist/app-debug.apk`.
 
 ## Installazione rapida (altri dispositivi)
@@ -65,3 +67,4 @@ Nota: su macOS devi concedere `Screen Recording` per gli screenshot area.
 ## Note
 - Quota e billing sono della Gemini API key/progetto, non del piano consumer Gemini app.
 - Su telefoni Xiaomi/MIUI/HyperOS: disattivare ottimizzazione batteria è fondamentale.
+- Valutazione rete mesh BLE: vedi `docs/mesh-evaluation.md` (non consigliata per questa architettura GATT).

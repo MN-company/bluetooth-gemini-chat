@@ -270,7 +270,7 @@ class BleKeepAliveService : Service() {
         val ackPayload = json.encodeToString(
             ContainerAckResponse(containerId = containerId, chunkCount = chunks.size, messageId = messageId)
         )
-        sendToPc(ackPayload, "container_ack", messageId, sourceAddress)
+        sendToPc(ackPayload, "container_ack", messageId, sourceAddress, highPriority = true)
     }
 
     private suspend fun handlePromptRequest(rawJson: String, sourceAddress: String) {
@@ -481,7 +481,7 @@ class BleKeepAliveService : Service() {
 
     private suspend fun sendResult(response: ResultResponse, targetAddress: String? = null) {
         val payload = json.encodeToString(response)
-        sendToPc(payload, "result", response.messageId, targetAddress)
+        sendToPc(payload, "result", response.messageId, targetAddress, highPriority = true)
     }
 
     private suspend fun sendPartial(
@@ -503,12 +503,12 @@ class BleKeepAliveService : Service() {
 
     private suspend fun sendError(messageId: String, error: String, targetAddress: String? = null) {
         val payload = json.encodeToString(ErrorResponse(messageId = messageId, error = error))
-        sendToPc(payload, "error", messageId, targetAddress)
+        sendToPc(payload, "error", messageId, targetAddress, highPriority = true)
     }
 
     private suspend fun sendPong(messageId: String, clientTsMs: Long?, targetAddress: String? = null) {
         val payload = json.encodeToString(PongResponse(messageId = messageId, clientTsMs = clientTsMs))
-        sendToPc(payload, "pong", messageId, targetAddress)
+        sendToPc(payload, "pong", messageId, targetAddress, highPriority = true)
     }
 
     private suspend fun sendToPc(
@@ -516,6 +516,7 @@ class BleKeepAliveService : Service() {
         type: String,
         messageId: String,
         targetAddress: String? = null,
+        highPriority: Boolean = false,
     ) {
         val manager = bleServerManager
         if (manager == null) {
@@ -525,7 +526,7 @@ class BleKeepAliveService : Service() {
 
         try {
             val resolvedAddress = targetAddress ?: requestRouteByMessageId[messageId]
-            manager.sendJson(payload, resolvedAddress)
+            manager.sendJson(payload, resolvedAddress, highPriority = highPriority)
             if (type == "result" || type == "error" || type == "pong") {
                 requestRouteByMessageId.remove(messageId)
             }

@@ -9,6 +9,7 @@ import mimetypes
 import threading
 import time
 import uuid
+import random
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Callable
@@ -57,6 +58,7 @@ class BleChatClient:
         self._reconnect_task: asyncio.Task[Any] | None = None
         self._pending_pings: dict[str, float] = {}
         self._last_pong_monotonic = time.monotonic()
+        self._auto_reconnect_enabled = True
 
     def start(self) -> None:
         if self._thread_started:
@@ -93,6 +95,11 @@ class BleChatClient:
         self._last_connected_address = None
         self._stop_reconnect()
         self._run_coro(self._disconnect())
+
+    def set_auto_reconnect(self, enabled: bool) -> None:
+        self._auto_reconnect_enabled = bool(enabled)
+        if not self._auto_reconnect_enabled:
+            self._stop_reconnect()
 
     def send_prompt(
         self,
@@ -290,6 +297,8 @@ class BleChatClient:
                 self._emit({"type": "status", "text": f"Reconnect failed: {exc}"})
             else:
                 self._emit({"type": "error", "text": f"Connection failed: {exc}"})
+                if self._auto_reconnect_enabled and self._last_connected_address == address:
+                    self._start_reconnect()
 
     async def _disconnect(self, silent: bool = False) -> None:
         self._stop_heartbeat()
@@ -360,7 +369,7 @@ class BleChatClient:
             await asyncio.sleep(PING_INTERVAL_SECONDS)
 
     def _start_reconnect(self) -> None:
-        if self._closing or self._last_connected_address is None:
+        if self._closing or self._last_connected_address is None or not self._auto_reconnect_enabled:
             return
         if self._reconnect_task is not None and not self._reconnect_task.done():
             return
@@ -386,7 +395,9 @@ class BleChatClient:
                 self._emit({"type": "status", "text": "Reconnected"})
                 return
 
-            backoff = min(RECONNECT_BASE_SECONDS * (1.6 ** (attempt - 1)), RECONNECT_MAX_SECONDS)
+            base_backoff = min(RECONNECT_BASE_SECONDS * (1.6 ** (attempt - 1)), RECONNECT_MAX_SECONDS)
+            # Small jitter reduces reconnect collisions in multi-client scenarios.
+            backoff = base_backoff + random.uniform(0.0, 0.4)
             await asyncio.sleep(backoff)
             attempt += 1
 

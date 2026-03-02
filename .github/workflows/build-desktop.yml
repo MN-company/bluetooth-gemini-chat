@@ -43,6 +43,7 @@ jobs:
             --name BluetoothGeminiChat \
             --paths desktop \
             --collect-submodules bleak \
+            --collect-submodules pystray \
             --add-data "desktop/install_macos_quick_action.py:." \
             --add-data "desktop/macos_quick_ask.sh:." \
             --add-data "desktop/macos_quick_ask.py:." \
@@ -59,6 +60,7 @@ jobs:
             --name BluetoothGeminiChat \
             --paths desktop \
             --collect-submodules bleak \
+            --collect-submodules pystray \
             desktop/app.py
 
       - name: Package artifact (macOS)

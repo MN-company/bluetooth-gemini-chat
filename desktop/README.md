@@ -30,6 +30,9 @@ python app.py
 14. Overlay clipboard rapido (testo o immagine):
    - macOS: Apple Shortcuts + `~/.gemini_ble/ask_gemini_ble_clipboard.sh`
    Legge la clipboard locale e mostra la risposta in overlay.
+15. In `Settings`:
+   - abilita/disabilita `Auto-connect all'avvio` e `Auto-retry su disconnessione`
+   - su macOS puoi attivare `menu bar mode` e `nascondi Dock icon`.
 
 ## Dettagli
 
@@ -52,3 +55,4 @@ python app.py
 - Tenta install automatica della Quick Action macOS all'avvio; bottone `Install Right-click` per reinstall.
 - Supporta hotkey globale via `pynput` su Windows/Linux; su macOS usa Apple Shortcuts.
 - Su macOS lo screenshot richiede permesso `Screen Recording` per Terminal/Python.
+- Supporta tray/menu bar via `pystray` (macOS/Windows) con azioni rapide: show/hide, shot+ask, clipboard+ask, reconnect.
