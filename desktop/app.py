@@ -19,12 +19,28 @@ from tkinter import colorchooser, filedialog, simpledialog, ttk
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
-from tkinterdnd2 import TkinterDnD, DND_FILES
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+except Exception:
+    TkinterDnD = None
+    DND_FILES = None
 
-class CTkinterDnD(ctk.CTk, TkinterDnD.DnDWrapper):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.TkdndVersion = TkinterDnD._require(self)
+
+if TkinterDnD is not None:
+    class CTkinterDnD(ctk.CTk, TkinterDnD.DnDWrapper):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._dnd_ready = False
+            try:
+                self.TkdndVersion = TkinterDnD._require(self)
+                self._dnd_ready = True
+            except Exception:
+                self._dnd_ready = False
+else:
+    class CTkinterDnD(ctk.CTk):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._dnd_ready = False
 
 
 from ble_client import BleChatClient
@@ -118,7 +134,7 @@ MODEL_PRESETS = [
     "gemini-2.0-pro-exp",
 ]
 
-APP_VERSION = "0.1.7"
+APP_VERSION = "0.1.8"
 GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
 
 
@@ -148,8 +164,17 @@ class DesktopChatApp:
         self.root.title("Gemini BLE Chat")
         self.root.geometry("1240x780")
         self.root.minsize(300, 400)
-        self.root.drop_target_register(DND_FILES)
-        self.root.dnd_bind('<<Drop>>', self._on_file_drop)
+        self._dnd_enabled = False
+        self._dnd_issue_note = ""
+        if getattr(self.root, "_dnd_ready", False) and DND_FILES is not None:
+            try:
+                self.root.drop_target_register(DND_FILES)
+                self.root.dnd_bind("<<Drop>>", self._on_file_drop)
+                self._dnd_enabled = True
+            except Exception as exc:
+                self._dnd_issue_note = str(exc)
+        else:
+            self._dnd_issue_note = "tkinterdnd2/tkdnd non disponibile"
 
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.client = BleChatClient(self.events.put)
@@ -244,6 +269,11 @@ class DesktopChatApp:
 
         self._configure_theme()
         self._build_ui()
+        if not self._dnd_enabled:
+            if platform.system().lower() == "linux":
+                self._append_log("System", "Drag & drop disabilitato su Linux: usa i pulsanti Attach/Add PDF.")
+            elif self._dnd_issue_note:
+                self._append_log("System", f"Drag & drop disabilitato: {self._dnd_issue_note}")
         self.client.set_auto_reconnect(self._auto_retry_known_device)
         self._start_menu_bar_icon_if_needed()
         self._apply_macos_activation_policy()

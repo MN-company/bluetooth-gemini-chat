@@ -18,16 +18,19 @@ Chat PC <-> Android via BLE (senza Wi-Fi sul PC), con Gemini sul telefono.
 
 ## Installazione rapida (altri dispositivi)
 
-### 0) Desktop senza Python (macOS/Windows)
+### 0) Desktop senza Python (macOS/Windows/Linux)
 1. Vai su GitHub -> `Actions` -> workflow `Build Desktop Clients`.
 2. Apri l'ultima run riuscita.
 3. Scarica artifact:
    - `desktop-macOS` -> `BluetoothGeminiChat-macos.dmg`
    - `desktop-Windows` -> `BluetoothGeminiChat-windows.zip`
+   - `desktop-Linux` -> `BluetoothGeminiChat-linux.tar.gz`
 4. Su macOS apri il DMG e trascina `BluetoothGeminiChat.app` in `Applications`.
 5. Su Windows estrai lo ZIP e avvia `BluetoothGeminiChat.exe`.
+6. Su Linux/Arch estrai il `.tar.gz` e avvia `BluetoothGeminiChat/BluetoothGeminiChat`.
 
 Nota: su macOS devi concedere `Screen Recording` per gli screenshot area.
+Nota Linux: se `tkdnd` non e disponibile, drag&drop viene disattivato automaticamente (usa i pulsanti Attach/Add PDF).
 
 ### 1) Android (APK)
 1. Abilita `USB debugging` sul telefono.

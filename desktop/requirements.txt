@@ -2,7 +2,7 @@ bleak==0.22.3
 Pillow==10.4.0
 pypdf==4.3.1
 customtkinter==5.2.2
-tkinterdnd2==0.4.2
+tkinterdnd2==0.4.2; platform_system != "Linux"
 pyperclip==1.9.0
 pynput==1.7.7
 pystray==0.19.5
