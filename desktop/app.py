@@ -198,11 +198,7 @@ class DesktopChatApp:
         self._pre_pip_geometry = ""
         self._is_macos = platform.system().lower() == "darwin"
         self._overlay_listener: Any | None = None
-        self._overlay_hotkey = (
-            "Apple Shortcut (Cmd+Shift+G)"
-            if self._is_macos
-            else "Ctrl+Shift+G (shot) / Ctrl+Shift+H (clipboard)"
-        )
+        self._overlay_hotkey = "Apple Shortcut (Cmd+Shift+G)" if self._is_macos else "Ctrl+Shift+G"
         self._overlay_request_ids: set[str] = set()
         self._overlay_image_paths_by_request: dict[str, str] = {}
         self._overlay_started_at: dict[str, float] = {}
@@ -364,11 +360,9 @@ class DesktopChatApp:
         self.search_entry.pack(fill=tk.X, pady=(0, 6))
         self.search_entry.bind("<KeyRelease>", lambda e: self._refresh_sessions_list(self.active_session_id))
 
-        # Chats listbox (scrollable)
-        chats_list_wrap = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        chats_list_wrap.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        # Chats listbox
         self.chats_list = tk.Listbox(
-            chats_list_wrap,
+            self.sidebar_frame,
             bg="#1c1c1c",
             fg="#e0e0e0",
             selectbackground="#1f538d",
@@ -377,12 +371,8 @@ class DesktopChatApp:
             relief=tk.SOLID,
             highlightthickness=0,
         )
-        chats_scroll = ctk.CTkScrollbar(chats_list_wrap, orientation="vertical", command=self.chats_list.yview)
-        self.chats_list.configure(yscrollcommand=chats_scroll.set)
-        self.chats_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        chats_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.chats_list.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         self.chats_list.bind("<<ListboxSelect>>", self._on_session_selected)
-        self._bind_listbox_mousewheel(self.chats_list)
 
         # --- Knowledge Base Container Panel ---
         separator = ctk.CTkFrame(self.sidebar_frame, height=1, fg_color="#2a2a2a")
@@ -397,10 +387,8 @@ class DesktopChatApp:
             text_color="white", font=("Avenir", 11),
         ).pack(side=tk.RIGHT)
 
-        container_wrap = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        container_wrap.pack(fill=tk.X, pady=(0, 4))
         self.container_list = tk.Listbox(
-            container_wrap,
+            self.sidebar_frame,
             bg="#181818",
             fg="#cccccc",
             selectbackground="#1e5c1e",
@@ -412,13 +400,9 @@ class DesktopChatApp:
             height=5,
             font=("Avenir", 12),
         )
-        container_scroll = ctk.CTkScrollbar(container_wrap, orientation="vertical", command=self.container_list.yview)
-        self.container_list.configure(yscrollcommand=container_scroll.set)
-        self.container_list.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        container_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.container_list.pack(fill=tk.X, pady=(0, 4))
         self.container_list.bind("<<ListboxSelect>>", self._on_container_list_click)
         self.container_list.bind("<Double-Button-1>", self._on_activate_container)
-        self._bind_listbox_mousewheel(self.container_list)
 
         # Row 1: Add PDF | Attiva | Upload
         kb_row1 = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
@@ -439,8 +423,8 @@ class DesktopChatApp:
             hover_color="#2a2a2a", text_color="#d0d0d0", font=("Avenir", 13),
         ).pack(side=tk.LEFT)
         ctk.CTkButton(
-            kb_row1, text="Sync", command=self._on_sync_remote_containers,
-            width=52, height=30, fg_color="transparent", border_width=1, border_color="#444",
+            kb_row1, text="☁", command=self._on_sync_remote_containers,
+            width=34, height=30, fg_color="transparent", border_width=1, border_color="#444",
             hover_color="#2a2a2a", text_color="#d0d0d0", font=("Avenir", 13),
         ).pack(side=tk.LEFT, padx=(3, 0))
 
@@ -464,47 +448,29 @@ class DesktopChatApp:
         self._build_button_grid(
             self.sidebar_frame,
             [
-                ("Rinomina chat", self.on_rename_chat),
-                ("Elimina chat", self.on_delete_chat),
-                ("Scan bridge", self.on_scan),
-                ("Connetti", self.on_connect),
-                ("Disconnetti", self.on_disconnect),
-                ("Svuota memoria", self.on_clear_memory),
+                ("Rename", self.on_rename_chat),
+                ("Delete", self.on_delete_chat),
+                ("Scan", self.on_scan),
+                ("Connect", self.on_connect),
+                ("Disconnect", self.on_disconnect),
+                ("Clear Mem", self.on_clear_memory),
+                ("Shot+Ask", self.on_hotkey_overlay_triggered),
+                ("Clip+Ask", self.on_hotkey_clipboard_triggered),
             ],
             columns=2,
             pady=(8, 8),
         )
-
-        devices_wrap = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        devices_wrap.pack(fill=tk.X, pady=(0, 6))
+        
         self.devices_list = tk.Listbox(
-            devices_wrap,
-            height=3,
-            bg="#1c1c1c",
-            fg="#e0e0e0",
-            selectbackground="#1f538d",
-            activestyle=tk.NONE,
-            borderwidth=1,
-            relief=tk.SOLID,
-            highlightthickness=0,
+            self.sidebar_frame, height=3, bg="#1c1c1c", fg="#e0e0e0", selectbackground="#1f538d", activestyle=tk.NONE, borderwidth=1, relief=tk.SOLID, highlightthickness=0,
         )
-        devices_scroll = ctk.CTkScrollbar(devices_wrap, orientation="vertical", command=self.devices_list.yview)
-        self.devices_list.configure(yscrollcommand=devices_scroll.set)
-        self.devices_list.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        devices_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self._bind_listbox_mousewheel(self.devices_list)
+        self.devices_list.pack(fill=tk.X, pady=(0, 6))
         ctk.CTkLabel(
             self.sidebar_frame,
             text=f"Trigger: {self._overlay_hotkey}",
             text_color="#a1a1a1",
             font=("Avenir", 10),
         ).pack(anchor=tk.W, pady=(0, 6))
-        ctk.CTkLabel(
-            self.sidebar_frame,
-            text="Setup rapido: 1) Scan  2) Seleziona telefono  3) Connetti",
-            text_color="#7f7f7f",
-            font=("Avenir", 10),
-        ).pack(anchor=tk.W, pady=(0, 4))
 
 
         # --- MAIN CHAT AREA (Row 1, Col 1) ---
@@ -1266,69 +1232,40 @@ class DesktopChatApp:
     def on_open_settings(self) -> None:
         dialog = ctk.CTkToplevel(self.root)
         dialog.title("Settings")
-        dialog.geometry("620x720")
+        dialog.geometry("560x700")
         dialog.transient(self.root)
         dialog.grab_set()
-        dialog.grid_rowconfigure(0, weight=1)
-        dialog.grid_columnconfigure(0, weight=1)
 
-        body = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
-        body.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 0))
-        body.grid_columnconfigure(0, weight=1)
+        # --- Section 1: System Instructions ---
+        ctk.CTkLabel(dialog, text="System Instructions (Global Prompt):", font=("Avenir", 14, "bold")).pack(pady=(12, 4), padx=12, anchor=tk.W)
+        ctk.CTkLabel(dialog, text="Iniettate silenziosamente in ogni richiesta.", font=("Avenir", 11), text_color="#888888").pack(padx=12, anchor=tk.W)
 
-        ctk.CTkLabel(body, text="Impostazioni principali", font=("Avenir", 18, "bold")).pack(
-            pady=(4, 10), padx=12, anchor=tk.W
-        )
-        ctk.CTkLabel(
-            body,
-            text="Le opzioni sotto sono pensate per un setup rapido e stabile su macOS/Windows/Linux.",
-            font=("Avenir", 11),
-            text_color="#888888",
-        ).pack(padx=12, anchor=tk.W)
-
-        # --- Global instructions ---
-        ctk.CTkLabel(body, text="Prompt di sistema (globale):", font=("Avenir", 14, "bold")).pack(
-            pady=(14, 4), padx=12, anchor=tk.W
-        )
-        textbox = ctk.CTkTextbox(
-            body,
-            height=120,
-            font=("Avenir", 13),
-            fg_color="#1e1e1e",
-            border_width=1,
-            border_color="#333333",
-        )
-        textbox.pack(fill=tk.X, padx=12, pady=(6, 10))
+        textbox = ctk.CTkTextbox(dialog, height=120, font=("Avenir", 13), fg_color="#1e1e1e", border_width=1, border_color="#333333")
+        textbox.pack(fill=tk.X, padx=12, pady=(6, 12))
         textbox.insert("1.0", self.system_instructions_var.get())
 
-        # --- Pinned PDFs ---
-        ctk.CTkLabel(body, text="PDF fissi (sempre attivi):", font=("Avenir", 14, "bold")).pack(
-            pady=(8, 4), padx=12, anchor=tk.W
-        )
+        # --- Section 2: Pinned PDFs ---
+        ctk.CTkLabel(dialog, text="📚 Documenti Fissi (PDF sempre attivi):", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        ctk.CTkLabel(dialog, text="Allegati automaticamente ad ogni messaggio senza doverli ricaricare.", font=("Avenir", 11), text_color="#888888").pack(padx=12, anchor=tk.W)
+
         pinned_list_var = tk.Variable(value=list(self.pinned_pdf_paths))
-        pinned_wrap = ctk.CTkFrame(body, fg_color="transparent")
-        pinned_wrap.pack(fill=tk.X, padx=12, pady=(4, 4))
         pdf_listbox = tk.Listbox(
-            pinned_wrap,
+            dialog,
             listvariable=pinned_list_var,
-            height=6,
+            height=5,
             bg="#1e1e1e",
             fg="#dddddd",
             selectbackground="#1f538d",
-            borderwidth=1,
-            relief=tk.SOLID,
+            borderwidth=0,
             highlightthickness=0,
             font=("Avenir", 12),
         )
-        pdf_scroll = ctk.CTkScrollbar(pinned_wrap, orientation="vertical", command=pdf_listbox.yview)
-        pdf_listbox.configure(yscrollcommand=pdf_scroll.set)
-        pdf_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        pdf_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        pdf_listbox.pack(fill=tk.X, padx=12, pady=(6, 4))
 
         def add_pdf() -> None:
+            from tkinter import filedialog
             paths = filedialog.askopenfilenames(
-                parent=dialog,
-                title="Seleziona PDF",
+                parent=dialog, title="Seleziona PDF",
                 filetypes=[("PDF", "*.pdf"), ("All Files", "*")],
             )
             current = list(pinned_list_var.get())
@@ -1344,33 +1281,28 @@ class DesktopChatApp:
                 del current[i]
             pinned_list_var.set(current)
 
-        pdf_btn_row = ctk.CTkFrame(body, fg_color="transparent")
-        pdf_btn_row.pack(fill=tk.X, padx=12, pady=(2, 10))
-        ctk.CTkButton(pdf_btn_row, text="+ Aggiungi PDF", command=add_pdf, width=140, fg_color="#1f538d").pack(
-            side=tk.LEFT, padx=(0, 8)
-        )
-        ctk.CTkButton(
-            pdf_btn_row,
-            text="− Rimuovi selezionato",
-            command=remove_pdf,
-            width=170,
-            fg_color="transparent",
-            border_width=1,
-            hover_color="#333333",
-        ).pack(side=tk.LEFT)
+        pdf_btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        pdf_btn_row.pack(fill=tk.X, padx=12, pady=(0, 12))
+        ctk.CTkButton(pdf_btn_row, text="+ Aggiungi PDF", command=add_pdf, width=120, fg_color="#1f538d").pack(side=tk.LEFT, padx=(0, 8))
+        ctk.CTkButton(pdf_btn_row, text="− Rimuovi selezionato", command=remove_pdf, width=160, fg_color="transparent", border_width=1, hover_color="#333333").pack(side=tk.LEFT)
 
-        # --- Overlay ---
-        ctk.CTkLabel(body, text="Overlay Shot+Ask:", font=("Avenir", 14, "bold")).pack(
-            pady=(8, 4), padx=12, anchor=tk.W
-        )
+        # --- Section 3: Shot+Ask Overlay ---
+        ctk.CTkLabel(dialog, text="🪟 Shot+Ask Overlay:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        ctk.CTkLabel(
+            dialog,
+            text="Scegli sfondo e dimensioni della finestra risposta.",
+            font=("Avenir", 11),
+            text_color="#888888",
+        ).pack(padx=12, anchor=tk.W)
+
         overlay_bg_var = tk.StringVar(value=self._overlay_bg_color)
         overlay_width_var = tk.StringVar(value=str(self._overlay_width))
         overlay_height_var = tk.StringVar(value=str(self._overlay_height))
         overlay_resizable_var = tk.BooleanVar(value=self._overlay_resizable)
 
-        overlay_bg_row = ctk.CTkFrame(body, fg_color="transparent")
+        overlay_bg_row = ctk.CTkFrame(dialog, fg_color="transparent")
         overlay_bg_row.pack(fill=tk.X, padx=12, pady=(6, 6))
-        ctk.CTkLabel(overlay_bg_row, text="Sfondo (#RRGGBB):", width=130).pack(side=tk.LEFT)
+        ctk.CTkLabel(overlay_bg_row, text="Sfondo (#RRGGBB):", width=120).pack(side=tk.LEFT)
         ctk.CTkEntry(overlay_bg_row, textvariable=overlay_bg_var, width=120).pack(side=tk.LEFT, padx=(0, 8))
         color_swatch = tk.Frame(
             overlay_bg_row,
@@ -1399,74 +1331,53 @@ class DesktopChatApp:
 
         overlay_bg_var.trace_add("write", on_overlay_bg_changed)
 
-        overlay_size_row = ctk.CTkFrame(body, fg_color="transparent")
+        overlay_size_row = ctk.CTkFrame(dialog, fg_color="transparent")
         overlay_size_row.pack(fill=tk.X, padx=12, pady=(0, 8))
-        ctk.CTkLabel(overlay_size_row, text="Larghezza:", width=130).pack(side=tk.LEFT)
+        ctk.CTkLabel(overlay_size_row, text="Larghezza:", width=120).pack(side=tk.LEFT)
         ctk.CTkEntry(overlay_size_row, textvariable=overlay_width_var, width=80).pack(side=tk.LEFT, padx=(0, 12))
         ctk.CTkLabel(overlay_size_row, text="Altezza:", width=70).pack(side=tk.LEFT)
         ctk.CTkEntry(overlay_size_row, textvariable=overlay_height_var, width=80).pack(side=tk.LEFT)
 
         ctk.CTkCheckBox(
-            body,
-            text="Consenti ridimensionamento manuale overlay",
+            dialog,
+            text="Consenti ridimensionamento manuale finestra overlay",
             variable=overlay_resizable_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 12))
 
-        # --- Connection ---
-        ctk.CTkLabel(body, text="Connessione:", font=("Avenir", 14, "bold")).pack(
-            pady=(8, 4), padx=12, anchor=tk.W
-        )
+        # --- Section 4: Connection & macOS Shell ---
+        ctk.CTkLabel(dialog, text="🔗 Connessione:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
         auto_connect_var = tk.BooleanVar(value=self._auto_connect_on_start)
         auto_retry_var = tk.BooleanVar(value=self._auto_retry_known_device)
         auto_updates_var = tk.BooleanVar(value=self._auto_check_updates)
         ctk.CTkCheckBox(
-            body,
+            dialog,
             text="Auto-connect all'avvio (ultimo telefono noto)",
             variable=auto_connect_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 4))
         ctk.CTkCheckBox(
-            body,
-            text="Auto-retry su disconnessione",
+            dialog,
+            text="Auto-retry su disconnessione (backoff)",
             variable=auto_retry_var,
-        ).pack(anchor=tk.W, padx=12, pady=(0, 4))
+        ).pack(anchor=tk.W, padx=12, pady=(0, 12))
         ctk.CTkCheckBox(
-            body,
+            dialog,
             text="Controlla aggiornamenti automaticamente",
             variable=auto_updates_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 12))
 
-        # --- OS integration ---
-        ctk.CTkLabel(body, text="Integrazione sistema:", font=("Avenir", 14, "bold")).pack(
-            pady=(8, 4), padx=12, anchor=tk.W
-        )
+        ctk.CTkLabel(dialog, text="🍎 macOS Shell:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
         menu_bar_mode_var = tk.BooleanVar(value=self._menu_bar_mode_enabled)
         hide_dock_var = tk.BooleanVar(value=self._hide_dock_icon_enabled)
         ctk.CTkCheckBox(
-            body,
-            text="Mostra icona nella barra in alto / tray",
+            dialog,
+            text="Mostra icona nella barra in alto (menu bar)",
             variable=menu_bar_mode_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 4))
-        dock_checkbox = ctk.CTkCheckBox(
-            body,
-            text="Nascondi icona Dock (solo macOS)",
+        ctk.CTkCheckBox(
+            dialog,
+            text="Nascondi icona nella Dock",
             variable=hide_dock_var,
-        )
-        dock_checkbox.pack(anchor=tk.W, padx=12, pady=(0, 8))
-        if not self._is_macos:
-            dock_checkbox.configure(state="disabled")
-        if self._is_macos:
-            ctk.CTkButton(
-                body,
-                text="Configura permessi macOS",
-                command=lambda: self._show_permissions_onboarding(force=True),
-                fg_color="transparent",
-                border_width=1,
-                hover_color="#333333",
-            ).pack(anchor=tk.W, padx=12, pady=(0, 10))
-
-        footer = ctk.CTkFrame(dialog, fg_color="transparent")
-        footer.grid(row=1, column=0, sticky="ew", padx=10, pady=(8, 10))
-        footer.grid_columnconfigure(0, weight=1)
+        ).pack(anchor=tk.W, padx=12, pady=(0, 12))
 
         def save() -> None:
             text = textbox.get("1.0", tk.END).strip()
@@ -1482,7 +1393,6 @@ class DesktopChatApp:
             self._menu_bar_mode_enabled = bool(menu_bar_mode_var.get())
             self._hide_dock_icon_enabled = bool(hide_dock_var.get())
             self.client.set_auto_reconnect(self._auto_retry_known_device)
-
             old_settings = self._load_settings()
             old_settings["system_instructions"] = text
             old_settings["pinned_pdf_paths"] = self.pinned_pdf_paths
@@ -1497,7 +1407,6 @@ class DesktopChatApp:
             old_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
             old_settings["last_connected_address"] = self._last_connected_address
             self._save_settings(old_settings)
-
             self._apply_overlay_window_preferences()
             if self._menu_bar_mode_enabled:
                 self._start_menu_bar_icon_if_needed()
@@ -1505,9 +1414,19 @@ class DesktopChatApp:
                 self._stop_menu_bar_icon()
             self._apply_macos_activation_policy()
             dialog.destroy()
-            self._append_log("System", "Settings saved")
+            n = len(self.pinned_pdf_paths)
+            self._append_log(
+                "System",
+                (
+                    f"Settings saved. Pinned PDFs: {n}. "
+                    f"System instructions: {'YES' if text else 'none'}. "
+                    f"Overlay: {self._overlay_width}x{self._overlay_height}, bg {self._overlay_bg_color}. "
+                    f"Auto-connect: {'on' if self._auto_connect_on_start else 'off'}. "
+                    f"Auto-retry: {'on' if self._auto_retry_known_device else 'off'}."
+                ),
+            )
 
-        ctk.CTkButton(footer, text="Salva", command=save, fg_color="#1f538d", width=140).pack(side=tk.RIGHT)
+        ctk.CTkButton(dialog, text="💾 SALVA", command=save, fg_color="#1f538d").pack(pady=(0, 14))
 
     # ── Knowledge Base Container handlers ─────────────────────────────────────
 
@@ -1628,15 +1547,18 @@ class DesktopChatApp:
         self._refresh_container_list()
 
     def _on_delete_container(self) -> None:
+        from tkinter import messagebox
         cid = self._selected_container_id()
         if cid is None:
             return
         c = self._context_store.get(cid)
+        if not messagebox.askyesno("Elimina Container", f"Eliminare '{c.name if c else cid}'?", parent=self.root):
+            return
         self._context_store.delete(cid)
         if self._active_container_id == cid:
             self._active_container_id = None
         self._refresh_container_list()
-        self._append_log("System", f"Container eliminato: {c.name if c else cid}")
+        self._append_log("System", "Container eliminato")
 
     def _on_upload_container(self) -> None:
         cid = self._selected_container_id()
@@ -1842,21 +1764,15 @@ class DesktopChatApp:
 
 
     def _toggle_pip(self) -> None:
+
         if self.pip_enabled.get():
             self._pip_mode_active = True
             self._pre_pip_geometry = self.root.geometry()
-            try:
-                self.root.attributes("-topmost", True)
-            except Exception:
-                pass
-            self.root.geometry("430x560")
-            self.root.minsize(300, 380)
+            self.root.attributes('-topmost', True)
+            self.root.geometry("400x500")
         else:
             self._pip_mode_active = False
-            try:
-                self.root.attributes("-topmost", False)
-            except Exception:
-                pass
+            self.root.attributes('-topmost', False)
             if self._pre_pip_geometry:
                 self.root.geometry(self._pre_pip_geometry)
 
@@ -1865,14 +1781,14 @@ class DesktopChatApp:
             return
         width = event.width
         # Threshold for compact mode
-        if width < 620 and not self._is_compact_mode:
+        if width < 750 and not self._is_compact_mode:
             self._is_compact_mode = True
             self.header_frame.grid_remove()
             self.sidebar_frame.grid_remove()
             self.chat_area_frame.grid(row=0, column=0, rowspan=2, columnspan=2, sticky="nsew", padx=0, pady=0)
             # Remove padding for pure chat view
             self.root.configure(padx=0, pady=0)
-        elif width >= 620 and self._is_compact_mode:
+        elif width >= 750 and self._is_compact_mode:
             self._is_compact_mode = False
             self.header_frame.grid()
             self.sidebar_frame.grid()
@@ -1995,17 +1911,15 @@ class DesktopChatApp:
             return
 
         combo = "<ctrl>+<shift>+g"
-        combo_clip = "<ctrl>+<shift>+h"
         try:
             listener = pynput_keyboard.GlobalHotKeys(
                 {
                     combo: lambda: self.events.put({"type": "hotkey_overlay"}),
-                    combo_clip: lambda: self.events.put({"type": "quick_clipboard_overlay", "prompt": ""}),
                 }
             )
             listener.start()
             self._overlay_listener = listener
-            self._append_log("System", "Global hotkeys ready: Ctrl+Shift+G (shot), Ctrl+Shift+H (clipboard)")
+            self._append_log("System", f"Global hotkey ready: {self._overlay_hotkey}")
         except Exception as exc:
             self._append_log("Error", f"Global hotkey unavailable: {exc}")
 
