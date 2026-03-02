@@ -134,7 +134,7 @@ MODEL_PRESETS = [
     "gemini-2.0-pro-exp",
 ]
 
-APP_VERSION = "0.1.8"
+APP_VERSION = "0.1.9"
 GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
 
 
@@ -1220,12 +1220,12 @@ class DesktopChatApp:
             menu.addItem_(item)
             targets.append(target)
 
-        add_item("Show/Hide Window", lambda: self.root.after(0, self._toggle_app_visibility))
-        add_item("Shot+Ask", lambda: self.root.after(0, self.on_hotkey_overlay_triggered))
-        add_item("Clipboard+Ask", lambda: self.root.after(0, self.on_hotkey_clipboard_triggered))
-        add_item("Reconnect", lambda: self.root.after(0, self._reconnect_last_or_selected))
+        add_item("Show/Hide Window", lambda: self.events.put({"type": "tray_toggle"}))
+        add_item("Shot+Ask", lambda: self.events.put({"type": "tray_shot"}))
+        add_item("Clipboard+Ask", lambda: self.events.put({"type": "tray_clip"}))
+        add_item("Reconnect", lambda: self.events.put({"type": "tray_reconnect"}))
         menu.addItem_(NSMenuItem.separatorItem())
-        add_item("Quit", lambda: self.root.after(0, self.on_close))
+        add_item("Quit", lambda: self.events.put({"type": "tray_quit"}))
 
         status_item.setMenu_(menu)
         self._mac_status_item = status_item
@@ -3145,6 +3145,26 @@ class DesktopChatApp:
 
         if event_type == "toggle_visibility":
             self._toggle_app_visibility()
+            return
+
+        if event_type == "tray_toggle":
+            self._toggle_app_visibility()
+            return
+
+        if event_type == "tray_shot":
+            self.on_hotkey_overlay_triggered()
+            return
+
+        if event_type == "tray_clip":
+            self.on_hotkey_clipboard_triggered()
+            return
+
+        if event_type == "tray_reconnect":
+            self._reconnect_last_or_selected()
+            return
+
+        if event_type == "tray_quit":
+            self.on_close()
             return
 
         if event_type == "hotkey_overlay":
