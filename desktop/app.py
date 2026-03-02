@@ -6,6 +6,7 @@ import platform
 import queue
 import re
 import shutil
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -101,6 +102,11 @@ try:
 except Exception:
     pynput_keyboard = None
 
+try:
+    import certifi
+except Exception:
+    certifi = None
+
 MODEL_PRESETS = [
     "phone-default",
     "gemini-2.5-pro",
@@ -112,7 +118,7 @@ MODEL_PRESETS = [
     "gemini-2.0-pro-exp",
 ]
 
-APP_VERSION = "0.1.6"
+APP_VERSION = "0.1.7"
 GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
 
 
@@ -199,6 +205,7 @@ class DesktopChatApp:
         self._auto_connect_on_start = bool(_saved.get("auto_connect_on_start", True))
         self._auto_retry_known_device = bool(_saved.get("auto_retry_known_device", True))
         self._auto_check_updates = bool(_saved.get("auto_check_updates", True))
+        self._close_to_background_on_close = bool(_saved.get("close_to_background_on_close", self._is_macos))
         self._menu_bar_mode_enabled = bool(_saved.get("menu_bar_mode_enabled", self._is_macos))
         self._hide_dock_icon_enabled = bool(_saved.get("hide_dock_icon_enabled", self._is_macos))
         self._overlay_bg_color = self._normalize_hex_color(_saved.get("overlay_bg_color"), "#0f172a")
@@ -246,7 +253,7 @@ class DesktopChatApp:
         self._refresh_context_preview()
         self._auto_install_quick_action()
         self._start_overlay_hotkey_listener()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
         self.root.after(100, self._poll_events)
         self.root.after(1200, self._maybe_auto_connect_on_start)
         self.root.after(1500, self._maybe_show_permissions_onboarding)
@@ -577,14 +584,52 @@ class DesktopChatApp:
         current.update(patch)
         self._save_settings(current)
 
+    def _open_external_url(self, url: str, use_ssl_fallback: bool = False) -> bytes:
+        request = urlrequest.Request(url, headers={"User-Agent": f"BluetoothGeminiChat/{APP_VERSION}"})
+        contexts: list[ssl.SSLContext | None] = [None]
+        if use_ssl_fallback:
+            contexts = [self._ssl_context_verified(), self._ssl_context_unverified()]
+        for context in contexts:
+            try:
+                with urlrequest.urlopen(request, timeout=30, context=context) as response:
+                    return response.read()
+            except Exception:
+                if context is not contexts[-1]:
+                    continue
+                raise
+        raise RuntimeError("unreachable")
+
+    def _ssl_context_verified(self) -> ssl.SSLContext | None:
+        try:
+            if certifi is not None:
+                return ssl.create_default_context(cafile=certifi.where())
+            return ssl.create_default_context()
+        except Exception:
+            return None
+
+    def _ssl_context_unverified(self) -> ssl.SSLContext | None:
+        try:
+            return ssl._create_unverified_context()
+        except Exception:
+            return None
+
     def _open_macos_privacy_pane(self, pane_suffix: str) -> None:
         if not self._is_macos:
             return
-        url = f"x-apple.systempreferences:com.apple.preference.security?{pane_suffix}"
-        try:
-            subprocess.Popen(["open", url])
-        except Exception as exc:
-            self._append_log("Error", f"Cannot open macOS privacy settings: {exc}")
+        targets = [
+            f"x-apple.systempreferences:com.apple.preference.security?{pane_suffix}",
+            "x-apple.systempreferences:com.apple.preference.security",
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity",
+            "/System/Applications/System Settings.app",
+        ]
+        for target in targets:
+            try:
+                result = subprocess.run(["open", target], check=False, capture_output=True, text=True)
+                if result.returncode == 0:
+                    return
+            except Exception:
+                continue
+        self._append_log("Error", "Cannot open macOS privacy settings. Apri manualmente Impostazioni > Privacy e Sicurezza.")
 
     def _has_screen_recording_permission(self) -> bool | None:
         if not self._is_macos:
@@ -714,6 +759,16 @@ class DesktopChatApp:
             wraplength=640,
             text_color="#b0b0b0",
         ).pack(anchor=tk.W, padx=16, pady=(0, 12))
+        ctk.CTkLabel(
+            dialog,
+            text=(
+                "Nota: alcuni prompt macOS compaiono solo una volta. "
+                "Se lo stato resta 'Missing', apri Impostazioni e abilita manualmente."
+            ),
+            justify=tk.LEFT,
+            wraplength=640,
+            text_color="#8f8f8f",
+        ).pack(anchor=tk.W, padx=16, pady=(0, 8))
 
         screen_state_var = tk.StringVar()
         access_state_var = tk.StringVar()
@@ -775,25 +830,42 @@ class DesktopChatApp:
 
             return (screen_state is True, access_state is True, bt_ok)
 
+        def request_screen_permission() -> None:
+            result = self._request_screen_recording_permission()
+            if result is not True:
+                self._open_macos_privacy_pane("Privacy_ScreenCapture")
+            refresh_states()
+
+        def request_access_permission() -> None:
+            result = self._request_accessibility_permission()
+            if result is not True:
+                self._open_macos_privacy_pane("Privacy_Accessibility")
+            refresh_states()
+
+        def request_bluetooth_permission() -> None:
+            self._request_bluetooth_permission()
+            self._open_macos_privacy_pane("Privacy_Bluetooth")
+            dialog.after(900, refresh_states)
+
         section_row(
             "1) Screen Recording",
             "Necessario per Shot+Ask e screenshot area su macOS.",
             screen_state_var,
-            lambda: (self._request_screen_recording_permission(), refresh_states()),
+            request_screen_permission,
             lambda: self._open_macos_privacy_pane("Privacy_ScreenCapture"),
         )
         section_row(
             "2) Accessibility",
             "Necessario per integrazione shortcut globali e overlay affidabile.",
             access_state_var,
-            lambda: (self._request_accessibility_permission(), refresh_states()),
+            request_access_permission,
             lambda: self._open_macos_privacy_pane("Privacy_Accessibility"),
         )
         section_row(
             "3) Bluetooth",
             "Necessario per scan e connessione BLE col telefono.",
             bt_state_var,
-            lambda: (self._request_bluetooth_permission(), refresh_states()),
+            request_bluetooth_permission,
             lambda: self._open_macos_privacy_pane("Privacy_Bluetooth"),
         )
         ctk.CTkCheckBox(
@@ -859,6 +931,12 @@ class DesktopChatApp:
 
         dialog.protocol("WM_DELETE_WINDOW", remind_later)
         refresh_states()
+        def poll_status() -> None:
+            if self._permissions_dialog is None or not self._permissions_dialog.winfo_exists():
+                return
+            refresh_states()
+            dialog.after(1800, poll_status)
+        dialog.after(1800, poll_status)
 
     def _parse_version_tuple(self, value: str) -> tuple[int, ...]:
         clean = value.strip().lower()
@@ -891,18 +969,25 @@ class DesktopChatApp:
         download_dir = Path.home() / "Downloads" / "GeminiBLEUpdates"
         download_dir.mkdir(parents=True, exist_ok=True)
         target = download_dir / filename
-        with urlrequest.urlopen(url, timeout=30) as response:
-            target.write_bytes(response.read())
+        payload = self._open_external_url(url, use_ssl_fallback=True)
+        target.write_bytes(payload)
         return target
 
     def on_check_updates(self, background: bool = True) -> None:
         api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
         try:
-            with urlrequest.urlopen(api_url, timeout=15) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except (urlerror.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raw = self._open_external_url(api_url, use_ssl_fallback=True)
+            payload = json.loads(raw.decode("utf-8"))
+        except (urlerror.URLError, TimeoutError, json.JSONDecodeError, ssl.SSLError) as exc:
             if not background:
-                self._append_log("Error", f"Update check failed: {exc}")
+                lowered = str(exc).lower()
+                if "certificate_verify_failed" in lowered:
+                    self._append_log(
+                        "Error",
+                        "Update check failed: certificati SSL non disponibili in questo ambiente.",
+                    )
+                else:
+                    self._append_log("Error", f"Update check failed: {exc}")
             return
 
         latest_tag = str(payload.get("tag_name", "")).strip() or "unknown"
@@ -1177,25 +1262,31 @@ class DesktopChatApp:
     def on_open_settings(self) -> None:
         dialog = ctk.CTkToplevel(self.root)
         dialog.title("Settings")
-        dialog.geometry("560x700")
+        dialog.geometry("620x760")
+        dialog.minsize(540, 520)
         dialog.transient(self.root)
         dialog.grab_set()
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+
+        content = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
+        content.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
 
         # --- Section 1: System Instructions ---
-        ctk.CTkLabel(dialog, text="System Instructions (Global Prompt):", font=("Avenir", 14, "bold")).pack(pady=(12, 4), padx=12, anchor=tk.W)
-        ctk.CTkLabel(dialog, text="Iniettate silenziosamente in ogni richiesta.", font=("Avenir", 11), text_color="#888888").pack(padx=12, anchor=tk.W)
+        ctk.CTkLabel(content, text="System Instructions (Global Prompt):", font=("Avenir", 14, "bold")).pack(pady=(12, 4), padx=12, anchor=tk.W)
+        ctk.CTkLabel(content, text="Iniettate silenziosamente in ogni richiesta.", font=("Avenir", 11), text_color="#888888").pack(padx=12, anchor=tk.W)
 
-        textbox = ctk.CTkTextbox(dialog, height=120, font=("Avenir", 13), fg_color="#1e1e1e", border_width=1, border_color="#333333")
+        textbox = ctk.CTkTextbox(content, height=120, font=("Avenir", 13), fg_color="#1e1e1e", border_width=1, border_color="#333333")
         textbox.pack(fill=tk.X, padx=12, pady=(6, 12))
         textbox.insert("1.0", self.system_instructions_var.get())
 
         # --- Section 2: Pinned PDFs ---
-        ctk.CTkLabel(dialog, text="📚 Documenti Fissi (PDF sempre attivi):", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
-        ctk.CTkLabel(dialog, text="Allegati automaticamente ad ogni messaggio senza doverli ricaricare.", font=("Avenir", 11), text_color="#888888").pack(padx=12, anchor=tk.W)
+        ctk.CTkLabel(content, text="📚 Documenti Fissi (PDF sempre attivi):", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        ctk.CTkLabel(content, text="Allegati automaticamente ad ogni messaggio senza doverli ricaricare.", font=("Avenir", 11), text_color="#888888").pack(padx=12, anchor=tk.W)
 
         pinned_list_var = tk.Variable(value=list(self.pinned_pdf_paths))
         pdf_listbox = tk.Listbox(
-            dialog,
+            content,
             listvariable=pinned_list_var,
             height=5,
             bg="#1e1e1e",
@@ -1226,15 +1317,15 @@ class DesktopChatApp:
                 del current[i]
             pinned_list_var.set(current)
 
-        pdf_btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        pdf_btn_row = ctk.CTkFrame(content, fg_color="transparent")
         pdf_btn_row.pack(fill=tk.X, padx=12, pady=(0, 12))
         ctk.CTkButton(pdf_btn_row, text="+ Aggiungi PDF", command=add_pdf, width=120, fg_color="#1f538d").pack(side=tk.LEFT, padx=(0, 8))
         ctk.CTkButton(pdf_btn_row, text="− Rimuovi selezionato", command=remove_pdf, width=160, fg_color="transparent", border_width=1, hover_color="#333333").pack(side=tk.LEFT)
 
         # --- Section 3: Shot+Ask Overlay ---
-        ctk.CTkLabel(dialog, text="🪟 Shot+Ask Overlay:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        ctk.CTkLabel(content, text="🪟 Shot+Ask Overlay:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
         ctk.CTkLabel(
-            dialog,
+            content,
             text="Scegli sfondo e dimensioni della finestra risposta.",
             font=("Avenir", 11),
             text_color="#888888",
@@ -1245,7 +1336,7 @@ class DesktopChatApp:
         overlay_height_var = tk.StringVar(value=str(self._overlay_height))
         overlay_resizable_var = tk.BooleanVar(value=self._overlay_resizable)
 
-        overlay_bg_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        overlay_bg_row = ctk.CTkFrame(content, fg_color="transparent")
         overlay_bg_row.pack(fill=tk.X, padx=12, pady=(6, 6))
         ctk.CTkLabel(overlay_bg_row, text="Sfondo (#RRGGBB):", width=120).pack(side=tk.LEFT)
         ctk.CTkEntry(overlay_bg_row, textvariable=overlay_bg_var, width=120).pack(side=tk.LEFT, padx=(0, 8))
@@ -1276,7 +1367,7 @@ class DesktopChatApp:
 
         overlay_bg_var.trace_add("write", on_overlay_bg_changed)
 
-        overlay_size_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        overlay_size_row = ctk.CTkFrame(content, fg_color="transparent")
         overlay_size_row.pack(fill=tk.X, padx=12, pady=(0, 8))
         ctk.CTkLabel(overlay_size_row, text="Larghezza:", width=120).pack(side=tk.LEFT)
         ctk.CTkEntry(overlay_size_row, textvariable=overlay_width_var, width=80).pack(side=tk.LEFT, padx=(0, 12))
@@ -1284,48 +1375,54 @@ class DesktopChatApp:
         ctk.CTkEntry(overlay_size_row, textvariable=overlay_height_var, width=80).pack(side=tk.LEFT)
 
         ctk.CTkCheckBox(
-            dialog,
+            content,
             text="Consenti ridimensionamento manuale finestra overlay",
             variable=overlay_resizable_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 12))
 
         # --- Section 4: Connection & macOS Shell ---
-        ctk.CTkLabel(dialog, text="🔗 Connessione:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        ctk.CTkLabel(content, text="🔗 Connessione:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
         auto_connect_var = tk.BooleanVar(value=self._auto_connect_on_start)
         auto_retry_var = tk.BooleanVar(value=self._auto_retry_known_device)
         auto_updates_var = tk.BooleanVar(value=self._auto_check_updates)
+        close_bg_var = tk.BooleanVar(value=self._close_to_background_on_close)
         ctk.CTkCheckBox(
-            dialog,
+            content,
             text="Auto-connect all'avvio (ultimo telefono noto)",
             variable=auto_connect_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 4))
         ctk.CTkCheckBox(
-            dialog,
+            content,
             text="Auto-retry su disconnessione (backoff)",
             variable=auto_retry_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 12))
         ctk.CTkCheckBox(
-            dialog,
+            content,
             text="Controlla aggiornamenti automaticamente",
             variable=auto_updates_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 12))
+        ctk.CTkCheckBox(
+            content,
+            text="Con la X chiudi solo la finestra (app resta in background)",
+            variable=close_bg_var,
+        ).pack(anchor=tk.W, padx=12, pady=(0, 12))
 
-        ctk.CTkLabel(dialog, text="🍎 macOS Shell:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        ctk.CTkLabel(content, text="🍎 macOS Shell:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
         menu_bar_mode_var = tk.BooleanVar(value=self._menu_bar_mode_enabled)
         hide_dock_var = tk.BooleanVar(value=self._hide_dock_icon_enabled)
         ctk.CTkCheckBox(
-            dialog,
+            content,
             text="Mostra icona nella barra in alto (menu bar)",
             variable=menu_bar_mode_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 4))
         ctk.CTkCheckBox(
-            dialog,
+            content,
             text="Nascondi icona nella Dock",
             variable=hide_dock_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 12))
         if self._is_macos:
             ctk.CTkButton(
-                dialog,
+                content,
                 text="Configura permessi macOS",
                 command=lambda: self._show_permissions_onboarding(force=True),
                 fg_color="transparent",
@@ -1344,6 +1441,7 @@ class DesktopChatApp:
             self._auto_connect_on_start = bool(auto_connect_var.get())
             self._auto_retry_known_device = bool(auto_retry_var.get())
             self._auto_check_updates = bool(auto_updates_var.get())
+            self._close_to_background_on_close = bool(close_bg_var.get())
             self._menu_bar_mode_enabled = bool(menu_bar_mode_var.get())
             self._hide_dock_icon_enabled = bool(hide_dock_var.get())
             self.client.set_auto_reconnect(self._auto_retry_known_device)
@@ -1357,6 +1455,7 @@ class DesktopChatApp:
             old_settings["auto_connect_on_start"] = self._auto_connect_on_start
             old_settings["auto_retry_known_device"] = self._auto_retry_known_device
             old_settings["auto_check_updates"] = self._auto_check_updates
+            old_settings["close_to_background_on_close"] = self._close_to_background_on_close
             old_settings["menu_bar_mode_enabled"] = self._menu_bar_mode_enabled
             old_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
             old_settings["last_connected_address"] = self._last_connected_address
@@ -1376,11 +1475,12 @@ class DesktopChatApp:
                     f"System instructions: {'YES' if text else 'none'}. "
                     f"Overlay: {self._overlay_width}x{self._overlay_height}, bg {self._overlay_bg_color}. "
                     f"Auto-connect: {'on' if self._auto_connect_on_start else 'off'}. "
-                    f"Auto-retry: {'on' if self._auto_retry_known_device else 'off'}."
+                    f"Auto-retry: {'on' if self._auto_retry_known_device else 'off'}. "
+                    f"Close button to background: {'on' if self._close_to_background_on_close else 'off'}."
                 ),
             )
 
-        ctk.CTkButton(dialog, text="💾 SALVA", command=save, fg_color="#1f538d").pack(pady=(0, 14))
+        ctk.CTkButton(content, text="💾 SALVA", command=save, fg_color="#1f538d").pack(pady=(4, 16), padx=12, anchor=tk.E)
 
     # ── Knowledge Base Container handlers ─────────────────────────────────────
 
@@ -3321,6 +3421,22 @@ class DesktopChatApp:
                 self._toggle_pip()
             self.root.iconify()
 
+    def _hide_to_background(self) -> None:
+        if self._pip_mode_active:
+            self.pip_enabled.set(False)
+            self._toggle_pip()
+        try:
+            self.root.withdraw()
+        except Exception:
+            self.root.iconify()
+        self._append_log("System", "App in background: usa menu bar/shortcut per riaprirla.")
+
+    def on_window_close(self) -> None:
+        if self._close_to_background_on_close:
+            self._hide_to_background()
+            return
+        self.on_close()
+
     def on_close(self) -> None:
         if self._overlay_listener is not None:
             try:
@@ -3337,6 +3453,7 @@ class DesktopChatApp:
         latest_settings["auto_connect_on_start"] = self._auto_connect_on_start
         latest_settings["auto_retry_known_device"] = self._auto_retry_known_device
         latest_settings["auto_check_updates"] = self._auto_check_updates
+        latest_settings["close_to_background_on_close"] = self._close_to_background_on_close
         latest_settings["menu_bar_mode_enabled"] = self._menu_bar_mode_enabled
         latest_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
         latest_settings["last_connected_address"] = self._last_connected_address
