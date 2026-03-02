@@ -3,6 +3,16 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="BluetoothGeminiChat"
+BUNDLE_ID="com.mncompany.bluetoothgeminichat"
+APP_VERSION="$(
+python3 - <<'PY'
+import pathlib
+import re
+text = pathlib.Path("desktop/app.py").read_text(encoding="utf-8")
+match = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', text)
+print(match.group(1) if match else "0.1.0")
+PY
+)"
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 non trovato"
@@ -20,6 +30,7 @@ python3 -m PyInstaller \
   --clean \
   --windowed \
   --name "$APP_NAME" \
+  --osx-bundle-identifier "$BUNDLE_ID" \
   --paths "$ROOT_DIR/desktop" \
   --collect-submodules bleak \
   --collect-submodules pystray \
@@ -30,6 +41,13 @@ python3 -m PyInstaller \
 
 if [ -d "$ROOT_DIR/dist/$APP_NAME.app" ]; then
   echo "Build macOS pronta: $ROOT_DIR/dist/$APP_NAME.app"
+  INFO_PLIST="$ROOT_DIR/dist/$APP_NAME.app/Contents/Info.plist"
+  if [ -f "$INFO_PLIST" ]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$INFO_PLIST" >/dev/null 2>&1 \
+      || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $APP_VERSION" "$INFO_PLIST"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_VERSION" "$INFO_PLIST" >/dev/null 2>&1 \
+      || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $APP_VERSION" "$INFO_PLIST"
+  fi
   mkdir -p "$ROOT_DIR/dist/dmg-root"
   rm -rf "$ROOT_DIR/dist/dmg-root/$APP_NAME.app" "$ROOT_DIR/dist/dmg-root/Applications"
   cp -R "$ROOT_DIR/dist/$APP_NAME.app" "$ROOT_DIR/dist/dmg-root/"

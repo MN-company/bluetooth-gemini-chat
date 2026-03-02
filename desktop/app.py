@@ -44,15 +44,57 @@ except Exception:
     pystray = None
 
 try:
+    import objc
+except Exception:
+    objc = None
+
+try:
     from AppKit import (
         NSApplication,
         NSApplicationActivationPolicyAccessory,
         NSApplicationActivationPolicyRegular,
+        NSImage,
+        NSMenu,
+        NSMenuItem,
+        NSStatusBar,
+        NSVariableStatusItemLength,
     )
 except Exception:
     NSApplication = None
     NSApplicationActivationPolicyAccessory = None
     NSApplicationActivationPolicyRegular = None
+    NSImage = None
+    NSMenu = None
+    NSMenuItem = None
+    NSStatusBar = None
+    NSVariableStatusItemLength = None
+
+try:
+    from Foundation import NSObject
+except Exception:
+    NSObject = None
+
+try:
+    from ApplicationServices import (
+        AXIsProcessTrusted,
+        AXIsProcessTrustedWithOptions,
+        kAXTrustedCheckOptionPrompt,
+    )
+except Exception:
+    AXIsProcessTrusted = None
+    AXIsProcessTrustedWithOptions = None
+    kAXTrustedCheckOptionPrompt = None
+
+try:
+    from Quartz import CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess
+except Exception:
+    CGPreflightScreenCaptureAccess = None
+    CGRequestScreenCaptureAccess = None
+
+try:
+    from CoreBluetooth import CBCentralManager
+except Exception:
+    CBCentralManager = None
 
 try:
     from pynput import keyboard as pynput_keyboard
@@ -70,8 +112,28 @@ MODEL_PRESETS = [
     "gemini-2.0-pro-exp",
 ]
 
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.6"
 GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
+
+
+if objc is not None and NSObject is not None:
+    class _MacMenuActionTarget(NSObject):
+        def initWithCallback_(self, callback: Any) -> Any:
+            self = objc.super(_MacMenuActionTarget, self).init()
+            if self is None:
+                return None
+            self._callback = callback
+            return self
+
+        def onAction_(self, _sender: Any) -> None:
+            try:
+                cb = getattr(self, "_callback", None)
+                if cb is not None:
+                    cb()
+            except Exception:
+                pass
+else:
+    _MacMenuActionTarget = None
 
 
 class DesktopChatApp:
@@ -145,8 +207,22 @@ class DesktopChatApp:
         self._overlay_resizable = bool(_saved.get("overlay_resizable", True))
         self._tray_icon: Any | None = None
         self._tray_thread: threading.Thread | None = None
+        self._mac_status_item: Any | None = None
+        self._mac_status_menu: Any | None = None
+        self._mac_status_targets: list[Any] = []
+        self._permissions_dialog: ctk.CTkToplevel | None = None
+        self._bluetooth_probe_manager: Any | None = None
         self._macos_policy_applied = False
-        self._menu_bar_available = self._is_macos and pystray is not None and PILImage is not None
+        if self._is_macos:
+            self._menu_bar_available = (
+                NSStatusBar is not None
+                and NSMenu is not None
+                and NSMenuItem is not None
+                and NSApplication is not None
+                and _MacMenuActionTarget is not None
+            )
+        else:
+            self._menu_bar_available = pystray is not None and PILImage is not None
 
         self._context_store = ContextStore(Path(__file__).parent)
         self._active_container_id: str | None = None
@@ -173,6 +249,7 @@ class DesktopChatApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self._poll_events)
         self.root.after(1200, self._maybe_auto_connect_on_start)
+        self.root.after(1500, self._maybe_show_permissions_onboarding)
         if self._auto_check_updates:
             self.root.after(2200, lambda: self.on_check_updates(background=True))
 
@@ -500,6 +577,289 @@ class DesktopChatApp:
         current.update(patch)
         self._save_settings(current)
 
+    def _open_macos_privacy_pane(self, pane_suffix: str) -> None:
+        if not self._is_macos:
+            return
+        url = f"x-apple.systempreferences:com.apple.preference.security?{pane_suffix}"
+        try:
+            subprocess.Popen(["open", url])
+        except Exception as exc:
+            self._append_log("Error", f"Cannot open macOS privacy settings: {exc}")
+
+    def _has_screen_recording_permission(self) -> bool | None:
+        if not self._is_macos:
+            return True
+        if CGPreflightScreenCaptureAccess is None:
+            return None
+        try:
+            return bool(CGPreflightScreenCaptureAccess())
+        except Exception:
+            return None
+
+    def _request_screen_recording_permission(self) -> bool | None:
+        if not self._is_macos:
+            return True
+        if CGRequestScreenCaptureAccess is None:
+            return None
+        try:
+            return bool(CGRequestScreenCaptureAccess())
+        except Exception:
+            return None
+
+    def _has_accessibility_permission(self) -> bool | None:
+        if not self._is_macos:
+            return True
+        if AXIsProcessTrusted is None:
+            return None
+        try:
+            return bool(AXIsProcessTrusted())
+        except Exception:
+            return None
+
+    def _request_accessibility_permission(self) -> bool | None:
+        if not self._is_macos:
+            return True
+        if AXIsProcessTrustedWithOptions is None:
+            return None
+        try:
+            options: dict[Any, Any]
+            if kAXTrustedCheckOptionPrompt is not None:
+                options = {kAXTrustedCheckOptionPrompt: True}
+            else:
+                options = {"AXTrustedCheckOptionPrompt": True}
+            return bool(AXIsProcessTrustedWithOptions(options))
+        except Exception:
+            return None
+
+    def _bluetooth_authorization_state(self) -> str | None:
+        if not self._is_macos:
+            return "granted"
+        if CBCentralManager is None:
+            return None
+        try:
+            auth_value = int(CBCentralManager.authorization())
+            if auth_value == 3:
+                return "granted"
+            if auth_value == 2:
+                return "denied"
+            if auth_value == 1:
+                return "restricted"
+            if auth_value == 0:
+                return "not_determined"
+            return f"unknown({auth_value})"
+        except Exception:
+            return None
+
+    def _request_bluetooth_permission(self) -> None:
+        if not self._is_macos:
+            return
+        # Instantiate a central manager once to trigger the OS prompt on first run.
+        if CBCentralManager is not None and self._bluetooth_probe_manager is None:
+            try:
+                self._bluetooth_probe_manager = CBCentralManager.alloc().init()
+            except Exception:
+                self._bluetooth_probe_manager = None
+        try:
+            self.client.scan_devices()
+        except Exception:
+            pass
+
+    def _format_permission_state(self, state: bool | None, label: str) -> str:
+        if state is True:
+            return f"{label}: OK"
+        if state is False:
+            return f"{label}: Missing"
+        return f"{label}: Unknown"
+
+    def _maybe_show_permissions_onboarding(self) -> None:
+        if not self._is_macos:
+            return
+        settings = self._load_settings()
+        if bool(settings.get("permissions_onboarding_done", False)):
+            return
+        self._show_permissions_onboarding(force=False)
+
+    def _show_permissions_onboarding(self, force: bool = False) -> None:
+        if not self._is_macos:
+            return
+        if self._permissions_dialog is not None and self._permissions_dialog.winfo_exists():
+            self._permissions_dialog.lift()
+            return
+        if not force:
+            settings = self._load_settings()
+            if bool(settings.get("permissions_onboarding_done", False)):
+                return
+
+        from tkinter import messagebox
+
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Setup permessi macOS")
+        dialog.geometry("680x560")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        self._permissions_dialog = dialog
+
+        ctk.CTkLabel(
+            dialog,
+            text="Primo avvio: abilita i permessi richiesti",
+            font=("Avenir", 18, "bold"),
+        ).pack(anchor=tk.W, padx=16, pady=(14, 6))
+        ctk.CTkLabel(
+            dialog,
+            text=(
+                "L'app usa Bluetooth (bridge), Screen Recording (Shot+Ask) e "
+                "Accessibility (shortcut globali/overlay)."
+            ),
+            justify=tk.LEFT,
+            wraplength=640,
+            text_color="#b0b0b0",
+        ).pack(anchor=tk.W, padx=16, pady=(0, 12))
+
+        screen_state_var = tk.StringVar()
+        access_state_var = tk.StringVar()
+        bt_state_var = tk.StringVar()
+        bt_manual_confirm = tk.BooleanVar(value=False)
+
+        panel = ctk.CTkFrame(dialog, fg_color="#151515", border_width=1, border_color="#2a2a2a")
+        panel.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 10))
+
+        def section_row(
+            title: str,
+            subtitle: str,
+            status_var: tk.StringVar,
+            request_cmd: Any,
+            open_cmd: Any,
+        ) -> None:
+            row = ctk.CTkFrame(panel, fg_color="transparent")
+            row.pack(fill=tk.X, padx=12, pady=(12, 2))
+            ctk.CTkLabel(row, text=title, font=("Avenir", 14, "bold")).pack(anchor=tk.W)
+            ctk.CTkLabel(
+                row,
+                text=subtitle,
+                justify=tk.LEFT,
+                wraplength=620,
+                text_color="#b0b0b0",
+            ).pack(anchor=tk.W, pady=(0, 4))
+            ctk.CTkLabel(row, textvariable=status_var, font=("Avenir", 12)).pack(anchor=tk.W, pady=(0, 4))
+            btn_row = ctk.CTkFrame(row, fg_color="transparent")
+            btn_row.pack(anchor=tk.W, pady=(0, 2))
+            ctk.CTkButton(btn_row, text="Richiedi", width=96, command=request_cmd).pack(side=tk.LEFT, padx=(0, 8))
+            ctk.CTkButton(
+                btn_row,
+                text="Apri Impostazioni",
+                width=156,
+                command=open_cmd,
+                fg_color="transparent",
+                border_width=1,
+                hover_color="#2a2a2a",
+            ).pack(side=tk.LEFT)
+
+        def refresh_states() -> tuple[bool, bool, bool]:
+            screen_state = self._has_screen_recording_permission()
+            access_state = self._has_accessibility_permission()
+            bt_state = self._bluetooth_authorization_state()
+            bt_ok = bt_state == "granted" or bt_manual_confirm.get()
+
+            screen_state_var.set(self._format_permission_state(screen_state, "Screen Recording"))
+            access_state_var.set(self._format_permission_state(access_state, "Accessibility"))
+
+            if bt_state == "granted":
+                bt_manual_confirm.set(True)
+                bt_state_var.set("Bluetooth: OK")
+            elif bt_state in {"denied", "restricted"}:
+                bt_state_var.set(f"Bluetooth: {bt_state}")
+            elif bt_state == "not_determined":
+                bt_state_var.set("Bluetooth: in attesa autorizzazione")
+            else:
+                bt_state_var.set("Bluetooth: verifica manuale (premi Richiedi)")
+
+            return (screen_state is True, access_state is True, bt_ok)
+
+        section_row(
+            "1) Screen Recording",
+            "Necessario per Shot+Ask e screenshot area su macOS.",
+            screen_state_var,
+            lambda: (self._request_screen_recording_permission(), refresh_states()),
+            lambda: self._open_macos_privacy_pane("Privacy_ScreenCapture"),
+        )
+        section_row(
+            "2) Accessibility",
+            "Necessario per integrazione shortcut globali e overlay affidabile.",
+            access_state_var,
+            lambda: (self._request_accessibility_permission(), refresh_states()),
+            lambda: self._open_macos_privacy_pane("Privacy_Accessibility"),
+        )
+        section_row(
+            "3) Bluetooth",
+            "Necessario per scan e connessione BLE col telefono.",
+            bt_state_var,
+            lambda: (self._request_bluetooth_permission(), refresh_states()),
+            lambda: self._open_macos_privacy_pane("Privacy_Bluetooth"),
+        )
+        ctk.CTkCheckBox(
+            panel,
+            text="Ho autorizzato il Bluetooth (se lo stato non è rilevabile automaticamente)",
+            variable=bt_manual_confirm,
+            command=refresh_states,
+        ).pack(anchor=tk.W, padx=12, pady=(2, 12))
+
+        footer = ctk.CTkFrame(dialog, fg_color="transparent")
+        footer.pack(fill=tk.X, padx=16, pady=(0, 14))
+
+        def finish_setup() -> None:
+            screen_ok, access_ok, bt_ok = refresh_states()
+            if not (screen_ok and access_ok and bt_ok):
+                proceed = messagebox.askyesno(
+                    "Permessi incompleti",
+                    (
+                        "Alcuni permessi risultano mancanti.\n"
+                        "Se continui ora alcune funzioni (scan BLE/screenshot/shortcut) possono fallire.\n\n"
+                        "Vuoi comunque chiudere il setup?"
+                    ),
+                    parent=dialog,
+                )
+                if not proceed:
+                    return
+            self._update_settings(
+                {
+                    "permissions_onboarding_done": True,
+                    "permissions_screen_recording_ok": screen_ok,
+                    "permissions_accessibility_ok": access_ok,
+                    "permissions_bluetooth_ok": bt_ok,
+                }
+            )
+            self._append_log("System", "Setup permessi macOS completato")
+            dialog.destroy()
+            self._permissions_dialog = None
+
+        def remind_later() -> None:
+            self._append_log("System", "Setup permessi rimandato")
+            dialog.destroy()
+            self._permissions_dialog = None
+
+        ctk.CTkButton(
+            footer,
+            text="Ricarica stato",
+            width=120,
+            command=refresh_states,
+            fg_color="transparent",
+            border_width=1,
+            hover_color="#2a2a2a",
+        ).pack(side=tk.LEFT)
+        ctk.CTkButton(
+            footer,
+            text="Ricorda dopo",
+            width=120,
+            command=remind_later,
+            fg_color="transparent",
+            border_width=1,
+            hover_color="#2a2a2a",
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+        ctk.CTkButton(footer, text="Completa setup", width=140, command=finish_setup).pack(side=tk.RIGHT, padx=(0, 8))
+
+        dialog.protocol("WM_DELETE_WINDOW", remind_later)
+        refresh_states()
+
     def _parse_version_tuple(self, value: str) -> tuple[int, ...]:
         clean = value.strip().lower()
         if clean.startswith("v"):
@@ -656,8 +1016,13 @@ class DesktopChatApp:
             return
         if not self._menu_bar_available:
             if self._is_macos:
-                self._append_log("System", "Menu bar mode unavailable: install 'pystray'")
+                self._append_log("System", "Menu bar mode unavailable: missing AppKit bridge")
             return
+
+        if self._is_macos:
+            self._start_macos_menu_bar_item()
+            return
+
         if self._tray_icon is not None:
             return
 
@@ -699,7 +1064,75 @@ class DesktopChatApp:
         self._tray_thread = threading.Thread(target=run_icon, daemon=True)
         self._tray_thread.start()
 
+    def _start_macos_menu_bar_item(self) -> None:
+        if not self._is_macos:
+            return
+        if self._mac_status_item is not None:
+            return
+        if NSStatusBar is None or NSMenu is None or NSMenuItem is None or _MacMenuActionTarget is None:
+            self._append_log("System", "Menu bar mode unavailable on this build")
+            return
+
+        status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+        if status_item is None:
+            self._append_log("System", "Cannot create macOS status item")
+            return
+
+        button = status_item.button()
+        if button is not None:
+            if NSImage is not None:
+                try:
+                    image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                        "bubble.left.and.bubble.right.fill",
+                        "Gemini BLE Chat",
+                    )
+                    if image is not None:
+                        button.setImage_(image)
+                    else:
+                        button.setTitle_("G")
+                except Exception:
+                    button.setTitle_("G")
+            else:
+                button.setTitle_("G")
+
+        menu = NSMenu.alloc().init()
+        targets: list[Any] = []
+
+        def add_item(title: str, callback: Any) -> None:
+            target = _MacMenuActionTarget.alloc().initWithCallback_(callback)
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, "onAction:", "")
+            item.setTarget_(target)
+            menu.addItem_(item)
+            targets.append(target)
+
+        add_item("Show/Hide Window", lambda: self.root.after(0, self._toggle_app_visibility))
+        add_item("Shot+Ask", lambda: self.root.after(0, self.on_hotkey_overlay_triggered))
+        add_item("Clipboard+Ask", lambda: self.root.after(0, self.on_hotkey_clipboard_triggered))
+        add_item("Reconnect", lambda: self.root.after(0, self._reconnect_last_or_selected))
+        menu.addItem_(NSMenuItem.separatorItem())
+        add_item("Quit", lambda: self.root.after(0, self.on_close))
+
+        status_item.setMenu_(menu)
+        self._mac_status_item = status_item
+        self._mac_status_menu = menu
+        self._mac_status_targets = targets
+
+    def _stop_macos_menu_bar_item(self) -> None:
+        item = self._mac_status_item
+        self._mac_status_item = None
+        self._mac_status_menu = None
+        self._mac_status_targets = []
+        if item is None:
+            return
+        try:
+            NSStatusBar.systemStatusBar().removeStatusItem_(item)
+        except Exception:
+            pass
+
     def _stop_menu_bar_icon(self) -> None:
+        if self._is_macos:
+            self._stop_macos_menu_bar_item()
+            return
         icon = self._tray_icon
         self._tray_icon = None
         if icon is None:
@@ -890,6 +1323,15 @@ class DesktopChatApp:
             text="Nascondi icona nella Dock",
             variable=hide_dock_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 12))
+        if self._is_macos:
+            ctk.CTkButton(
+                dialog,
+                text="Configura permessi macOS",
+                command=lambda: self._show_permissions_onboarding(force=True),
+                fg_color="transparent",
+                border_width=1,
+                hover_color="#333333",
+            ).pack(anchor=tk.W, padx=12, pady=(0, 12))
 
         def save() -> None:
             text = textbox.get("1.0", tk.END).strip()
@@ -1614,7 +2056,7 @@ class DesktopChatApp:
                         elif "not authorized" in lowered or "permission" in lowered:
                             self._append_log(
                                 "Error",
-                                "Screenshot blocked: abilita Screen Recording per Terminal/Python in macOS Settings.",
+                                "Screenshot blocked: abilita Screen Recording per BluetoothGeminiChat in macOS Settings.",
                             )
                         else:
                             detail = stderr if stderr else f"exit code {result.returncode}"
