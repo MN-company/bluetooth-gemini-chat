@@ -32,6 +32,19 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r desktop/requirements.txt pyinstaller
 
+      - name: Read app version
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          APP_VERSION=$(python - <<'PY'
+          import pathlib, re
+          text = pathlib.Path("desktop/app.py").read_text(encoding="utf-8")
+          m = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', text)
+          print(m.group(1) if m else "0.1.0")
+          PY
+          )
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+
       - name: Build desktop app (macOS)
         if: runner.os == 'macOS'
         shell: bash
@@ -41,6 +54,7 @@ jobs:
             --clean \
             --windowed \
             --name BluetoothGeminiChat \
+            --osx-bundle-identifier com.mncompany.bluetoothgeminichat \
             --paths desktop \
             --collect-submodules bleak \
             --collect-submodules pystray \
@@ -48,6 +62,16 @@ jobs:
             --add-data "desktop/macos_quick_ask.sh:." \
             --add-data "desktop/macos_quick_ask.py:." \
             desktop/app.py
+
+      - name: Patch macOS app metadata
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          INFO_PLIST="dist/BluetoothGeminiChat.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$INFO_PLIST" >/dev/null 2>&1 \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $APP_VERSION" "$INFO_PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_VERSION" "$INFO_PLIST" >/dev/null 2>&1 \
+            || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $APP_VERSION" "$INFO_PLIST"
 
       - name: Build desktop app (Windows)
         if: runner.os == 'Windows'
