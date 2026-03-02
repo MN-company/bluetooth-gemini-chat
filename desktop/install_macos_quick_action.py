@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -286,6 +287,8 @@ def install(verbose: bool = False) -> Path:
 def _ensure_wrapper(script_path: Path) -> Path:
     runtime_dir = Path.home() / ".gemini_ble"
     runtime_dir.mkdir(parents=True, exist_ok=True)
+    runtime_script = runtime_dir / "macos_quick_ask.sh"
+    runtime_helper = runtime_dir / "macos_quick_ask.py"
     default_wrapper = runtime_dir / "ask_gemini_ble.sh"
     shot_wrapper = runtime_dir / "ask_gemini_ble_shot.sh"
     clipboard_wrapper = runtime_dir / "ask_gemini_ble_clipboard.sh"
@@ -293,18 +296,23 @@ def _ensure_wrapper(script_path: Path) -> Path:
     helper_path = script_path.with_name("macos_quick_ask.py")
     inbox_path = runtime_dir / "quick_inbox.jsonl"
 
-    _write_wrapper(default_wrapper, f'exec "{script_path}" "$@"')
+    shutil.copy2(script_path, runtime_script)
+    shutil.copy2(helper_path, runtime_helper)
+    os.chmod(runtime_script, 0o755)
+    os.chmod(runtime_helper, 0o755)
+
+    _write_wrapper(default_wrapper, f'exec "{runtime_script}" "$@"')
     _write_wrapper(
         shot_wrapper,
-        f'GEMINI_INPUT_TEXT="" exec python3 "{helper_path}" "{inbox_path}" quick_overlay "$*"',
+        f'GEMINI_INPUT_TEXT="" exec python3 "{runtime_helper}" "{inbox_path}" quick_overlay "$*"',
     )
     _write_wrapper(
         clipboard_wrapper,
-        f'GEMINI_INPUT_TEXT="" exec python3 "{helper_path}" "{inbox_path}" quick_clipboard "$*"',
+        f'GEMINI_INPUT_TEXT="" exec python3 "{runtime_helper}" "{inbox_path}" quick_clipboard "$*"',
     )
     _write_wrapper(
         toggle_wrapper,
-        f'GEMINI_INPUT_TEXT="" exec python3 "{helper_path}" "{inbox_path}" toggle_visibility ""',
+        f'GEMINI_INPUT_TEXT="" exec python3 "{runtime_helper}" "{inbox_path}" toggle_visibility ""',
     )
     return default_wrapper
 

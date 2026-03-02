@@ -12,12 +12,14 @@ import android.os.IBinder
 import android.os.PowerManager
 import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeoutException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -35,6 +37,7 @@ class BleKeepAliveService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val requestRouteByMessageId = ConcurrentHashMap<String, String>()
+    private val activePromptJobsByMessageId = ConcurrentHashMap<String, Job>()
 
     private lateinit var settingsRepository: SettingsRepository
     private lateinit var geminiApiClient: GeminiApiClient
@@ -211,12 +214,53 @@ class BleKeepAliveService : Service() {
         when (envelope.type) {
             "prompt" -> handlePromptRequest(rawJson, sourceAddress)
             "ping" -> handlePing(rawJson, sourceAddress)
+            "cancel" -> handleCancel(rawJson, sourceAddress)
+            "list_containers" -> handleListContainers(envelope.messageId, sourceAddress)
             "load_container" -> handleLoadContainer(rawJson, sourceAddress)
             else -> {
                 val messageId = envelope.messageId.ifBlank { "unknown" }
                 sendError(messageId, "Unsupported request type: ${envelope.type}", sourceAddress)
             }
         }
+    }
+
+    private suspend fun handleListContainers(messageId: String, sourceAddress: String) {
+        val list = BridgeRuntimeState.containers.values
+            .map { c ->
+                ContainerSummary(
+                    id = c.id,
+                    name = c.name,
+                    chunkCount = c.chunks.size,
+                )
+            }
+            .sortedBy { it.name.lowercase() }
+        val payload = json.encodeToString(
+            ListContainersResponse(
+                messageId = if (messageId.isBlank()) "list-containers" else messageId,
+                containers = list,
+            )
+        )
+        sendToPc(payload, "container_list", messageId.ifBlank { "list-containers" }, sourceAddress, highPriority = true)
+    }
+
+    private suspend fun handleCancel(rawJson: String, sourceAddress: String) {
+        val cancel = try {
+            json.decodeFromString<CancelRequest>(rawJson)
+        } catch (_: Throwable) {
+            return
+        }
+        val targetMessageId = cancel.targetMessageId.trim().ifBlank { cancel.messageId }
+        if (targetMessageId.isBlank()) {
+            return
+        }
+        val job = activePromptJobsByMessageId[targetMessageId]
+        if (job == null) {
+            sendStatus(targetMessageId, "not-running", sourceAddress)
+            return
+        }
+        job.cancel(CancellationException("Cancelled by client"))
+        sendStatus(targetMessageId, "canceled", sourceAddress)
+        appendLog("Cancel requested for $targetMessageId")
     }
 
     private suspend fun handlePing(rawJson: String, sourceAddress: String) {
@@ -377,6 +421,7 @@ class BleKeepAliveService : Service() {
         }
 
         appendLog("Prompt received (${request.messageId})$imageInfo$contextInfo$memoryInfo$webInfo$modelInfo$thinkingInfo")
+        currentCoroutineContext()[Job]?.let { activePromptJobsByMessageId[request.messageId] = it }
         val startedMs = System.currentTimeMillis()
         sendStatus(request.messageId, "processing (0s)", sourceAddress)
         val progressJob = serviceScope.launch {
@@ -407,6 +452,7 @@ class BleKeepAliveService : Service() {
                 contextBlocks = sanitizedContextBlocks,
                 conversationMemory = sanitizedMemoryTurns,
                 activeContainerId = request.activeContainerId?.takeIf { it.isNotBlank() },
+                activeContainerName = request.activeContainerName?.takeIf { it.isNotBlank() },
                 onPartialText = { partial ->
                     val now = System.currentTimeMillis()
                     val longEnough = partial.length >= (lastPartialLength + 12)
@@ -454,6 +500,11 @@ class BleKeepAliveService : Service() {
             )
             val elapsed = ((System.currentTimeMillis() - startedMs) / 1000L).coerceAtLeast(0)
             appendLog("Response sent (${request.messageId}) in ${elapsed}s")
+        } catch (t: CancellationException) {
+            progressJob.cancel()
+            sendStatus(request.messageId, "canceled", sourceAddress)
+            val elapsed = ((System.currentTimeMillis() - startedMs) / 1000L).coerceAtLeast(0)
+            appendLog("Request canceled (${request.messageId}) after ${elapsed}s")
         } catch (t: Throwable) {
             progressJob.cancel()
             val elapsed = ((System.currentTimeMillis() - startedMs) / 1000L).coerceAtLeast(0)
@@ -471,6 +522,8 @@ class BleKeepAliveService : Service() {
                 appendLog("Failed to send error to PC (${request.messageId}): ${sendFailure.message}")
             }
             appendLog("Gemini error (${request.messageId}) after ${elapsed}s: ${t.message}")
+        } finally {
+            activePromptJobsByMessageId.remove(request.messageId)
         }
     }
 

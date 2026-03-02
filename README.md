@@ -7,6 +7,9 @@ Chat PC <-> Android via BLE (senza Wi-Fi sul PC), con Gemini sul telefono.
 - Bridge Android BLE + chiamata Gemini API.
 - Supporto multi-client BLE (piu desktop connessi allo stesso telefono, risposta routata al client corretto).
 - Ottimizzazione multi-client: coda invio per-device, priorita messaggi critici (pong/result/error), preferenza PHY 2M.
+- Autoupdater:
+  - desktop: check release GitHub + download asset corretto per piattaforma,
+  - Android: check release in-app + apertura diretta APK release.
 - Selettore modello da PC (`phone-default` o override per richiesta).
 - Lista modelli disponibili da API direttamente nell'app Android.
 - Screenshot rapido con overlay risposta (Windows: hotkey globale, macOS: Apple Shortcuts wrapper).
@@ -19,9 +22,10 @@ Chat PC <-> Android via BLE (senza Wi-Fi sul PC), con Gemini sul telefono.
 1. Vai su GitHub -> `Actions` -> workflow `Build Desktop Clients`.
 2. Apri l'ultima run riuscita.
 3. Scarica artifact:
-   - `desktop-macOS` -> `BluetoothGeminiChat-macos.zip`
+   - `desktop-macOS` -> `BluetoothGeminiChat-macos.dmg`
    - `desktop-Windows` -> `BluetoothGeminiChat-windows.zip`
-4. Estrai e avvia l'eseguibile (`BluetoothGeminiChat.app` su macOS, `BluetoothGeminiChat.exe` su Windows).
+4. Su macOS apri il DMG e trascina `BluetoothGeminiChat.app` in `Applications`.
+5. Su Windows estrai lo ZIP e avvia `BluetoothGeminiChat.exe`.
 
 Nota: su macOS devi concedere `Screen Recording` per gli screenshot area.
 
@@ -34,6 +38,7 @@ Nota: su macOS devi concedere `Screen Recording` per gli screenshot area.
    ```
 4. Apri app `Gemini Bridge`, inserisci API key, salva, concedi permessi BLE.
 5. Premi `Disable Battery Optimization` nell'app Android (consigliato).
+6. In `Settings` dell'app Android usa `Check update` e `Scarica APK` per aggiornare.
 
 ### 2) Desktop
 ```bash
@@ -50,6 +55,10 @@ Nota: su macOS devi concedere `Screen Recording` per gli screenshot area.
    - macOS: Shortcut Apple con `~/.gemini_ble/ask_gemini_ble_shot.sh` (es. `Cmd+Shift+G`)
    - macOS (clipboard): Shortcut Apple con `~/.gemini_ble/ask_gemini_ble_clipboard.sh`
    - Windows: `Ctrl+Shift+G` (hotkey globale integrata)
+
+## Apple Shortcuts (link pronti)
+- BLE clipboard: [https://www.icloud.com/shortcuts/ae088b6775b042e38ffab54275f46c0c](https://www.icloud.com/shortcuts/ae088b6775b042e38ffab54275f46c0c)
+- BLE screenshot: [https://www.icloud.com/shortcuts/cd88dd6781a5427390f8034fe265a75b](https://www.icloud.com/shortcuts/cd88dd6781a5427390f8034fe265a75b)
 
 ## Script utili
 - `scripts/setup_desktop.sh`: crea venv e installa dipendenze desktop.

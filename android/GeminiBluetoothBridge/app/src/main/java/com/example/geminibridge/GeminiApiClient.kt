@@ -53,6 +53,7 @@ class GeminiApiClient(
         contextBlocks: List<ContextBlockRequest> = emptyList(),
         conversationMemory: List<MemoryTurnRequest> = emptyList(),
         activeContainerId: String? = null,
+        activeContainerName: String? = null,
         onPartialText: ((String) -> Unit)? = null,
         onPartialThought: ((String) -> Unit)? = null,
     ): GeminiGenerationResult = withContext(Dispatchers.IO) {
@@ -76,15 +77,13 @@ class GeminiApiClient(
         val cleanedImageMimeType = imageMimeType?.trim()?.takeIf { it.isNotEmpty() }
 
         // On-device BM25 retrieval from active container
-        val effectiveContextBlocks: List<ContextBlockRequest> = if (!activeContainerId.isNullOrBlank()) {
-            val container = BridgeRuntimeState.containers[activeContainerId]
-            if (container != null && container.chunks.isNotEmpty()) {
-                val retrieved = retrieveTopChunks(query = prompt, container = container, topK = 20)
-                // Merge retrieved with any explicit contextBlocks (e.g. system instructions)
-                contextBlocks + retrieved
-            } else {
-                contextBlocks
-            }
+        val resolvedContainer = resolveActiveContainer(
+            activeContainerId = activeContainerId,
+            activeContainerName = activeContainerName,
+        )
+        val effectiveContextBlocks: List<ContextBlockRequest> = if (resolvedContainer != null && resolvedContainer.chunks.isNotEmpty()) {
+            val retrieved = retrieveTopChunks(query = prompt, container = resolvedContainer, topK = 20)
+            contextBlocks + retrieved
         } else {
             contextBlocks
         }
@@ -740,6 +739,22 @@ class GeminiApiClient(
             if (token.length >= 3) result.add(token)
         }
         return result
+    }
+
+    private fun resolveActiveContainer(
+        activeContainerId: String?,
+        activeContainerName: String?,
+    ): StoredContainer? {
+        if (!activeContainerId.isNullOrBlank()) {
+            BridgeRuntimeState.containers[activeContainerId]?.let { return it }
+        }
+        if (!activeContainerName.isNullOrBlank()) {
+            val wanted = activeContainerName.trim().lowercase()
+            return BridgeRuntimeState.containers.values.firstOrNull {
+                it.name.trim().lowercase() == wanted
+            }
+        }
+        return null
     }
 
     private data class CandidateParts(
