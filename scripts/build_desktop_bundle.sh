@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="BluetoothGeminiChat"
 BUNDLE_ID="com.mncompany.bluetoothgeminichat"
+OS_NAME="$(uname -s)"
 APP_VERSION="$(
 python3 - <<'PY'
 import pathlib
@@ -25,21 +26,25 @@ python3 -m pip install -r "$ROOT_DIR/desktop/requirements.txt" pyinstaller
 cd "$ROOT_DIR"
 rm -rf build "$ROOT_DIR/dist/$APP_NAME" "$ROOT_DIR/dist/$APP_NAME.app"
 
-python3 -m PyInstaller \
-  --noconfirm \
-  --clean \
-  --windowed \
-  --name "$APP_NAME" \
-  --osx-bundle-identifier "$BUNDLE_ID" \
-  --paths "$ROOT_DIR/desktop" \
-  --collect-submodules bleak \
-  --collect-submodules pystray \
-  --add-data "$ROOT_DIR/desktop/install_macos_quick_action.py:." \
-  --add-data "$ROOT_DIR/desktop/macos_quick_ask.sh:." \
-  --add-data "$ROOT_DIR/desktop/macos_quick_ask.py:." \
-  "$ROOT_DIR/desktop/app.py"
+PYI_ARGS=(
+  --noconfirm
+  --clean
+  --windowed
+  --name "$APP_NAME"
+  --paths "$ROOT_DIR/desktop"
+  --collect-submodules bleak
+  --collect-submodules pystray
+  --add-data "$ROOT_DIR/desktop/install_macos_quick_action.py:."
+  --add-data "$ROOT_DIR/desktop/macos_quick_ask.sh:."
+  --add-data "$ROOT_DIR/desktop/macos_quick_ask.py:."
+)
+if [ "$OS_NAME" = "Darwin" ]; then
+  PYI_ARGS+=(--osx-bundle-identifier "$BUNDLE_ID")
+fi
+PYI_ARGS+=("$ROOT_DIR/desktop/app.py")
+python3 -m PyInstaller "${PYI_ARGS[@]}"
 
-if [ -d "$ROOT_DIR/dist/$APP_NAME.app" ]; then
+if [ "$OS_NAME" = "Darwin" ] && [ -d "$ROOT_DIR/dist/$APP_NAME.app" ]; then
   echo "Build macOS pronta: $ROOT_DIR/dist/$APP_NAME.app"
   INFO_PLIST="$ROOT_DIR/dist/$APP_NAME.app/Contents/Info.plist"
   if [ -f "$INFO_PLIST" ]; then
@@ -59,6 +64,10 @@ if [ -d "$ROOT_DIR/dist/$APP_NAME.app" ]; then
     -format UDZO \
     "$ROOT_DIR/dist/$APP_NAME-macos.dmg"
   echo "DMG pronta: $ROOT_DIR/dist/$APP_NAME-macos.dmg"
+elif [ "$OS_NAME" = "Linux" ] && [ -d "$ROOT_DIR/dist/$APP_NAME" ]; then
+  echo "Build Linux pronta: $ROOT_DIR/dist/$APP_NAME"
+  tar -C "$ROOT_DIR/dist" -czf "$ROOT_DIR/dist/$APP_NAME-linux.tar.gz" "$APP_NAME"
+  echo "Tarball pronta: $ROOT_DIR/dist/$APP_NAME-linux.tar.gz"
 elif [ -d "$ROOT_DIR/dist/$APP_NAME" ]; then
   echo "Build desktop pronta: $ROOT_DIR/dist/$APP_NAME"
 else

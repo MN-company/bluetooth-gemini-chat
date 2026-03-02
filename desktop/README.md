@@ -62,6 +62,7 @@ python app.py
 - Supporta quick action/shortcuts macOS via script `macos_quick_ask.sh` (vedi `QUICK_ACTION_SETUP.md`).
 - Tenta install automatica della Quick Action macOS all'avvio; bottone `Install Right-click` per reinstall.
 - Supporta hotkey globale via `pynput` su Windows/Linux; su macOS usa Apple Shortcuts.
+- Su Linux (es. Arch) l'app parte anche senza `tkinterdnd2/tkdnd`: in quel caso drag & drop viene disabilitato automaticamente e restano disponibili i pulsanti `Attach Image` / `Add PDF`.
 - Su macOS lo screenshot richiede permesso `Screen Recording` per Terminal/Python.
 - Supporta tray/menu bar con azioni rapide: show/hide, shot+ask, clipboard+ask, reconnect.
 - Su macOS la menu bar usa integrazione nativa AppKit (evita crash thread off-main).
