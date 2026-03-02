@@ -8,6 +8,7 @@ All'avvio, l'app desktop installa automaticamente la Quick Action di testo e cre
 - `~/.gemini_ble/toggle_gemini_ble.sh` -> mostra/nasconde finestra chat
 
 Tutti gli eventi rapidi passano da `~/.gemini_ble/quick_inbox.jsonl` (runtime condiviso, indipendente dalla cartella progetto).
+Lo script installer copia anche `macos_quick_ask.sh/.py` in `~/.gemini_ble`, cosi i comandi continuano a funzionare anche su Mac diversi o app spostata.
 
 ## Quick Action (tasto destro testo)
 
@@ -35,3 +36,7 @@ Opzionale: crea un altro shortcut per clipboard+ask overlay:
 ```zsh
 /Users/$USER/.gemini_ble/ask_gemini_ble_clipboard.sh
 ```
+
+Shortcut pronti (iCloud):
+- BLE clipboard: [https://www.icloud.com/shortcuts/ae088b6775b042e38ffab54275f46c0c](https://www.icloud.com/shortcuts/ae088b6775b042e38ffab54275f46c0c)
+- BLE screenshot: [https://www.icloud.com/shortcuts/cd88dd6781a5427390f8034fe265a75b](https://www.icloud.com/shortcuts/cd88dd6781a5427390f8034fe265a75b)

@@ -11,6 +11,15 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.util.concurrent.TimeUnit
+
+const val APP_VERSION_NAME = "0.1.5"
 
 @Serializable
 data class IncomingEnvelope(
@@ -34,6 +43,7 @@ data class PromptRequest(
     val contextBlocks: List<ContextBlockRequest> = emptyList(),
     val conversationMemory: List<MemoryTurnRequest> = emptyList(),
     val activeContainerId: String? = null,
+    val activeContainerName: String? = null,
 )
 
 @Serializable
@@ -54,6 +64,27 @@ data class PingRequest(
     val type: String,
     val messageId: String,
     val clientTsMs: Long? = null,
+)
+
+@Serializable
+data class CancelRequest(
+    val type: String,
+    val messageId: String,
+    val targetMessageId: String = "",
+)
+
+@Serializable
+data class ListContainersResponse(
+    val type: String = "container_list",
+    val messageId: String,
+    val containers: List<ContainerSummary> = emptyList(),
+)
+
+@Serializable
+data class ContainerSummary(
+    val id: String,
+    val name: String,
+    val chunkCount: Int,
 )
 
 @Serializable
@@ -112,11 +143,23 @@ data class UiState(
     val modelsError: String = "",
     val logs: List<String> = emptyList(),
     val serviceRunning: Boolean = false,
+    val updateChecking: Boolean = false,
+    val updateAvailable: Boolean = false,
+    val latestVersion: String = "",
+    val updateUrl: String = "",
+    val updateAssetUrl: String = "",
+    val updateError: String = "",
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepository = SettingsRepository(application)
     private val geminiApiClient = GeminiApiClient(settingsRepository)
+    private val updateHttpClient = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
+        .build()
+    private val updateJson = Json { ignoreUnknownKeys = true }
 
     private val _uiState = MutableStateFlow(
         UiState(
@@ -145,6 +188,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update { it.copy(serviceRunning = running) }
             }
         }
+        checkForAppUpdates(silent = true)
     }
 
     fun updatePermissions(granted: Boolean) {
@@ -212,6 +256,109 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             app.startService(intent)
         }
         BridgeRuntimeState.appendLog("Foreground service restart requested")
+    }
+
+    fun checkForAppUpdates(silent: Boolean = false) {
+        _uiState.update {
+            it.copy(
+                updateChecking = true,
+                updateError = if (silent) it.updateError else "",
+            )
+        }
+        viewModelScope.launch {
+            runCatching {
+                fetchLatestRelease()
+            }.onSuccess { release ->
+                val hasUpdate = isVersionNewer(release.tag, APP_VERSION_NAME)
+                _uiState.update {
+                    it.copy(
+                        updateChecking = false,
+                        updateAvailable = hasUpdate,
+                        latestVersion = release.tag,
+                        updateUrl = release.url,
+                        updateAssetUrl = release.apkUrl,
+                        updateError = "",
+                    )
+                }
+                if (hasUpdate) {
+                    BridgeRuntimeState.appendLog("Update disponibile: ${release.tag}")
+                } else if (!silent) {
+                    BridgeRuntimeState.appendLog("App aggiornata ($APP_VERSION_NAME)")
+                }
+            }.onFailure { err ->
+                _uiState.update {
+                    it.copy(
+                        updateChecking = false,
+                        updateError = err.message ?: "Update check failed",
+                    )
+                }
+                if (!silent) {
+                    BridgeRuntimeState.appendLog("Update check failed: ${err.message}")
+                }
+            }
+        }
+    }
+
+    private data class LatestRelease(
+        val tag: String,
+        val url: String,
+        val apkUrl: String,
+    )
+
+    private fun fetchLatestRelease(): LatestRelease {
+        val request = Request.Builder()
+            .url("https://api.github.com/repos/MN-company/bluetooth-gemini-chat/releases/latest")
+            .get()
+            .build()
+
+        updateHttpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IllegalStateException("GitHub release API error: ${response.code}")
+            }
+            val raw = response.body?.string().orEmpty()
+            if (raw.isBlank()) {
+                throw IllegalStateException("Empty release response")
+            }
+            val root = updateJson.parseToJsonElement(raw).jsonObject
+            val tag = root["tag_name"]?.jsonPrimitive?.content.orEmpty()
+            val url = root["html_url"]?.jsonPrimitive?.content.orEmpty()
+            var apkUrl = ""
+            root["assets"]?.jsonArray?.forEach { asset ->
+                val obj = asset.jsonObject
+                val name = obj["name"]?.jsonPrimitive?.content.orEmpty()
+                val download = obj["browser_download_url"]?.jsonPrimitive?.content.orEmpty()
+                if (name == "app-debug.apk" || (apkUrl.isBlank() && name.endsWith(".apk"))) {
+                    apkUrl = download
+                }
+            }
+            return LatestRelease(
+                tag = tag.ifBlank { "unknown" },
+                url = url,
+                apkUrl = apkUrl,
+            )
+        }
+    }
+
+    private fun isVersionNewer(candidate: String, current: String): Boolean {
+        val cand = versionTuple(candidate)
+        val curr = versionTuple(current)
+        val maxLen = maxOf(cand.size, curr.size)
+        for (idx in 0 until maxLen) {
+            val a = cand.getOrElse(idx) { 0 }
+            val b = curr.getOrElse(idx) { 0 }
+            if (a != b) return a > b
+        }
+        return false
+    }
+
+    private fun versionTuple(value: String): List<Int> {
+        val normalized = value.trim().lowercase().removePrefix("v")
+        if (normalized.isBlank()) return listOf(0)
+        return Regex("\\d+")
+            .findAll(normalized)
+            .map { it.value.toIntOrNull() ?: 0 }
+            .toList()
+            .ifEmpty { listOf(0) }
     }
 
     private fun startBridgeService() {

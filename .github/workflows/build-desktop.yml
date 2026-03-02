@@ -63,12 +63,19 @@ jobs:
             --collect-submodules pystray \
             desktop/app.py
 
-      - name: Package artifact (macOS)
+      - name: Package artifact (macOS DMG)
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          cd dist
-          zip -r BluetoothGeminiChat-macos.zip BluetoothGeminiChat.app
+          mkdir -p dist/dmg-root
+          cp -R dist/BluetoothGeminiChat.app dist/dmg-root/
+          ln -s /Applications dist/dmg-root/Applications
+          hdiutil create \
+            -volname "BluetoothGeminiChat" \
+            -srcfolder dist/dmg-root \
+            -ov \
+            -format UDZO \
+            dist/BluetoothGeminiChat-macos.dmg
 
       - name: Package artifact (Windows)
         if: runner.os == 'Windows'
@@ -81,5 +88,5 @@ jobs:
         with:
           name: desktop-${{ runner.os }}
           path: |
-            dist/BluetoothGeminiChat-macos.zip
+            dist/BluetoothGeminiChat-macos.dmg
             dist/BluetoothGeminiChat-windows.zip

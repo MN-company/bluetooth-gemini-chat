@@ -82,6 +82,13 @@ class MainActivity : ComponentActivity() {
                         onRequestPermissions = { it.launch(requiredPermissions()) },
                         onCheckBatteryOptimizationExempt = { isIgnoringBatteryOptimizations() },
                         onRequestDisableBatteryOptimization = { requestDisableBatteryOptimization(it) },
+                        onOpenExternalUrl = { url ->
+                            if (url.isNotBlank()) {
+                                runCatching {
+                                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                                }
+                            }
+                        },
                     )
                 }
             }
@@ -128,6 +135,7 @@ private fun BridgeScreen(
     onRequestPermissions: (androidx.activity.result.ActivityResultLauncher<Array<String>>) -> Unit,
     onCheckBatteryOptimizationExempt: () -> Boolean,
     onRequestDisableBatteryOptimization: (androidx.activity.result.ActivityResultLauncher<Intent>) -> Unit,
+    onOpenExternalUrl: (String) -> Unit,
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     var selectedTab by remember { mutableStateOf(Tab.SETTINGS) }
@@ -184,6 +192,8 @@ private fun BridgeScreen(
                     onSave = { viewModel.saveSettings(apiKey = apiKey, model = model); viewModel.updatePermissions(onCheckPermissions()) },
                     onRestart = { viewModel.restartBridgeService() },
                     onRefreshModels = { viewModel.loadAvailableModels(apiKey) },
+                    onCheckUpdates = { viewModel.checkForAppUpdates(silent = false) },
+                    onOpenUpdate = { url -> onOpenExternalUrl(url) },
                 )
                 Tab.CONTAINERS -> ContainersTab()
                 Tab.LOGS       -> LogsTab(logs = uiState.logs)
@@ -289,6 +299,8 @@ private fun SettingsTab(
     apiKey: String, model: String,
     onApiKeyChange: (String) -> Unit, onModelChange: (String) -> Unit,
     onSave: () -> Unit, onRestart: () -> Unit, onRefreshModels: () -> Unit,
+    onCheckUpdates: () -> Unit,
+    onOpenUpdate: (String) -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(16.dp),
@@ -346,6 +358,59 @@ private fun SettingsTab(
                         text = name, fontSize = 13.sp, color = TextPrim,
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                     )
+                }
+            }
+        }
+
+        item {
+            AppCard {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    SectionTitle("Aggiornamenti App")
+                    Text(
+                        text = "Versione installata: $APP_VERSION_NAME",
+                        fontSize = 12.sp,
+                        color = TextSec,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SecondaryButton(
+                            label = if (uiState.updateChecking) "Controllo..." else "Check update",
+                            modifier = Modifier.weight(1f),
+                            onClick = onCheckUpdates,
+                        )
+                        if (uiState.updateAvailable) {
+                            PrimaryButton(
+                                label = "Scarica APK",
+                                modifier = Modifier.weight(1f),
+                                onClick = {
+                                    val target = if (uiState.updateAssetUrl.isNotBlank()) {
+                                        uiState.updateAssetUrl
+                                    } else {
+                                        uiState.updateUrl
+                                    }
+                                    onOpenUpdate(target)
+                                },
+                            )
+                        }
+                    }
+                    when {
+                        uiState.updateError.isNotBlank() -> {
+                            Text(uiState.updateError, fontSize = 12.sp, color = Danger)
+                        }
+                        uiState.updateAvailable -> {
+                            Text(
+                                "Nuova versione disponibile: ${uiState.latestVersion}",
+                                fontSize = 12.sp,
+                                color = AccentGrn,
+                            )
+                        }
+                        uiState.latestVersion.isNotBlank() -> {
+                            Text(
+                                "Ultima release: ${uiState.latestVersion}",
+                                fontSize = 12.sp,
+                                color = TextSec,
+                            )
+                        }
+                    }
                 }
             }
         }
