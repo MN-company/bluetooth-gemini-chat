@@ -17,21 +17,24 @@ python app.py
 4. (Opzionale) `Attach Image` per allegare un'immagine.
 5. (Opzionale) `Screenshot` per catturare rapidamente e allegare.
 6. (Opzionale) `Ask Clipboard` per inviare testo/immagine dagli appunti.
-7. (Opzionale) `Add PDF` per aggiungere documenti usati come contesto.
-8. (Opzionale) abilita `Enable Web Search (Google)` per grounding web.
-9. (Opzionale) abilita `Thinking Mode` e imposta `Budget` (o `Auto`) + `Show Thought Trace`.
-10. Usa `New/Rename/Delete` per chat multiple con cronologia persistente.
-11. Scrivi prompt e premi `Send`.
-12. Su macOS puoi usare `cmd + backspace` nel composer per pulirlo.
-13. Overlay screenshot rapido:
+7. (Opzionale) `Update` per verificare e scaricare aggiornamenti desktop dalla release GitHub.
+8. (Opzionale) `Add PDF` per aggiungere documenti usati come contesto.
+9. (Opzionale) abilita `Enable Web Search (Google)` per grounding web.
+10. (Opzionale) abilita `Thinking Mode` e imposta `Budget` (o `Auto`) + `Show Thought Trace`.
+11. Usa `New/Rename/Delete` per chat multiple con cronologia persistente.
+12. Scrivi prompt e premi `Send`.
+13. Puoi interrompere una generazione in corso con `Stop`.
+14. Su macOS puoi usare `cmd + backspace` nel composer per pulirlo.
+15. Overlay screenshot rapido:
    - macOS: usa Apple Shortcuts + `~/.gemini_ble/ask_gemini_ble_shot.sh` (puoi assegnare `Cmd+Shift+G`)
    - Windows: `Ctrl+Shift+G` (hotkey globale integrata)
    Esegue screenshot area, invia direttamente a Gemini e mostra risposta in overlay semitrasparente.
-14. Overlay clipboard rapido (testo o immagine):
+16. Overlay clipboard rapido (testo o immagine):
    - macOS: Apple Shortcuts + `~/.gemini_ble/ask_gemini_ble_clipboard.sh`
    Legge la clipboard locale e mostra la risposta in overlay.
-15. In `Settings`:
+17. In `Settings`:
    - abilita/disabilita `Auto-connect all'avvio` e `Auto-retry su disconnessione`
+   - abilita/disabilita `Auto-check updates`
    - su macOS puoi attivare `menu bar mode` e `nascondi Dock icon`.
 
 ## Dettagli
@@ -51,6 +54,8 @@ python app.py
 - Mostra progress upload su payload BLE grandi (es. immagini).
 - Supporta streaming progressivo delle risposte Gemini anche con web search (fallback automatici).
 - Supporta Thinking Mode + Think Budget + thought trace (`includeThoughts`) nel payload API.
+- Supporta stop generazione (`cancel`) dal bottone `STOP`.
+- Supporta updater desktop (check release + download asset).
 - Supporta quick action/shortcuts macOS via script `macos_quick_ask.sh` (vedi `QUICK_ACTION_SETUP.md`).
 - Tenta install automatica della Quick Action macOS all'avvio; bottone `Install Right-click` per reinstall.
 - Supporta hotkey globale via `pynput` su Windows/Linux; su macOS usa Apple Shortcuts.

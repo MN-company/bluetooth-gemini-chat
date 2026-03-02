@@ -5,6 +5,7 @@ import os
 import platform
 import queue
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -15,6 +16,8 @@ import webbrowser
 from pathlib import Path
 from tkinter import colorchooser, filedialog, simpledialog, ttk
 from typing import Any
+from urllib import error as urlerror
+from urllib import request as urlrequest
 from tkinterdnd2 import TkinterDnD, DND_FILES
 
 class CTkinterDnD(ctk.CTk, TkinterDnD.DnDWrapper):
@@ -67,6 +70,9 @@ MODEL_PRESETS = [
     "gemini-2.0-pro-exp",
 ]
 
+APP_VERSION = "0.1.5"
+GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
+
 
 class DesktopChatApp:
     def __init__(self) -> None:
@@ -92,6 +98,7 @@ class DesktopChatApp:
         self.active_session_id = self.sessions_store.active_session_id
 
         self._pending_request_session: dict[str, str] = {}
+        self._pending_request_order: list[str] = []
         self._streaming_preview_by_session: dict[str, str] = {}
         self._streaming_thought_by_session: dict[str, str] = {}
         self._session_ids_in_view: list[str] = []
@@ -129,6 +136,7 @@ class DesktopChatApp:
         self._last_connected_address = str(_saved.get("last_connected_address", "")).strip() or None
         self._auto_connect_on_start = bool(_saved.get("auto_connect_on_start", True))
         self._auto_retry_known_device = bool(_saved.get("auto_retry_known_device", True))
+        self._auto_check_updates = bool(_saved.get("auto_check_updates", True))
         self._menu_bar_mode_enabled = bool(_saved.get("menu_bar_mode_enabled", self._is_macos))
         self._hide_dock_icon_enabled = bool(_saved.get("hide_dock_icon_enabled", self._is_macos))
         self._overlay_bg_color = self._normalize_hex_color(_saved.get("overlay_bg_color"), "#0f172a")
@@ -144,6 +152,8 @@ class DesktopChatApp:
         self._active_container_id: str | None = None
         self._selected_container_idx: int | None = None
         self._container_transfer_request_id: str | None = None
+        self._container_transfer_container_id_by_request: dict[str, str] = {}
+        self._remote_containers: list[dict[str, Any]] = []
         self._transfer_dialog: ctk.CTkToplevel | None = None
         self._transfer_progress_var: tk.DoubleVar | None = None
         self._transfer_label_var: tk.StringVar | None = None
@@ -163,6 +173,8 @@ class DesktopChatApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self._poll_events)
         self.root.after(1200, self._maybe_auto_connect_on_start)
+        if self._auto_check_updates:
+            self.root.after(2200, lambda: self.on_check_updates(background=True))
 
     def _configure_theme(self) -> None:
         ctk.set_appearance_mode("dark")
@@ -197,6 +209,7 @@ class DesktopChatApp:
         ctk.CTkButton(header_left, text="ADD PDF", command=self.on_add_pdf, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT, padx=(0, 6))
         ctk.CTkButton(header_left, text="CLIPBOARD", command=self.on_clipboard_send, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT, padx=(0, 6))
         ctk.CTkButton(header_left, text="SCREENSHOT", command=self.on_quick_screenshot, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT, padx=(0, 6))
+        ctk.CTkButton(header_left, text="UPDATE", command=lambda: self.on_check_updates(background=False), fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=70).pack(side=tk.LEFT, padx=(0, 6))
         ctk.CTkButton(header_left, text="⚙️", command=self.on_open_settings, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=30).pack(side=tk.LEFT)
 
         # Header Right: Device Name / Connection info
@@ -301,6 +314,11 @@ class DesktopChatApp:
             width=34, height=30, fg_color="transparent", border_width=1, border_color="#444",
             hover_color="#2a2a2a", text_color="#d0d0d0", font=("Avenir", 13),
         ).pack(side=tk.LEFT)
+        ctk.CTkButton(
+            kb_row1, text="☁", command=self._on_sync_remote_containers,
+            width=34, height=30, fg_color="transparent", border_width=1, border_color="#444",
+            hover_color="#2a2a2a", text_color="#d0d0d0", font=("Avenir", 13),
+        ).pack(side=tk.LEFT, padx=(3, 0))
 
         # Row 2: Active indicator + Delete
         kb_row2 = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
@@ -408,6 +426,19 @@ class DesktopChatApp:
 
         send_btn = ctk.CTkButton(input_row, text="SEND", command=self.on_send, fg_color="#1e1e1e", border_width=1, border_color="#333333", hover_color="#333333", text_color="#e0e0e0", width=80)
         send_btn.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
+        self.stop_btn = ctk.CTkButton(
+            input_row,
+            text="STOP",
+            command=self.on_stop_active_request,
+            fg_color="#3a1c1c",
+            border_width=1,
+            border_color="#5a2d2d",
+            hover_color="#5a2d2d",
+            text_color="#f5d0d0",
+            width=72,
+            state="disabled",
+        )
+        self.stop_btn.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
 
         # Hidden variables to preserve underlying logic
         self.image_var = tk.StringVar(value="Image: none")
@@ -468,6 +499,133 @@ class DesktopChatApp:
         current = self._load_settings()
         current.update(patch)
         self._save_settings(current)
+
+    def _parse_version_tuple(self, value: str) -> tuple[int, ...]:
+        clean = value.strip().lower()
+        if clean.startswith("v"):
+            clean = clean[1:]
+        parts: list[int] = []
+        for chunk in re.findall(r"\d+", clean):
+            try:
+                parts.append(int(chunk))
+            except Exception:
+                parts.append(0)
+        return tuple(parts or [0])
+
+    def _is_version_newer(self, candidate: str, current: str) -> bool:
+        return self._parse_version_tuple(candidate) > self._parse_version_tuple(current)
+
+    def _release_asset_for_platform(self, assets: list[dict[str, Any]]) -> dict[str, Any] | None:
+        names = []
+        if self._is_macos:
+            names = ["BluetoothGeminiChat-macos.dmg", "BluetoothGeminiChat-macos.zip"]
+        elif platform.system().lower().startswith("windows"):
+            names = ["BluetoothGeminiChat-windows.zip"]
+        for wanted in names:
+            for asset in assets:
+                if str(asset.get("name", "")) == wanted:
+                    return asset
+        return None
+
+    def _download_update_asset(self, url: str, filename: str) -> Path:
+        download_dir = Path.home() / "Downloads" / "GeminiBLEUpdates"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        target = download_dir / filename
+        with urlrequest.urlopen(url, timeout=30) as response:
+            target.write_bytes(response.read())
+        return target
+
+    def on_check_updates(self, background: bool = True) -> None:
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+        try:
+            with urlrequest.urlopen(api_url, timeout=15) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (urlerror.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            if not background:
+                self._append_log("Error", f"Update check failed: {exc}")
+            return
+
+        latest_tag = str(payload.get("tag_name", "")).strip() or "unknown"
+        release_url = str(payload.get("html_url", "")).strip()
+        assets = payload.get("assets", [])
+        if not isinstance(assets, list):
+            assets = []
+        if not self._is_version_newer(latest_tag, APP_VERSION):
+            if not background:
+                self._append_log("System", f"Already up to date ({APP_VERSION})")
+            return
+
+        self._append_log("System", f"Update available: {latest_tag} (current {APP_VERSION})")
+        asset = self._release_asset_for_platform(assets)
+        if asset is None:
+            if release_url:
+                self._append_log("System", f"Open release page: {release_url}")
+            return
+
+        asset_name = str(asset.get("name", "update.bin")).strip() or "update.bin"
+        asset_url = str(asset.get("browser_download_url", "")).strip()
+        if not asset_url:
+            if release_url:
+                self._append_log("System", f"Open release page: {release_url}")
+            return
+
+        if background:
+            return
+
+        from tkinter import messagebox
+        do_download = messagebox.askyesno(
+            "Update disponibile",
+            f"Nuova versione {latest_tag} disponibile.\nVuoi scaricare {asset_name} adesso?",
+            parent=self.root,
+        )
+        if not do_download:
+            return
+
+        try:
+            local_path = self._download_update_asset(asset_url, asset_name)
+        except Exception as exc:
+            self._append_log("Error", f"Download update failed: {exc}")
+            return
+
+        self._append_log("System", f"Update downloaded: {local_path}")
+        try:
+            if self._is_macos and local_path.suffix.lower() == ".dmg":
+                subprocess.Popen(["open", str(local_path)])
+            elif platform.system().lower().startswith("windows"):
+                os.startfile(str(local_path))  # type: ignore[attr-defined]
+            else:
+                webbrowser.open(local_path.as_uri(), new=2)
+        except Exception as exc:
+            self._append_log("System", f"Open update file manually: {local_path} ({exc})")
+
+    def _track_pending_request(self, request_id: str, session_id: str) -> None:
+        self._pending_request_session[request_id] = session_id
+        self._pending_request_order = [rid for rid in self._pending_request_order if rid != request_id]
+        self._pending_request_order.append(request_id)
+        self._refresh_stop_button()
+
+    def _clear_pending_request(self, request_id: str) -> None:
+        self._pending_request_session.pop(request_id, None)
+        if request_id in self._pending_request_order:
+            self._pending_request_order = [rid for rid in self._pending_request_order if rid != request_id]
+        self._refresh_stop_button()
+
+    def _latest_pending_request_for_session(self, session_id: str) -> str | None:
+        for request_id in reversed(self._pending_request_order):
+            if self._pending_request_session.get(request_id) == session_id:
+                return request_id
+        return None
+
+    def _refresh_stop_button(self) -> None:
+        try:
+            can_stop = self._latest_pending_request_for_session(self.active_session_id) is not None
+            self.stop_btn.configure(state=("normal" if can_stop else "disabled"))
+        except Exception:
+            pass
+
+    def _clear_all_pending_requests(self) -> None:
+        for request_id in list(self._pending_request_order):
+            self._clear_pending_request(request_id)
 
     def _maybe_auto_connect_on_start(self) -> None:
         if not self._auto_connect_on_start:
@@ -702,6 +860,7 @@ class DesktopChatApp:
         ctk.CTkLabel(dialog, text="🔗 Connessione:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
         auto_connect_var = tk.BooleanVar(value=self._auto_connect_on_start)
         auto_retry_var = tk.BooleanVar(value=self._auto_retry_known_device)
+        auto_updates_var = tk.BooleanVar(value=self._auto_check_updates)
         ctk.CTkCheckBox(
             dialog,
             text="Auto-connect all'avvio (ultimo telefono noto)",
@@ -711,6 +870,11 @@ class DesktopChatApp:
             dialog,
             text="Auto-retry su disconnessione (backoff)",
             variable=auto_retry_var,
+        ).pack(anchor=tk.W, padx=12, pady=(0, 12))
+        ctk.CTkCheckBox(
+            dialog,
+            text="Controlla aggiornamenti automaticamente",
+            variable=auto_updates_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 12))
 
         ctk.CTkLabel(dialog, text="🍎 macOS Shell:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
@@ -737,6 +901,7 @@ class DesktopChatApp:
             self._overlay_resizable = bool(overlay_resizable_var.get())
             self._auto_connect_on_start = bool(auto_connect_var.get())
             self._auto_retry_known_device = bool(auto_retry_var.get())
+            self._auto_check_updates = bool(auto_updates_var.get())
             self._menu_bar_mode_enabled = bool(menu_bar_mode_var.get())
             self._hide_dock_icon_enabled = bool(hide_dock_var.get())
             self.client.set_auto_reconnect(self._auto_retry_known_device)
@@ -749,6 +914,7 @@ class DesktopChatApp:
             old_settings["overlay_resizable"] = self._overlay_resizable
             old_settings["auto_connect_on_start"] = self._auto_connect_on_start
             old_settings["auto_retry_known_device"] = self._auto_retry_known_device
+            old_settings["auto_check_updates"] = self._auto_check_updates
             old_settings["menu_bar_mode_enabled"] = self._menu_bar_mode_enabled
             old_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
             old_settings["last_connected_address"] = self._last_connected_address
@@ -796,7 +962,33 @@ class DesktopChatApp:
                 text=f"● {active.name} attivo", text_color="#4caf50"
             )
         else:
-            self._kb_active_label.configure(text="nessun container attivo", text_color="#555555")
+            remote_active = next(
+                (c for c in self._remote_containers if str(c.get("id", "")) == str(self._active_container_id)),
+                None,
+            )
+            if remote_active is not None:
+                self._kb_active_label.configure(
+                    text=f"● [Remote] {remote_active.get('name', 'container')} attivo",
+                    text_color="#4caf50",
+                )
+            else:
+                self._kb_active_label.configure(text="nessun container attivo", text_color="#555555")
+
+    def _active_container_name(self) -> str | None:
+        if not self._active_container_id:
+            return None
+        local = self._context_store.get(self._active_container_id)
+        if local is not None:
+            return local.name
+        remote = next(
+            (c for c in self._remote_containers if str(c.get("id", "")) == str(self._active_container_id)),
+            None,
+        )
+        if remote is not None:
+            name = str(remote.get("name", "")).strip()
+            if name:
+                return name
+        return None
 
     def _selected_container_id(self) -> str | None:
         """Return the ID of the currently highlighted container (survives refresh)."""
@@ -899,9 +1091,81 @@ class DesktopChatApp:
             self._append_log("System", f"Avvio trasferimento container '{c.name}' (~{size_kb}KB, {c.total_chunks()} chunk)...")
             request_id = self.client.send_container(container_dict)
             self._container_transfer_request_id = request_id
+            self._container_transfer_container_id_by_request[request_id] = cid
             self._open_transfer_dialog(c.name, size_kb)
         except ValueError as exc:
             self._append_log("Error", str(exc))
+
+    def _on_sync_remote_containers(self) -> None:
+        if not self.connected:
+            self._append_log("System", "Non connesso — connetti il bridge Android prima di sincronizzare")
+            return
+        try:
+            request_id = self.client.request_container_list()
+            self._append_log("System", f"Richiesta lista container remoti ({request_id})")
+        except Exception as exc:
+            self._append_log("Error", f"Sync container remoti fallita: {exc}")
+
+    def _open_remote_container_picker(self) -> None:
+        if not self._remote_containers:
+            self._append_log("System", "Nessun container remoto disponibile")
+            return
+
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Container remoti")
+        dialog.geometry("460x340")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text="Container disponibili sul telefono", font=("Avenir", 14, "bold")).pack(
+            anchor=tk.W, padx=12, pady=(10, 8)
+        )
+        lb = tk.Listbox(
+            dialog,
+            bg="#1e1e1e",
+            fg="#e0e0e0",
+            selectbackground="#1f538d",
+            activestyle=tk.NONE,
+            borderwidth=1,
+            relief=tk.SOLID,
+            highlightthickness=0,
+        )
+        lb.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
+        for c in self._remote_containers:
+            name = str(c.get("name", "container")).strip() or "container"
+            chunks = int(c.get("chunkCount", 0) or 0)
+            lb.insert(tk.END, f"{name} ({chunks} chunk)")
+
+        if self._active_container_id:
+            for idx, c in enumerate(self._remote_containers):
+                if str(c.get("id", "")) == self._active_container_id:
+                    lb.selection_set(idx)
+                    lb.see(idx)
+                    break
+
+        def activate_selected() -> None:
+            sel = lb.curselection()
+            if not sel:
+                return
+            chosen = self._remote_containers[sel[0]]
+            cid = str(chosen.get("id", "")).strip()
+            if not cid:
+                return
+            self._active_container_id = cid
+            self._refresh_container_list()
+            self._refresh_context_preview()
+            self._append_log(
+                "System",
+                f"Container remoto attivo: {chosen.get('name', 'container')} ({int(chosen.get('chunkCount', 0) or 0)} chunk)",
+            )
+            dialog.destroy()
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill=tk.X, padx=12, pady=(0, 12))
+        ctk.CTkButton(btn_row, text="Attiva", command=activate_selected, width=100).pack(side=tk.LEFT)
+        ctk.CTkButton(btn_row, text="Chiudi", command=dialog.destroy, width=100, fg_color="transparent", border_width=1).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
 
     # ── Transfer progress dialog ──────────────────────────────────────────────
 
@@ -940,10 +1204,11 @@ class DesktopChatApp:
             eta_str = ""
         self._transfer_label_var.set(f"{percent}%  —  {current}/{total} pacchetti{eta_str}")
         if percent >= 100:
-            self._close_transfer_dialog(success=True)
+            self._transfer_label_var.set("100%  —  pacchetti inviati, attendo conferma telefono…")
 
     def _close_transfer_dialog(self, success: bool = True) -> None:
         d = self._transfer_dialog
+        request_id = self._container_transfer_request_id
         if d is None:
             return
         self._transfer_dialog = None
@@ -955,13 +1220,17 @@ class DesktopChatApp:
             pass
         if success:
             self._append_log("System", "➜ Pacchetti inviati. In attesa di conferma di salvataggio dal telefono...")
-            # Auto-activate the container that was just uploaded
-            cid = self._selected_container_id()
+            # Auto-activate the container that was just uploaded.
+            cid = self._container_transfer_container_id_by_request.pop(request_id or "", None) or self._selected_container_id()
             if cid:
                 self._active_container_id = cid
                 c = self._context_store.get(cid)
                 self._append_log("System", f"Container auto-attivato: {c.name if c else cid}")
                 self._refresh_container_list()
+                self._refresh_context_preview()
+        else:
+            if request_id:
+                self._container_transfer_container_id_by_request.pop(request_id, None)
 
 
     def _toggle_pip(self) -> None:
@@ -1241,6 +1510,7 @@ class DesktopChatApp:
         self._overlay_request_ids.discard(request_id)
         self._overlay_started_at.pop(request_id, None)
         self._overlay_last_update_at.pop(request_id, None)
+        self._clear_pending_request(request_id)
         path = self._overlay_image_paths_by_request.pop(request_id, None)
         if path:
             try:
@@ -1554,6 +1824,7 @@ class DesktopChatApp:
         thought_preview = self._streaming_thought_by_session.get(self.active_session_id, "").strip()
         if thought_preview and self.show_thoughts_var.get():
             self._append_log("Thought", f"{thought_preview}\n▌")
+        self._refresh_stop_button()
 
     def on_scan(self) -> None:
         self.devices_list.delete(0, tk.END)
@@ -1756,7 +2027,7 @@ class DesktopChatApp:
         self._overlay_last_update_at[request_id] = now
         if image_path:
             self._overlay_image_paths_by_request[request_id] = image_path
-        self._pending_request_session[request_id] = session_id
+        self._track_pending_request(request_id, session_id)
         self._show_overlay_message(status_text, ttl_ms=0)
         return True
 
@@ -2044,6 +2315,11 @@ class DesktopChatApp:
             parts.append(f"image: {os.path.basename(self.selected_image_path)}")
         if self.selected_pdf_paths:
             parts.append(f"pdfs: {len(self.selected_pdf_paths)}")
+        active_container_name = self._active_container_name()
+        if self._active_container_id and active_container_name:
+            parts.append(f"container: {active_container_name}")
+        elif self._active_container_id:
+            parts.append("container: remote")
         if self.web_search_enabled.get():
             parts.append("web search: on")
         if self.thinking_enabled.get():
@@ -2187,6 +2463,7 @@ class DesktopChatApp:
                 thinking_budget=thinking_budget,
                 include_thoughts=include_thoughts,
                 active_container_id=self._active_container_id,
+                active_container_name=self._active_container_name(),
             )
         except ValueError as exc:
             self._append_log("Error", str(exc))
@@ -2219,11 +2496,26 @@ class DesktopChatApp:
                     self._append_log("System", "Thought trace enabled")
             self._append_log("System", f"Request queued ({request_id})")
 
-        self._pending_request_session[request_id] = session_id
+        self._track_pending_request(request_id, session_id)
         self._refresh_memory_label()
 
         self.prompt_entry.delete("1.0", tk.END)
         self.on_clear_image()
+
+    def on_stop_active_request(self) -> None:
+        request_id = self._latest_pending_request_for_session(self.active_session_id)
+        if request_id is None:
+            self._append_log("System", "Nessuna richiesta attiva da fermare")
+            self._refresh_stop_button()
+            return
+        if not self.connected:
+            self._append_log("System", "Bridge non connesso")
+            return
+        try:
+            self.client.cancel_request(request_id)
+            self._append_log("System", f"Stop requested ({request_id})")
+        except Exception as exc:
+            self._append_log("Error", f"Stop request failed: {exc}")
 
     def _consume_toggle_flag(self) -> None:
         if not self._toggle_flag_path.exists():
@@ -2306,6 +2598,7 @@ class DesktopChatApp:
             if self._overlay_request_ids and isinstance(message, str) and message:
                 self._show_overlay_message(f"Errore bridge: {message}", ttl_ms=8000)
                 self._cleanup_all_overlay_requests()
+            self._clear_all_pending_requests()
             self._append_log("Error", message)
             return
 
@@ -2351,6 +2644,7 @@ class DesktopChatApp:
             if self._overlay_request_ids:
                 self._show_overlay_message("Bridge disconnesso durante Shot+Ask", ttl_ms=8000)
                 self._cleanup_all_overlay_requests()
+            self._clear_all_pending_requests()
             self._append_log("System", "Disconnected")
             return
 
@@ -2425,14 +2719,45 @@ class DesktopChatApp:
                     state = str(message.get("state", "processing")).strip()
                     if state:
                         self._show_overlay_message(state, ttl_ms=0)
+                    if state.lower().startswith("canceled"):
+                        self._cleanup_overlay_request(message_id)
                     return
 
             target_session = self._pending_request_session.get(message_id, self.active_session_id)
 
             if message_type == "container_ack":
                 chunk_count = message.get("chunkCount", "?")
-                self._close_transfer_dialog(success=False)  # dialog already logged via _close
+                container_id = str(message.get("containerId", "")).strip()
+                self._close_transfer_dialog(success=True)
+                if container_id:
+                    self._active_container_id = container_id
+                    self._refresh_container_list()
+                    self._refresh_context_preview()
                 self._append_log("System", f"📱 Container confermato dal telefono ({chunk_count} chunk salvati).")
+                return
+
+            if message_type == "container_list":
+                raw_containers = message.get("containers", [])
+                parsed: list[dict[str, Any]] = []
+                if isinstance(raw_containers, list):
+                    for item in raw_containers:
+                        if not isinstance(item, dict):
+                            continue
+                        cid = str(item.get("id", "")).strip()
+                        name = str(item.get("name", "")).strip()
+                        if not cid:
+                            continue
+                        parsed.append(
+                            {
+                                "id": cid,
+                                "name": name or cid,
+                                "chunkCount": int(item.get("chunkCount", 0) or 0),
+                            }
+                        )
+                self._remote_containers = parsed
+                self._append_log("System", f"Container remoti disponibili: {len(parsed)}")
+                if parsed:
+                    self._open_remote_container_picker()
                 return
 
             if message_type == "status":
@@ -2441,6 +2766,13 @@ class DesktopChatApp:
                     self._append_log("Phone", state)
                 else:
                     self._append_log("System", f"[Other chat] {state}")
+                lowered = state.strip().lower()
+                if message_id and lowered.startswith("canceled"):
+                    self._streaming_preview_by_session.pop(target_session, None)
+                    self._streaming_thought_by_session.pop(target_session, None)
+                    self._clear_pending_request(message_id)
+                    if target_session == self.active_session_id:
+                        self._render_active_chat()
                 return
 
             if message_type == "partial":
@@ -2468,7 +2800,7 @@ class DesktopChatApp:
                 else:
                     self._append_log("System", "Response received in another chat tab")
                 if message_id:
-                    self._pending_request_session.pop(message_id, None)
+                    self._clear_pending_request(message_id)
                 self._refresh_sessions_list(self.active_session_id)
                 self._refresh_memory_label()
                 return
@@ -2483,7 +2815,7 @@ class DesktopChatApp:
                 else:
                     self._append_log("System", "Phone error received in another chat tab")
                 if message_id:
-                    self._pending_request_session.pop(message_id, None)
+                    self._clear_pending_request(message_id)
                 self._refresh_sessions_list(self.active_session_id)
                 return
 
@@ -2562,6 +2894,7 @@ class DesktopChatApp:
         latest_settings["overlay_resizable"] = self._overlay_resizable
         latest_settings["auto_connect_on_start"] = self._auto_connect_on_start
         latest_settings["auto_retry_known_device"] = self._auto_retry_known_device
+        latest_settings["auto_check_updates"] = self._auto_check_updates
         latest_settings["menu_bar_mode_enabled"] = self._menu_bar_mode_enabled
         latest_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
         latest_settings["last_connected_address"] = self._last_connected_address

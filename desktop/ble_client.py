@@ -6,6 +6,7 @@ import gzip
 import io
 import json
 import mimetypes
+import platform
 import threading
 import time
 import uuid
@@ -59,6 +60,7 @@ class BleChatClient:
         self._pending_pings: dict[str, float] = {}
         self._last_pong_monotonic = time.monotonic()
         self._auto_reconnect_enabled = True
+        self._is_windows = platform.system().lower().startswith("windows")
 
     def start(self) -> None:
         if self._thread_started:
@@ -115,6 +117,7 @@ class BleChatClient:
         thinking_budget: int | None = None,
         include_thoughts: bool = False,
         active_container_id: str | None = None,
+        active_container_name: str | None = None,
     ) -> str:
         request_id = str(uuid.uuid4())
         message = {
@@ -131,6 +134,8 @@ class BleChatClient:
             message["thinkingBudget"] = thinking_budget
         if active_container_id is not None:
             message["activeContainerId"] = active_container_id
+        if active_container_name is not None and active_container_name.strip():
+            message["activeContainerName"] = active_container_name.strip()
 
         if context_blocks:
             message["contextBlocks"] = context_blocks
@@ -153,6 +158,16 @@ class BleChatClient:
                 f"Request payload too large ({len(payload)} bytes). "
                 f"Reduce prompt/context/image (max {MAX_REQUEST_BYTES} bytes)."
             )
+        self._run_coro(self._send_payload(payload, request_id))
+        return request_id
+
+    def request_container_list(self) -> str:
+        request_id = str(uuid.uuid4())
+        message = {
+            "type": "list_containers",
+            "messageId": request_id,
+        }
+        payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         self._run_coro(self._send_payload(payload, request_id))
         return request_id
 
@@ -194,6 +209,20 @@ class BleChatClient:
                 f"Split into smaller containers."
             )
         self._run_coro(self._send_payload(payload, request_id, reliable=True))
+        return request_id
+
+    def cancel_request(self, target_message_id: str) -> str:
+        target_id = target_message_id.strip()
+        if not target_id:
+            raise ValueError("target_message_id is required")
+        request_id = str(uuid.uuid4())
+        message = {
+            "type": "cancel",
+            "messageId": request_id,
+            "targetMessageId": target_id,
+        }
+        payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        self._run_coro(self._send_payload(payload, request_id))
         return request_id
 
     def _run_loop(self) -> None:
@@ -419,14 +448,19 @@ class BleChatClient:
             self._emit({"type": "status", "text": f"Sending large payload ({packet_count} BLE packets)..."})
 
         try:
-            throttle_every = 12 if packet_count > 140 else 5
-            throttle_delay = 0.0015 if packet_count > 140 else 0.003
+            if self._is_windows:
+                throttle_every = 16 if packet_count > 140 else 8
+                throttle_delay = 0.0008 if packet_count > 140 else 0.0012
+            else:
+                throttle_every = 12 if packet_count > 140 else 5
+                throttle_delay = 0.0015 if packet_count > 140 else 0.003
             progress_step = max(packet_count // 12, 1)
+            use_write_response = reliable or (self._is_windows and packet_count <= 8)
 
             for idx, packet in enumerate(packets, start=1):
                 try:
-                    # If reliable=True, force response=True for guaranteed delivery
-                    await client.write_gatt_char(WRITE_CHAR_UUID, packet, response=reliable)
+                    # Windows often has lower jitter for small control packets with write response.
+                    await client.write_gatt_char(WRITE_CHAR_UUID, packet, response=use_write_response)
                 except BleakError:
                     await client.write_gatt_char(WRITE_CHAR_UUID, packet, response=True)
 
@@ -442,7 +476,7 @@ class BleChatClient:
                         }
                     )
 
-                if not reliable and idx % throttle_every == 0:
+                if not use_write_response and idx % throttle_every == 0:
                     await asyncio.sleep(throttle_delay)
 
             if emit_sent_event:

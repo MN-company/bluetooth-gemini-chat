@@ -22,6 +22,7 @@ python3 -m PyInstaller \
   --name "$APP_NAME" \
   --paths "$ROOT_DIR/desktop" \
   --collect-submodules bleak \
+  --collect-submodules pystray \
   --add-data "$ROOT_DIR/desktop/install_macos_quick_action.py:." \
   --add-data "$ROOT_DIR/desktop/macos_quick_ask.sh:." \
   --add-data "$ROOT_DIR/desktop/macos_quick_ask.py:." \
@@ -29,6 +30,17 @@ python3 -m PyInstaller \
 
 if [ -d "$ROOT_DIR/dist/$APP_NAME.app" ]; then
   echo "Build macOS pronta: $ROOT_DIR/dist/$APP_NAME.app"
+  mkdir -p "$ROOT_DIR/dist/dmg-root"
+  rm -rf "$ROOT_DIR/dist/dmg-root/$APP_NAME.app" "$ROOT_DIR/dist/dmg-root/Applications"
+  cp -R "$ROOT_DIR/dist/$APP_NAME.app" "$ROOT_DIR/dist/dmg-root/"
+  ln -s /Applications "$ROOT_DIR/dist/dmg-root/Applications"
+  hdiutil create \
+    -volname "$APP_NAME" \
+    -srcfolder "$ROOT_DIR/dist/dmg-root" \
+    -ov \
+    -format UDZO \
+    "$ROOT_DIR/dist/$APP_NAME-macos.dmg"
+  echo "DMG pronta: $ROOT_DIR/dist/$APP_NAME-macos.dmg"
 elif [ -d "$ROOT_DIR/dist/$APP_NAME" ]; then
   echo "Build desktop pronta: $ROOT_DIR/dist/$APP_NAME"
 else
