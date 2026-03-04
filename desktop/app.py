@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import platform
 import queue
@@ -129,7 +130,7 @@ MODEL_PRESETS = [
     "gemini-2.0-pro-exp",
 ]
 
-APP_VERSION = "0.1.11"
+APP_VERSION = "0.1.12"
 GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
 
 
@@ -158,7 +159,7 @@ class DesktopChatApp:
         self.root = CTkinterDnD()
         self.root.title("Gemini BLE Chat")
         self.root.geometry("1240x780")
-        self.root.minsize(300, 400)
+        self.root.minsize(980, 640)
         self._dnd_available = False
         if TkinterDnD is not None:
             try:
@@ -196,7 +197,8 @@ class DesktopChatApp:
         self._md_link_urls: dict[str, str] = {}
         self._pip_mode_active = False
         self._pre_pip_geometry = ""
-        self._is_macos = platform.system().lower() == "darwin"
+        self._platform_name = platform.system().lower()
+        self._is_macos = self._platform_name == "darwin"
         self._overlay_listener: Any | None = None
         self._overlay_hotkey = "Apple Shortcut (Cmd+Shift+G)" if self._is_macos else "Ctrl+Shift+G"
         self._overlay_request_ids: set[str] = set()
@@ -204,6 +206,7 @@ class DesktopChatApp:
         self._overlay_started_at: dict[str, float] = {}
         self._overlay_last_update_at: dict[str, float] = {}
         self._overlay_timeout_seconds = 95.0
+        self._overlay_idle_timeout_seconds = 22.0
         self._overlay_last_present_at = 0.0
         self._overlay_hide_after_id: str | None = None
         self._overlay_window: tk.Toplevel | None = None
@@ -219,6 +222,7 @@ class DesktopChatApp:
         self.system_instructions_var = tk.StringVar(value=_saved.get("system_instructions", ""))
         self.pinned_pdf_paths: list[str] = _saved.get("pinned_pdf_paths", [])
         self._last_connected_address = str(_saved.get("last_connected_address", "")).strip() or None
+        self._last_connected_bridge_id = self._normalize_bridge_id(_saved.get("last_connected_bridge_id"))
         self._auto_connect_on_start = bool(_saved.get("auto_connect_on_start", True))
         self._auto_retry_known_device = bool(_saved.get("auto_retry_known_device", True))
         self._auto_check_updates = bool(_saved.get("auto_check_updates", True))
@@ -228,6 +232,9 @@ class DesktopChatApp:
         self._overlay_width = self._parse_int_setting(_saved.get("overlay_width"), 460, 320, 1280)
         self._overlay_height = self._parse_int_setting(_saved.get("overlay_height"), 220, 160, 900)
         self._overlay_resizable = bool(_saved.get("overlay_resizable", True))
+        self._overlay_timeout_seconds = float(
+            self._parse_int_setting(_saved.get("overlay_timeout_seconds"), int(self._overlay_timeout_seconds), 30, 240)
+        )
         self._tray_icon: Any | None = None
         self._tray_thread: threading.Thread | None = None
         self._mac_status_item: Any | None = None
@@ -290,252 +297,235 @@ class DesktopChatApp:
 
 
     def _build_ui(self) -> None:
-        # Main grid setup: 2 rows (Header, Content), 2 cols (Sidebar, Chat)
-        self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(1, weight=1)
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
 
-        # --- HEADER (Row 0, spans 2 cols originally, but we'll put it in a frame that spans) ---
         self.header_frame = ctk.CTkFrame(self.root, fg_color="transparent")
-        self.header_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=8)
-        self.header_frame.columnconfigure(1, weight=1) # filler
-        
-        # Header Left: Model, Add PDF, Clipboard, Screenshot
-        header_left = ctk.CTkFrame(self.header_frame, fg_color="transparent")
-        header_left.grid(row=0, column=0, sticky="w")
-        
-        self.model_var = tk.StringVar(value=MODEL_PRESETS[0])
-        self.model_combo = ctk.CTkComboBox(
-            header_left,
-            variable=self.model_var,
-            values=MODEL_PRESETS,
-            state="readonly",
-            command=lambda _: self._refresh_context_preview(),
-            width=160
-        )
-        self.model_combo.pack(side=tk.LEFT, padx=(0, 10))
-        
-        ctk.CTkButton(header_left, text="ADD PDF", command=self.on_add_pdf, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT, padx=(0, 6))
-        ctk.CTkButton(header_left, text="CLIPBOARD", command=self.on_clipboard_send, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT, padx=(0, 6))
-        ctk.CTkButton(header_left, text="SCREENSHOT", command=self.on_quick_screenshot, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=80).pack(side=tk.LEFT, padx=(0, 6))
-        ctk.CTkButton(header_left, text="UPDATE", command=lambda: self.on_check_updates(background=False), fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=70).pack(side=tk.LEFT, padx=(0, 6))
-        ctk.CTkButton(header_left, text="⚙️", command=self.on_open_settings, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0", width=30).pack(side=tk.LEFT)
+        self.header_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        self.header_frame.columnconfigure(0, weight=0, minsize=300)
+        self.header_frame.columnconfigure(1, weight=1, minsize=520)
+        self.header_frame.columnconfigure(2, weight=0, minsize=390)
+        self.header_frame.rowconfigure(0, weight=1)
 
-        # Header Right: Device Name / Connection info
-        header_right = ctk.CTkFrame(self.header_frame, fg_color="transparent")
-        header_right.grid(row=0, column=2, sticky="e")
-        
-        self.status_var = tk.StringVar(value="Not connected")
-        self.link_var = tk.StringVar(value="Link: n/a")
-        
-        status_card = ctk.CTkFrame(header_right, border_width=1, border_color="#333333", fg_color="#1c1c1c")
-        status_card.pack(side=tk.RIGHT)
-        
-        ctk.CTkLabel(status_card, textvariable=self.status_var, font=("Avenir", 12, "bold")).pack(anchor=tk.E, padx=10, pady=(6, 0))
-        ctk.CTkLabel(status_card, textvariable=self.link_var, font=("Avenir", 10), text_color="#a1a1a1").pack(anchor=tk.E, padx=10, pady=(0, 6))
+        # Left panel: chats + context library
+        self.sidebar_frame = ctk.CTkFrame(self.header_frame)
+        self.sidebar_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
+        chats_head = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        chats_head.pack(fill=tk.X, padx=10, pady=(10, 6))
+        ctk.CTkLabel(chats_head, text="CHATS", font=("Avenir", 16, "bold")).pack(side=tk.LEFT)
+        ctk.CTkButton(chats_head, text="Settings", width=84, command=self.on_open_settings).pack(side=tk.RIGHT)
 
-        # --- SIDEBAR (Row 1, Col 0) ---
-        self.sidebar_frame = ctk.CTkFrame(self.root, width=310, fg_color="transparent")
-        self.sidebar_frame.grid(row=1, column=0, sticky="ns", padx=(12, 6), pady=(0, 12))
-        self.sidebar_frame.grid_propagate(False)
-        
-        # Chats header
-        chats_header = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        chats_header.pack(fill=tk.X, pady=(0, 6))
-        ctk.CTkLabel(chats_header, text="chats", font=("Avenir", 18)).pack(side=tk.LEFT)
-        ctk.CTkButton(chats_header, text="+", command=self.on_new_chat, width=30, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0").pack(side=tk.RIGHT)
+        chat_actions = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        chat_actions.pack(fill=tk.X, padx=10, pady=(0, 6))
+        ctk.CTkButton(chat_actions, text="New", width=72, command=self.on_new_chat).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(chat_actions, text="Rename", width=82, command=self.on_rename_chat).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(chat_actions, text="Delete", width=72, fg_color="#442323", hover_color="#5c2b2b", command=self.on_delete_chat).pack(side=tk.LEFT)
 
-        # Chat Search
         self.search_var = tk.StringVar()
         self.search_entry = ctk.CTkEntry(
             self.sidebar_frame,
             textvariable=self.search_var,
-            placeholder_text="Cerca chat...",
-            height=28,
-            font=("Avenir", 12),
-            fg_color="#1c1c1c",
-            border_width=1,
-            border_color="#333333"
+            placeholder_text="Search chat...",
+            height=30,
         )
-        self.search_entry.pack(fill=tk.X, pady=(0, 6))
-        self.search_entry.bind("<KeyRelease>", lambda e: self._refresh_sessions_list(self.active_session_id))
+        self.search_entry.pack(fill=tk.X, padx=10, pady=(0, 6))
+        self.search_entry.bind("<KeyRelease>", lambda _e: self._refresh_sessions_list(self.active_session_id))
 
-        # Chats listbox
         self.chats_list = tk.Listbox(
             self.sidebar_frame,
-            bg="#1c1c1c",
-            fg="#e0e0e0",
+            bg="#161a22",
+            fg="#f1f5f9",
             selectbackground="#1f538d",
             activestyle=tk.NONE,
             borderwidth=1,
             relief=tk.SOLID,
             highlightthickness=0,
+            height=16,
         )
-        self.chats_list.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        self.chats_list.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
         self.chats_list.bind("<<ListboxSelect>>", self._on_session_selected)
 
-        # --- Knowledge Base Container Panel ---
-        separator = ctk.CTkFrame(self.sidebar_frame, height=1, fg_color="#2a2a2a")
-        separator.pack(fill=tk.X, pady=(6, 8))
-
-        kb_header = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        kb_header.pack(fill=tk.X, pady=(0, 4))
-        ctk.CTkLabel(kb_header, text="📚 Libreria", font=("Avenir", 14, "bold"), text_color="#b0b0b0").pack(side=tk.LEFT)
-        ctk.CTkButton(
-            kb_header, text="＋ Nuovo", command=self._on_create_container,
-            width=72, height=24, fg_color="#1f538d", hover_color="#2a6bc7",
-            text_color="white", font=("Avenir", 11),
-        ).pack(side=tk.RIGHT)
-
+        context_card = ctk.CTkFrame(self.sidebar_frame)
+        context_card.pack(fill=tk.BOTH, padx=10, pady=(0, 10))
+        ctk.CTkLabel(context_card, text="CONTEXT LIBRARY", font=("Avenir", 13, "bold")).pack(anchor=tk.W, padx=8, pady=(8, 4))
         self.container_list = tk.Listbox(
-            self.sidebar_frame,
-            bg="#181818",
-            fg="#cccccc",
+            context_card,
+            bg="#161a22",
+            fg="#dbe3ed",
             selectbackground="#1e5c1e",
             selectforeground="#ffffff",
             activestyle=tk.NONE,
             borderwidth=1,
             relief=tk.SOLID,
             highlightthickness=0,
-            height=5,
-            font=("Avenir", 12),
+            height=6,
+            font=("Avenir", 11),
         )
-        self.container_list.pack(fill=tk.X, pady=(0, 4))
+        self.container_list.pack(fill=tk.X, padx=8, pady=(0, 6))
         self.container_list.bind("<<ListboxSelect>>", self._on_container_list_click)
         self.container_list.bind("<Double-Button-1>", self._on_activate_container)
 
-        # Row 1: Add PDF | Attiva | Upload
-        kb_row1 = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        kb_row1.pack(fill=tk.X, pady=(0, 3))
-        ctk.CTkButton(
-            kb_row1, text="📎 Aggiungi PDF", command=self._on_add_pdf_to_container,
-            height=30, fg_color="transparent", border_width=1, border_color="#444",
-            hover_color="#2a2a2a", text_color="#e0e0e0", font=("Avenir", 11),
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
-        ctk.CTkButton(
-            kb_row1, text="✓ Attiva", command=self._on_activate_container,
-            width=68, height=30, fg_color="#1e5c1e", hover_color="#2a7a2a",
-            text_color="white", font=("Avenir", 11),
-        ).pack(side=tk.LEFT, padx=(0, 3))
-        ctk.CTkButton(
-            kb_row1, text="📤", command=self._on_upload_container,
-            width=34, height=30, fg_color="transparent", border_width=1, border_color="#444",
-            hover_color="#2a2a2a", text_color="#d0d0d0", font=("Avenir", 13),
-        ).pack(side=tk.LEFT)
-        ctk.CTkButton(
-            kb_row1, text="☁", command=self._on_sync_remote_containers,
-            width=34, height=30, fg_color="transparent", border_width=1, border_color="#444",
-            hover_color="#2a2a2a", text_color="#d0d0d0", font=("Avenir", 13),
-        ).pack(side=tk.LEFT, padx=(3, 0))
+        kb_row1 = ctk.CTkFrame(context_card, fg_color="transparent")
+        kb_row1.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ctk.CTkButton(kb_row1, text="Browse PDF", height=28, command=self._on_add_pdf_to_container).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        ctk.CTkButton(kb_row1, text="Activate", width=74, height=28, command=self._on_activate_container).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(kb_row1, text="Upload", width=70, height=28, command=self._on_upload_container).pack(side=tk.LEFT)
 
-        # Row 2: Active indicator + Delete
-        kb_row2 = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        kb_row2.pack(fill=tk.X, pady=(0, 8))
-        self._kb_active_label = ctk.CTkLabel(
-            kb_row2, text="nessun container attivo",
-            font=("Avenir", 10), text_color="#555555",
-        )
-        self._kb_active_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ctk.CTkButton(
-            kb_row2, text="🗑", command=self._on_delete_container,
-            width=30, height=24, fg_color="transparent", border_width=1, border_color="#5c1a1a",
-            hover_color="#5c1a1a", text_color="#e0e0e0", font=("Avenir", 12),
-        ).pack(side=tk.RIGHT)
+        kb_row2 = ctk.CTkFrame(context_card, fg_color="transparent")
+        kb_row2.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ctk.CTkButton(kb_row2, text="Remote", width=72, height=26, command=self._on_sync_remote_containers).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(kb_row2, text="New", width=62, height=26, command=self._on_create_container).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(kb_row2, text="Delete", width=68, height=26, fg_color="#442323", hover_color="#5c2b2b", command=self._on_delete_container).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(kb_row2, text="Clear Mem", width=84, height=26, command=self.on_clear_memory).pack(side=tk.LEFT)
 
+        self._kb_active_label = ctk.CTkLabel(context_card, text="nessun container attivo", text_color="#74839a", font=("Avenir", 10))
+        self._kb_active_label.pack(fill=tk.X, padx=8, pady=(0, 8))
         self._refresh_container_list()
-        
-        # Extra tool buttons collapsed at bottom of sidebar since sketch didn't strictly place them
-        self._build_button_grid(
-            self.sidebar_frame,
-            [
-                ("Rename", self.on_rename_chat),
-                ("Delete", self.on_delete_chat),
-                ("Scan", self.on_scan),
-                ("Connect", self.on_connect),
-                ("Disconnect", self.on_disconnect),
-                ("Clear Mem", self.on_clear_memory),
-                ("Shot+Ask", self.on_hotkey_overlay_triggered),
-                ("Clip+Ask", self.on_hotkey_clipboard_triggered),
-            ],
-            columns=2,
-            pady=(8, 8),
-        )
-        
-        self.devices_list = tk.Listbox(
-            self.sidebar_frame, height=3, bg="#1c1c1c", fg="#e0e0e0", selectbackground="#1f538d", activestyle=tk.NONE, borderwidth=1, relief=tk.SOLID, highlightthickness=0,
-        )
-        self.devices_list.pack(fill=tk.X, pady=(0, 6))
-        ctk.CTkLabel(
-            self.sidebar_frame,
-            text=f"Trigger: {self._overlay_hotkey}",
-            text_color="#a1a1a1",
-            font=("Avenir", 10),
-        ).pack(anchor=tk.W, pady=(0, 6))
 
+        # Middle panel: chat stream
+        self.chat_area_frame = ctk.CTkFrame(self.header_frame)
+        self.chat_area_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
 
-        # --- MAIN CHAT AREA (Row 1, Col 1) ---
-        self.chat_area_frame = ctk.CTkFrame(self.root, fg_color="transparent")
-        self.chat_area_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 12), pady=(0, 12))
-        
-        # Chat card
-        chat_card = ctk.CTkFrame(self.chat_area_frame, fg_color="#1e1e1e", border_width=1, border_color="#333333")
-        chat_card.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
-        
+        stream_head = ctk.CTkFrame(self.chat_area_frame, fg_color="transparent")
+        stream_head.pack(fill=tk.X, padx=10, pady=(10, 6))
+        ctk.CTkLabel(stream_head, text="CHAT", font=("Avenir", 16, "bold")).pack(side=tk.LEFT)
+        self.memory_var = tk.StringVar(value="")
+        ctk.CTkLabel(stream_head, textvariable=self.memory_var, font=("Avenir", 11), text_color="#8ea0b8").pack(side=tk.RIGHT)
+
         self.chat_log = ctk.CTkTextbox(
-            chat_card,
+            self.chat_area_frame,
             wrap=tk.WORD,
             state="disabled",
-            fg_color="transparent",
-            text_color="#e0e0e0",
-            font=("Avenir", 13)
+            fg_color="#0f1724",
+            text_color="#e8edf5",
+            border_width=1,
+            border_color="#2a3444",
+            font=("Avenir", 13),
         )
-        self.chat_log.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        self.chat_log.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         self._configure_chat_tags()
 
-        # Context indicators & Toggles row
-        toggles_row = ctk.CTkFrame(self.chat_area_frame, fg_color="transparent")
-        toggles_row.pack(fill=tk.X, pady=(0, 6))
-        
+        # Right panel: bridge + composer
+        right_panel = ctk.CTkFrame(self.header_frame)
+        right_panel.grid(row=0, column=2, sticky="nsew")
+
+        bridge_card = ctk.CTkFrame(right_panel)
+        bridge_card.pack(fill=tk.X, padx=10, pady=(10, 8))
+        bridge_top = ctk.CTkFrame(bridge_card, fg_color="transparent")
+        bridge_top.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ctk.CTkLabel(bridge_top, text="BRIDGE", font=("Avenir", 14, "bold")).pack(side=tk.LEFT)
+        ctk.CTkButton(bridge_top, text="Update", width=70, command=lambda: self.on_check_updates(background=False)).pack(side=tk.RIGHT)
+
+        self.status_var = tk.StringVar(value="Not connected")
+        self.link_var = tk.StringVar(value="Link: n/a")
+        ctk.CTkLabel(bridge_card, textvariable=self.status_var, font=("Avenir", 12, "bold")).pack(anchor=tk.W, padx=10)
+        ctk.CTkLabel(bridge_card, textvariable=self.link_var, text_color="#9aa7bc", font=("Avenir", 11)).pack(anchor=tk.W, padx=10, pady=(0, 6))
+
+        bridge_actions = ctk.CTkFrame(bridge_card, fg_color="transparent")
+        bridge_actions.pack(fill=tk.X, padx=10, pady=(0, 6))
+        ctk.CTkButton(bridge_actions, text="Scan", width=72, command=self.on_scan).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(bridge_actions, text="Connect", width=78, command=self.on_connect).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(bridge_actions, text="Disconnect", width=88, command=self.on_disconnect).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(bridge_actions, text="Reconnect", width=86, command=self._reconnect_last_or_selected).pack(side=tk.LEFT)
+
+        self.devices_list = tk.Listbox(
+            bridge_card,
+            height=5,
+            bg="#161a22",
+            fg="#e9eef7",
+            selectbackground="#1f538d",
+            activestyle=tk.NONE,
+            borderwidth=1,
+            relief=tk.SOLID,
+            highlightthickness=0,
+        )
+        self.devices_list.pack(fill=tk.X, padx=10, pady=(0, 6))
+        ctk.CTkLabel(
+            bridge_card,
+            text=f"Shot+Ask trigger: {self._overlay_hotkey}",
+            text_color="#8ea0b8",
+            font=("Avenir", 10),
+        ).pack(anchor=tk.W, padx=10, pady=(0, 8))
+
+        composer_card = ctk.CTkFrame(right_panel)
+        composer_card.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        model_row = ctk.CTkFrame(composer_card, fg_color="transparent")
+        model_row.pack(fill=tk.X, padx=10, pady=(10, 6))
+        self.model_var = tk.StringVar(value=MODEL_PRESETS[0])
+        self.model_combo = ctk.CTkComboBox(
+            model_row,
+            variable=self.model_var,
+            values=MODEL_PRESETS,
+            state="readonly",
+            width=220,
+            command=lambda _v: self._refresh_context_preview(),
+        )
+        self.model_combo.pack(side=tk.LEFT)
+        ctk.CTkButton(model_row, text="Set Default", width=88, command=self._set_phone_default_model).pack(side=tk.RIGHT)
+
+        toggles_row = ctk.CTkFrame(composer_card, fg_color="transparent")
+        toggles_row.pack(fill=tk.X, padx=10, pady=(0, 6))
         self.web_search_enabled = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(toggles_row, text="WEBSEARCH", variable=self.web_search_enabled, command=self._refresh_context_preview).pack(side=tk.LEFT, padx=(0, 12))
         self.thinking_enabled = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(toggles_row, text="THINKING", variable=self.thinking_enabled, command=self._refresh_context_preview).pack(side=tk.LEFT, padx=(0, 12))
-        
         self.pip_enabled = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(toggles_row, text="PiP MODE", variable=self.pip_enabled, command=self._toggle_pip).pack(side=tk.LEFT)
-        
-        # Hidden variables for thinking budget since they were in older UI
         self.thinking_auto_var = tk.BooleanVar(value=False)
         self.thinking_budget_var = tk.StringVar(value="1024")
         self.show_thoughts_var = tk.BooleanVar(value=True)
 
-        self.context_preview_var = tk.StringVar(value="No active attachments")
-        ctk.CTkLabel(toggles_row, textvariable=self.context_preview_var, text_color="#a1a1a1", font=("Avenir", 11)).pack(side=tk.RIGHT)
+        ctk.CTkCheckBox(toggles_row, text="WEB", variable=self.web_search_enabled, command=self._refresh_context_preview).pack(side=tk.LEFT, padx=(0, 8))
+        ctk.CTkCheckBox(toggles_row, text="THINK", variable=self.thinking_enabled, command=self._refresh_context_preview).pack(side=tk.LEFT, padx=(0, 8))
+        ctk.CTkCheckBox(toggles_row, text="PiP", variable=self.pip_enabled, command=self._toggle_pip).pack(side=tk.LEFT, padx=(0, 8))
+        ctk.CTkEntry(toggles_row, textvariable=self.thinking_budget_var, width=64, placeholder_text="1024").pack(side=tk.LEFT, padx=(0, 6))
+        ctk.CTkCheckBox(toggles_row, text="Auto", variable=self.thinking_auto_var, command=self._refresh_context_preview).pack(side=tk.LEFT, padx=(0, 6))
+        ctk.CTkCheckBox(toggles_row, text="Trace", variable=self.show_thoughts_var, command=self._refresh_context_preview).pack(side=tk.LEFT)
 
-        # Input Row
-        input_row = ctk.CTkFrame(self.chat_area_frame, fg_color="transparent")
-        input_row.pack(fill=tk.X)
-        
         self.prompt_entry = ctk.CTkTextbox(
-            input_row,
-            height=60,
+            composer_card,
+            height=210,
             wrap=tk.WORD,
-            fg_color="#1e1e1e",
-            text_color="#e0e0e0",
+            fg_color="#0f1724",
+            text_color="#e8edf5",
             border_width=1,
-            border_color="#333333",
-            font=("Avenir", 13)
+            border_color="#2a3444",
+            font=("Avenir", 13),
         )
-        self.prompt_entry.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.prompt_entry.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
         self.prompt_entry.bind("<Return>", self._on_prompt_return)
         self.prompt_entry.bind("<KeyRelease>", self._adjust_input_height)
         self.prompt_entry.bind("<Command-BackSpace>", self._on_clear_composer_hotkey)
         self.prompt_entry.bind("<Command-Delete>", self._on_clear_composer_hotkey)
 
-        send_btn = ctk.CTkButton(input_row, text="SEND", command=self.on_send, fg_color="#1e1e1e", border_width=1, border_color="#333333", hover_color="#333333", text_color="#e0e0e0", width=80)
-        send_btn.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
+        context_actions = ctk.CTkFrame(composer_card, fg_color="transparent")
+        context_actions.pack(fill=tk.X, padx=10, pady=(0, 6))
+        ctk.CTkButton(context_actions, text="Attach Image", width=100, command=self.on_attach_image).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(context_actions, text="Screenshot", width=96, command=self.on_quick_screenshot).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(context_actions, text="Clipboard", width=90, command=self.on_clipboard_send).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(context_actions, text="Add PDF", width=86, command=self.on_add_pdf).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(context_actions, text="Clear Img", width=78, command=self.on_clear_image).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(context_actions, text="Clear PDFs", width=84, command=self.on_clear_pdf).pack(side=tk.LEFT)
+
+        quick_row = ctk.CTkFrame(composer_card, fg_color="transparent")
+        quick_row.pack(fill=tk.X, padx=10, pady=(0, 4))
+        ctk.CTkButton(quick_row, text="Shot+Ask", width=98, command=self.on_hotkey_overlay_triggered).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(quick_row, text="Clip+Ask", width=98, command=self.on_hotkey_clipboard_triggered).pack(side=tk.LEFT, padx=(0, 4))
+        ctk.CTkButton(quick_row, text="Ask Clipboard", width=110, command=self.on_clipboard_send).pack(side=tk.LEFT)
+
+        self.context_preview_var = tk.StringVar(value="No active attachments")
+        ctk.CTkLabel(
+            composer_card,
+            textvariable=self.context_preview_var,
+            text_color="#90a0b8",
+            font=("Avenir", 10),
+            justify=tk.LEFT,
+            anchor=tk.W,
+        ).pack(fill=tk.X, padx=10, pady=(0, 6))
+
+        send_row = ctk.CTkFrame(composer_card, fg_color="transparent")
+        send_row.pack(fill=tk.X, padx=10, pady=(0, 10))
         self.stop_btn = ctk.CTkButton(
-            input_row,
+            send_row,
             text="STOP",
             command=self.on_stop_active_request,
             fg_color="#3a1c1c",
@@ -543,25 +533,21 @@ class DesktopChatApp:
             border_color="#5a2d2d",
             hover_color="#5a2d2d",
             text_color="#f5d0d0",
-            width=72,
+            width=88,
             state="disabled",
         )
-        self.stop_btn.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
+        self.stop_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        ctk.CTkButton(send_row, text="SEND", width=92, command=self.on_send).pack(side=tk.RIGHT)
 
-        # Hidden variables to preserve underlying logic
         self.image_var = tk.StringVar(value="Image: none")
         self.pdf_var = tk.StringVar(value="PDF: none")
-        self.memory_var = tk.StringVar(value="")
-        
+
         self.root.bind("<Configure>", self._on_window_resize)
-        
-        # --- GLOBAL HOTKEYS BINDING ---
-        self.root.bind("<Command-n>", lambda e: [self.on_new_chat(), self.prompt_entry.focus()])
-        self.root.bind("<Command-r>", lambda e: self.on_rename_chat())
+        self.root.bind("<Command-n>", lambda _e: [self.on_new_chat(), self.prompt_entry.focus()])
+        self.root.bind("<Command-r>", lambda _e: self.on_rename_chat())
         self.root.bind("<Command-BackSpace>", self._on_global_backspace_hotkey)
-        self.root.bind("<Command-k>", lambda e: self.search_entry.focus())
-        self.root.bind("<Command-f>", lambda e: self.search_entry.focus())
-        
+        self.root.bind("<Command-k>", lambda _e: self.search_entry.focus())
+        self.root.bind("<Command-f>", lambda _e: self.search_entry.focus())
         self._is_compact_mode = False
 
     def _on_global_backspace_hotkey(self, event) -> str | None:
@@ -595,6 +581,28 @@ class DesktopChatApp:
         if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
             return value
         return fallback
+
+    def _normalize_bridge_id(self, raw: Any) -> str | None:
+        if not isinstance(raw, str):
+            return None
+        clean = "".join(ch for ch in raw.strip().upper() if ch in "0123456789ABCDEF")
+        if len(clean) < 6:
+            return None
+        return clean[:12]
+
+    def _format_device_label(self, device: dict[str, Any]) -> str:
+        name = str(device.get("name", "Gemini Bridge")).strip() or "Gemini Bridge"
+        address = str(device.get("address", "")).strip()
+        bridge_id = self._normalize_bridge_id(device.get("bridge_id"))
+        if bridge_id:
+            short = bridge_id[-6:]
+            return f"{name}  #{short}  ({address})"
+        return f"{name} ({address})"
+
+    def _connect_with_hint(self, address: str | None, bridge_id: str | None) -> None:
+        normalized_bridge = self._normalize_bridge_id(bridge_id)
+        safe_address = str(address or "").strip()
+        self.client.connect(safe_address, bridge_id=normalized_bridge)
 
     def _save_settings(self, data: dict[str, Any]) -> None:
         try:
@@ -1047,10 +1055,11 @@ class DesktopChatApp:
             return
         if self.connected:
             return
-        if not self._last_connected_address:
+        if not self._last_connected_address and not self._last_connected_bridge_id:
             return
-        self._append_log("System", f"Auto-connect to known bridge: {self._last_connected_address}")
-        self.client.connect(self._last_connected_address)
+        target = self._last_connected_bridge_id or self._last_connected_address or "known bridge"
+        self._append_log("System", f"Auto-connect to known bridge: {target}")
+        self._connect_with_hint(self._last_connected_address, self._last_connected_bridge_id)
 
     def _create_menu_bar_icon_image(self) -> Any | None:
         if PILImage is None or ImageDraw is None:
@@ -1224,48 +1233,52 @@ class DesktopChatApp:
         if selected:
             idx = selected[0]
             if 0 <= idx < len(self.devices):
-                self.client.connect(self.devices[idx]["address"])
+                device = self.devices[idx]
+                self._connect_with_hint(
+                    str(device.get("address", "")).strip(),
+                    self._normalize_bridge_id(device.get("bridge_id")),
+                )
                 return
-        if self._last_connected_address:
-            self.client.connect(self._last_connected_address)
+        if self._last_connected_address or self._last_connected_bridge_id:
+            self._connect_with_hint(self._last_connected_address, self._last_connected_bridge_id)
 
     def on_open_settings(self) -> None:
         dialog = ctk.CTkToplevel(self.root)
         dialog.title("Settings")
-        dialog.geometry("560x700")
+        dialog.geometry("760x700")
         dialog.transient(self.root)
         dialog.grab_set()
+        outer = ctk.CTkFrame(dialog, fg_color="transparent")
+        outer.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        scroll = ctk.CTkScrollableFrame(outer)
+        scroll.pack(fill=tk.BOTH, expand=True)
 
-        # --- Section 1: System Instructions ---
-        ctk.CTkLabel(dialog, text="System Instructions (Global Prompt):", font=("Avenir", 14, "bold")).pack(pady=(12, 4), padx=12, anchor=tk.W)
-        ctk.CTkLabel(dialog, text="Iniettate silenziosamente in ogni richiesta.", font=("Avenir", 11), text_color="#888888").pack(padx=12, anchor=tk.W)
-
-        textbox = ctk.CTkTextbox(dialog, height=120, font=("Avenir", 13), fg_color="#1e1e1e", border_width=1, border_color="#333333")
-        textbox.pack(fill=tk.X, padx=12, pady=(6, 12))
+        ctk.CTkLabel(scroll, text="System Prompt", font=("Avenir", 15, "bold")).pack(anchor=tk.W, padx=8, pady=(8, 4))
+        ctk.CTkLabel(scroll, text="Aggiunto a ogni richiesta.", text_color="#8ea0b8").pack(anchor=tk.W, padx=8)
+        textbox = ctk.CTkTextbox(scroll, height=130, font=("Avenir", 13))
+        textbox.pack(fill=tk.X, padx=8, pady=(6, 12))
         textbox.insert("1.0", self.system_instructions_var.get())
 
-        # --- Section 2: Pinned PDFs ---
-        ctk.CTkLabel(dialog, text="📚 Documenti Fissi (PDF sempre attivi):", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
-        ctk.CTkLabel(dialog, text="Allegati automaticamente ad ogni messaggio senza doverli ricaricare.", font=("Avenir", 11), text_color="#888888").pack(padx=12, anchor=tk.W)
-
+        ctk.CTkLabel(scroll, text="Pinned PDFs", font=("Avenir", 15, "bold")).pack(anchor=tk.W, padx=8, pady=(0, 4))
         pinned_list_var = tk.Variable(value=list(self.pinned_pdf_paths))
         pdf_listbox = tk.Listbox(
-            dialog,
+            scroll,
             listvariable=pinned_list_var,
-            height=5,
-            bg="#1e1e1e",
-            fg="#dddddd",
+            height=6,
+            bg="#121720",
+            fg="#d8e0eb",
             selectbackground="#1f538d",
-            borderwidth=0,
+            borderwidth=1,
+            relief=tk.SOLID,
             highlightthickness=0,
             font=("Avenir", 12),
         )
-        pdf_listbox.pack(fill=tk.X, padx=12, pady=(6, 4))
+        pdf_listbox.pack(fill=tk.X, padx=8, pady=(2, 6))
 
         def add_pdf() -> None:
-            from tkinter import filedialog
             paths = filedialog.askopenfilenames(
-                parent=dialog, title="Seleziona PDF",
+                parent=dialog,
+                title="Seleziona PDF",
                 filetypes=[("PDF", "*.pdf"), ("All Files", "*")],
             )
             current = list(pinned_list_var.get())
@@ -1281,48 +1294,33 @@ class DesktopChatApp:
                 del current[i]
             pinned_list_var.set(current)
 
-        pdf_btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-        pdf_btn_row.pack(fill=tk.X, padx=12, pady=(0, 12))
-        ctk.CTkButton(pdf_btn_row, text="+ Aggiungi PDF", command=add_pdf, width=120, fg_color="#1f538d").pack(side=tk.LEFT, padx=(0, 8))
-        ctk.CTkButton(pdf_btn_row, text="− Rimuovi selezionato", command=remove_pdf, width=160, fg_color="transparent", border_width=1, hover_color="#333333").pack(side=tk.LEFT)
+        pdf_btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        pdf_btn_row.pack(fill=tk.X, padx=8, pady=(0, 12))
+        ctk.CTkButton(pdf_btn_row, text="Browse PDF", width=104, command=add_pdf).pack(side=tk.LEFT, padx=(0, 6))
+        ctk.CTkButton(pdf_btn_row, text="Remove", width=90, command=remove_pdf).pack(side=tk.LEFT)
 
-        # --- Section 3: Shot+Ask Overlay ---
-        ctk.CTkLabel(dialog, text="🪟 Shot+Ask Overlay:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
-        ctk.CTkLabel(
-            dialog,
-            text="Scegli sfondo e dimensioni della finestra risposta.",
-            font=("Avenir", 11),
-            text_color="#888888",
-        ).pack(padx=12, anchor=tk.W)
-
+        ctk.CTkLabel(scroll, text="Shot+Ask Overlay", font=("Avenir", 15, "bold")).pack(anchor=tk.W, padx=8, pady=(0, 4))
         overlay_bg_var = tk.StringVar(value=self._overlay_bg_color)
         overlay_width_var = tk.StringVar(value=str(self._overlay_width))
         overlay_height_var = tk.StringVar(value=str(self._overlay_height))
         overlay_resizable_var = tk.BooleanVar(value=self._overlay_resizable)
+        overlay_timeout_var = tk.StringVar(value=str(int(self._overlay_timeout_seconds)))
 
-        overlay_bg_row = ctk.CTkFrame(dialog, fg_color="transparent")
-        overlay_bg_row.pack(fill=tk.X, padx=12, pady=(6, 6))
-        ctk.CTkLabel(overlay_bg_row, text="Sfondo (#RRGGBB):", width=120).pack(side=tk.LEFT)
-        ctk.CTkEntry(overlay_bg_row, textvariable=overlay_bg_var, width=120).pack(side=tk.LEFT, padx=(0, 8))
-        color_swatch = tk.Frame(
-            overlay_bg_row,
-            width=24,
-            height=24,
-            bg=self._overlay_bg_color,
-            highlightthickness=1,
-            highlightbackground="#555555",
-        )
+        overlay_row1 = ctk.CTkFrame(scroll, fg_color="transparent")
+        overlay_row1.pack(fill=tk.X, padx=8, pady=(0, 6))
+        ctk.CTkLabel(overlay_row1, text="Background", width=100).pack(side=tk.LEFT)
+        ctk.CTkEntry(overlay_row1, textvariable=overlay_bg_var, width=110).pack(side=tk.LEFT, padx=(0, 8))
+        color_swatch = tk.Frame(overlay_row1, width=24, height=24, bg=self._overlay_bg_color, highlightthickness=1, highlightbackground="#555555")
         color_swatch.pack(side=tk.LEFT, padx=(0, 8))
         color_swatch.pack_propagate(False)
 
         def choose_overlay_bg() -> None:
             _, picked = colorchooser.askcolor(color=overlay_bg_var.get().strip(), parent=dialog, title="Sfondo overlay")
-            if not picked:
-                return
-            overlay_bg_var.set(picked)
-            color_swatch.configure(bg=picked)
+            if picked:
+                overlay_bg_var.set(picked)
+                color_swatch.configure(bg=picked)
 
-        ctk.CTkButton(overlay_bg_row, text="Scegli", width=80, command=choose_overlay_bg).pack(side=tk.LEFT)
+        ctk.CTkButton(overlay_row1, text="Pick", width=70, command=choose_overlay_bg).pack(side=tk.LEFT)
 
         def on_overlay_bg_changed(*_: Any) -> None:
             value = self._normalize_hex_color(overlay_bg_var.get(), "")
@@ -1331,53 +1329,58 @@ class DesktopChatApp:
 
         overlay_bg_var.trace_add("write", on_overlay_bg_changed)
 
-        overlay_size_row = ctk.CTkFrame(dialog, fg_color="transparent")
-        overlay_size_row.pack(fill=tk.X, padx=12, pady=(0, 8))
-        ctk.CTkLabel(overlay_size_row, text="Larghezza:", width=120).pack(side=tk.LEFT)
-        ctk.CTkEntry(overlay_size_row, textvariable=overlay_width_var, width=80).pack(side=tk.LEFT, padx=(0, 12))
-        ctk.CTkLabel(overlay_size_row, text="Altezza:", width=70).pack(side=tk.LEFT)
-        ctk.CTkEntry(overlay_size_row, textvariable=overlay_height_var, width=80).pack(side=tk.LEFT)
+        overlay_row2 = ctk.CTkFrame(scroll, fg_color="transparent")
+        overlay_row2.pack(fill=tk.X, padx=8, pady=(0, 10))
+        ctk.CTkLabel(overlay_row2, text="Width", width=100).pack(side=tk.LEFT)
+        ctk.CTkEntry(overlay_row2, textvariable=overlay_width_var, width=72).pack(side=tk.LEFT, padx=(0, 12))
+        ctk.CTkLabel(overlay_row2, text="Height", width=60).pack(side=tk.LEFT)
+        ctk.CTkEntry(overlay_row2, textvariable=overlay_height_var, width=72).pack(side=tk.LEFT, padx=(0, 12))
+        ctk.CTkLabel(overlay_row2, text="Timeout(s)", width=86).pack(side=tk.LEFT)
+        ctk.CTkEntry(overlay_row2, textvariable=overlay_timeout_var, width=64).pack(side=tk.LEFT)
+        ctk.CTkCheckBox(scroll, text="Resizable overlay window", variable=overlay_resizable_var).pack(anchor=tk.W, padx=8, pady=(0, 12))
 
-        ctk.CTkCheckBox(
-            dialog,
-            text="Consenti ridimensionamento manuale finestra overlay",
-            variable=overlay_resizable_var,
-        ).pack(anchor=tk.W, padx=12, pady=(0, 12))
-
-        # --- Section 4: Connection & macOS Shell ---
-        ctk.CTkLabel(dialog, text="🔗 Connessione:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        ctk.CTkLabel(scroll, text="Connection", font=("Avenir", 15, "bold")).pack(anchor=tk.W, padx=8, pady=(0, 4))
         auto_connect_var = tk.BooleanVar(value=self._auto_connect_on_start)
         auto_retry_var = tk.BooleanVar(value=self._auto_retry_known_device)
         auto_updates_var = tk.BooleanVar(value=self._auto_check_updates)
-        ctk.CTkCheckBox(
-            dialog,
-            text="Auto-connect all'avvio (ultimo telefono noto)",
-            variable=auto_connect_var,
-        ).pack(anchor=tk.W, padx=12, pady=(0, 4))
-        ctk.CTkCheckBox(
-            dialog,
-            text="Auto-retry su disconnessione (backoff)",
-            variable=auto_retry_var,
-        ).pack(anchor=tk.W, padx=12, pady=(0, 12))
-        ctk.CTkCheckBox(
-            dialog,
-            text="Controlla aggiornamenti automaticamente",
-            variable=auto_updates_var,
-        ).pack(anchor=tk.W, padx=12, pady=(0, 12))
+        ctk.CTkCheckBox(scroll, text="Auto-connect at startup", variable=auto_connect_var).pack(anchor=tk.W, padx=8, pady=(0, 4))
+        ctk.CTkCheckBox(scroll, text="Auto-retry after disconnect", variable=auto_retry_var).pack(anchor=tk.W, padx=8, pady=(0, 4))
+        ctk.CTkCheckBox(scroll, text="Auto-check updates", variable=auto_updates_var).pack(anchor=tk.W, padx=8, pady=(0, 10))
 
-        ctk.CTkLabel(dialog, text="🍎 macOS Shell:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
         menu_bar_mode_var = tk.BooleanVar(value=self._menu_bar_mode_enabled)
         hide_dock_var = tk.BooleanVar(value=self._hide_dock_icon_enabled)
-        ctk.CTkCheckBox(
-            dialog,
-            text="Mostra icona nella barra in alto (menu bar)",
-            variable=menu_bar_mode_var,
-        ).pack(anchor=tk.W, padx=12, pady=(0, 4))
-        ctk.CTkCheckBox(
-            dialog,
-            text="Nascondi icona nella Dock",
-            variable=hide_dock_var,
-        ).pack(anchor=tk.W, padx=12, pady=(0, 12))
+
+        if self._is_macos:
+            ctk.CTkLabel(scroll, text="macOS", font=("Avenir", 15, "bold")).pack(anchor=tk.W, padx=8, pady=(0, 4))
+            ctk.CTkCheckBox(scroll, text="Enable menu bar mode", variable=menu_bar_mode_var).pack(anchor=tk.W, padx=8, pady=(0, 4))
+            ctk.CTkCheckBox(scroll, text="Hide Dock icon", variable=hide_dock_var).pack(anchor=tk.W, padx=8, pady=(0, 4))
+            perm_row = ctk.CTkFrame(scroll, fg_color="transparent")
+            perm_row.pack(fill=tk.X, padx=8, pady=(0, 10))
+            ctk.CTkButton(perm_row, text="Screen Perm", width=106, command=self._request_screen_recording_permission).pack(side=tk.LEFT, padx=(0, 6))
+            ctk.CTkButton(perm_row, text="Accessibility", width=110, command=self._request_accessibility_permission).pack(side=tk.LEFT, padx=(0, 6))
+            ctk.CTkButton(perm_row, text="Bluetooth", width=98, command=self._request_bluetooth_permission).pack(side=tk.LEFT)
+        elif self._platform_name.startswith("windows"):
+            ctk.CTkLabel(scroll, text="Windows", font=("Avenir", 15, "bold")).pack(anchor=tk.W, padx=8, pady=(0, 4))
+            ctk.CTkLabel(
+                scroll,
+                text="Hotkeys globali: Ctrl+Shift+G (Shot+Ask), Ctrl+Shift+H (Clipboard+Ask).",
+                text_color="#8ea0b8",
+            ).pack(anchor=tk.W, padx=8, pady=(0, 10))
+        else:
+            ctk.CTkLabel(scroll, text="Linux", font=("Avenir", 15, "bold")).pack(anchor=tk.W, padx=8, pady=(0, 4))
+            ctk.CTkLabel(
+                scroll,
+                text="Per screenshot: grim+slurp (Wayland) o gnome-screenshot/maim/scrot (X11).",
+                text_color="#8ea0b8",
+            ).pack(anchor=tk.W, padx=8, pady=(0, 2))
+            ctk.CTkLabel(
+                scroll,
+                text="Per clipboard immagini: wl-clipboard o xclip.",
+                text_color="#8ea0b8",
+            ).pack(anchor=tk.W, padx=8, pady=(0, 10))
+
+        footer = ctk.CTkFrame(dialog, fg_color="transparent")
+        footer.pack(fill=tk.X, padx=12, pady=(8, 10))
 
         def save() -> None:
             text = textbox.get("1.0", tk.END).strip()
@@ -1387,12 +1390,14 @@ class DesktopChatApp:
             self._overlay_width = self._parse_int_setting(overlay_width_var.get(), self._overlay_width, 320, 1280)
             self._overlay_height = self._parse_int_setting(overlay_height_var.get(), self._overlay_height, 160, 900)
             self._overlay_resizable = bool(overlay_resizable_var.get())
+            self._overlay_timeout_seconds = float(self._parse_int_setting(overlay_timeout_var.get(), int(self._overlay_timeout_seconds), 30, 240))
             self._auto_connect_on_start = bool(auto_connect_var.get())
             self._auto_retry_known_device = bool(auto_retry_var.get())
             self._auto_check_updates = bool(auto_updates_var.get())
-            self._menu_bar_mode_enabled = bool(menu_bar_mode_var.get())
-            self._hide_dock_icon_enabled = bool(hide_dock_var.get())
+            self._menu_bar_mode_enabled = bool(menu_bar_mode_var.get()) if self._is_macos else False
+            self._hide_dock_icon_enabled = bool(hide_dock_var.get()) if self._is_macos else False
             self.client.set_auto_reconnect(self._auto_retry_known_device)
+
             old_settings = self._load_settings()
             old_settings["system_instructions"] = text
             old_settings["pinned_pdf_paths"] = self.pinned_pdf_paths
@@ -1400,33 +1405,33 @@ class DesktopChatApp:
             old_settings["overlay_width"] = self._overlay_width
             old_settings["overlay_height"] = self._overlay_height
             old_settings["overlay_resizable"] = self._overlay_resizable
+            old_settings["overlay_timeout_seconds"] = int(self._overlay_timeout_seconds)
             old_settings["auto_connect_on_start"] = self._auto_connect_on_start
             old_settings["auto_retry_known_device"] = self._auto_retry_known_device
             old_settings["auto_check_updates"] = self._auto_check_updates
             old_settings["menu_bar_mode_enabled"] = self._menu_bar_mode_enabled
             old_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
             old_settings["last_connected_address"] = self._last_connected_address
+            old_settings["last_connected_bridge_id"] = self._last_connected_bridge_id
             self._save_settings(old_settings)
+
             self._apply_overlay_window_preferences()
-            if self._menu_bar_mode_enabled:
-                self._start_menu_bar_icon_if_needed()
-            else:
-                self._stop_menu_bar_icon()
-            self._apply_macos_activation_policy()
+            if self._is_macos:
+                if self._menu_bar_mode_enabled:
+                    self._start_menu_bar_icon_if_needed()
+                else:
+                    self._stop_menu_bar_icon()
+                self._apply_macos_activation_policy()
+            self._refresh_context_preview()
             dialog.destroy()
-            n = len(self.pinned_pdf_paths)
             self._append_log(
                 "System",
-                (
-                    f"Settings saved. Pinned PDFs: {n}. "
-                    f"System instructions: {'YES' if text else 'none'}. "
-                    f"Overlay: {self._overlay_width}x{self._overlay_height}, bg {self._overlay_bg_color}. "
-                    f"Auto-connect: {'on' if self._auto_connect_on_start else 'off'}. "
-                    f"Auto-retry: {'on' if self._auto_retry_known_device else 'off'}."
-                ),
+                f"Settings saved. Pinned PDFs: {len(self.pinned_pdf_paths)} | Overlay: {self._overlay_width}x{self._overlay_height}",
             )
 
-        ctk.CTkButton(dialog, text="💾 SALVA", command=save, fg_color="#1f538d").pack(pady=(0, 14))
+        ctk.CTkButton(footer, text="BROWSE", width=100, command=add_pdf).pack(side=tk.LEFT, padx=(0, 8))
+        ctk.CTkButton(footer, text="UPDATE", width=100, command=lambda: self.on_check_updates(background=False)).pack(side=tk.LEFT, padx=(0, 8))
+        ctk.CTkButton(footer, text="SALVA", width=110, fg_color="#1f538d", command=save).pack(side=tk.RIGHT)
 
     # ── Knowledge Base Container handlers ─────────────────────────────────────
 
@@ -1779,20 +1784,8 @@ class DesktopChatApp:
     def _on_window_resize(self, event) -> None:
         if event.widget != self.root:
             return
-        width = event.width
-        # Threshold for compact mode
-        if width < 750 and not self._is_compact_mode:
-            self._is_compact_mode = True
-            self.header_frame.grid_remove()
-            self.sidebar_frame.grid_remove()
-            self.chat_area_frame.grid(row=0, column=0, rowspan=2, columnspan=2, sticky="nsew", padx=0, pady=0)
-            # Remove padding for pure chat view
-            self.root.configure(padx=0, pady=0)
-        elif width >= 750 and self._is_compact_mode:
-            self._is_compact_mode = False
-            self.header_frame.grid()
-            self.sidebar_frame.grid()
-            self.chat_area_frame.grid(row=1, column=1, rowspan=1, columnspan=1, sticky="nsew", padx=(6, 12), pady=(0, 12))
+        # Compact mode disabled: keep a stable tri-pane layout across platforms.
+        self._is_compact_mode = False
 
     def _set_phone_default_model(self) -> None:
         self.model_var.set(MODEL_PRESETS[0])
@@ -2071,11 +2064,14 @@ class DesktopChatApp:
         timed_out: list[str] = []
         for request_id in list(self._overlay_request_ids):
             started_at = self._overlay_started_at.get(request_id, now)
-            if (now - started_at) >= self._overlay_timeout_seconds:
+            last_update = self._overlay_last_update_at.get(request_id, started_at)
+            total_elapsed = now - started_at
+            idle_elapsed = now - last_update
+            if total_elapsed >= self._overlay_timeout_seconds or idle_elapsed >= self._overlay_idle_timeout_seconds:
                 timed_out.append(request_id)
         for request_id in timed_out:
             self._show_overlay_message(
-                "Timeout Shot+Ask: nessuna risposta dal bridge. Riprova.",
+                "Timeout Shot+Ask: upload completato ma nessuna risposta dal bridge. Riprova.",
                 ttl_ms=9000,
             )
             self._cleanup_overlay_request(request_id)
@@ -2177,6 +2173,8 @@ class DesktopChatApp:
                 except OSError:
                     pass
                 return None
+        if system_name.startswith("windows"):
+            return self._capture_area_screenshot_path_windows(log_errors=log_errors)
         if system_name == "linux":
             return self._capture_area_screenshot_path_linux(log_errors=log_errors)
 
@@ -2201,6 +2199,73 @@ class DesktopChatApp:
             if log_errors:
                 self._append_log("Error", f"Screenshot failed: {exc}")
             return None
+
+    def _clipboard_image_signature(self) -> str | None:
+        if ImageGrab is None:
+            return None
+        try:
+            clip = ImageGrab.grabclipboard()  # type: ignore[union-attr]
+        except Exception:
+            return None
+        if clip is None or not hasattr(clip, "copy"):
+            return None
+        try:
+            sample = clip.copy()
+            sample.thumbnail((32, 32))
+            payload = sample.tobytes()
+            digest = hashlib.sha1(payload).hexdigest()
+            return f"{sample.size[0]}x{sample.size[1]}:{digest}"
+        except Exception:
+            return None
+
+    def _capture_area_screenshot_path_windows(self, log_errors: bool = True) -> str | None:
+        if ImageGrab is None:
+            if log_errors:
+                self._append_log("Error", "Area screenshot requires Pillow ImageGrab")
+            return None
+
+        baseline_sig = self._clipboard_image_signature()
+        try:
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", "Start-Process 'ms-screenclip:'"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            try:
+                subprocess.Popen(["explorer.exe", "ms-screenclip:"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as exc:
+                if log_errors:
+                    self._append_log("Error", f"Screenshot failed: {exc}")
+                return None
+
+        deadline = time.monotonic() + 24.0
+        while time.monotonic() < deadline:
+            time.sleep(0.18)
+            try:
+                clip = ImageGrab.grabclipboard()  # type: ignore[union-attr]
+            except Exception:
+                continue
+            if clip is None or not hasattr(clip, "save"):
+                continue
+            current_sig = self._clipboard_image_signature()
+            if baseline_sig is not None and current_sig == baseline_sig:
+                continue
+            try:
+                fd, path = tempfile.mkstemp(prefix="gemini-shot-", suffix=".png")
+                os.close(fd)
+                clip.save(path, format="PNG")
+                if Path(path).exists() and Path(path).stat().st_size > 0:
+                    return path
+                Path(path).unlink(missing_ok=True)
+            except Exception as exc:
+                if log_errors:
+                    self._append_log("Error", f"Screenshot save failed: {exc}")
+                return None
+
+        if log_errors:
+            self._append_log("System", "Screenshot canceled")
+        return None
 
     def _capture_area_screenshot_path_linux(self, log_errors: bool = True) -> str | None:
         fd, path = tempfile.mkstemp(prefix="gemini-shot-", suffix=".png")
@@ -2424,16 +2489,20 @@ class DesktopChatApp:
     def on_connect(self) -> None:
         selected = self.devices_list.curselection()
         if not selected:
-            if self._last_connected_address:
-                self._append_log("System", f"Connecting to last known device: {self._last_connected_address}")
-                self.client.connect(self._last_connected_address)
+            if self._last_connected_address or self._last_connected_bridge_id:
+                target = self._last_connected_bridge_id or self._last_connected_address or "known bridge"
+                self._append_log("System", f"Connecting to last known bridge: {target}")
+                self._connect_with_hint(self._last_connected_address, self._last_connected_bridge_id)
                 return
             self._append_log("System", "Select a device first")
             return
 
         idx = selected[0]
         device = self.devices[idx]
-        self.client.connect(device["address"])
+        self._connect_with_hint(
+            str(device.get("address", "")).strip(),
+            self._normalize_bridge_id(device.get("bridge_id")),
+        )
 
     def on_disconnect(self) -> None:
         self.client.disconnect()
@@ -3247,9 +3316,12 @@ class DesktopChatApp:
             self.devices_list.delete(0, tk.END)
             selected_idx: int | None = None
             for idx, device in enumerate(self.devices):
-                label = f"{device['name']} ({device['address']})"
+                label = self._format_device_label(device)
                 self.devices_list.insert(tk.END, label)
-                if self._last_connected_address and device.get("address") == self._last_connected_address:
+                device_bridge = self._normalize_bridge_id(device.get("bridge_id"))
+                address_match = bool(self._last_connected_address and device.get("address") == self._last_connected_address)
+                bridge_match = bool(self._last_connected_bridge_id and device_bridge == self._last_connected_bridge_id)
+                if address_match or bridge_match:
                     selected_idx = idx
             if selected_idx is not None:
                 self.devices_list.selection_clear(0, tk.END)
@@ -3269,15 +3341,24 @@ class DesktopChatApp:
             self._remote_list_feature_supported = True
             self._remote_list_legacy_attempted = False
             address = str(event.get("address", "")).strip()
+            bridge_id = self._normalize_bridge_id(event.get("bridge_id"))
             if address:
                 self._last_connected_address = address
-                self._update_settings({"last_connected_address": address})
+            if bridge_id:
+                self._last_connected_bridge_id = bridge_id
+            self._update_settings(
+                {
+                    "last_connected_address": self._last_connected_address,
+                    "last_connected_bridge_id": self._last_connected_bridge_id,
+                }
+            )
             device = event.get("device", "device")
             packet = event.get("max_packet_size", "?")
             self.status_var.set(f"Connected: {device}")
             self.link_var.set("Link: probing...")
             self._last_link_state = "healthy"
-            self._append_log("System", f"Connected ({device}), packet size: {packet}")
+            id_text = f", bridgeId: {bridge_id}" if bridge_id else ""
+            self._append_log("System", f"Connected ({device}), packet size: {packet}{id_text}")
             return
 
         if event_type == "disconnected":
@@ -3327,6 +3408,10 @@ class DesktopChatApp:
             return
 
         if event_type == "sent":
+            request_id = str(event.get("request_id", "")).strip()
+            if request_id and request_id in self._overlay_request_ids:
+                self._overlay_last_update_at[request_id] = time.monotonic()
+                self._show_overlay_message("Upload screenshot completato, attendo elaborazione...", ttl_ms=0)
             if self.connected:
                 self.status_var.set("Connected")
             return
@@ -3543,12 +3628,14 @@ class DesktopChatApp:
         latest_settings["overlay_width"] = self._overlay_width
         latest_settings["overlay_height"] = self._overlay_height
         latest_settings["overlay_resizable"] = self._overlay_resizable
+        latest_settings["overlay_timeout_seconds"] = int(self._overlay_timeout_seconds)
         latest_settings["auto_connect_on_start"] = self._auto_connect_on_start
         latest_settings["auto_retry_known_device"] = self._auto_retry_known_device
         latest_settings["auto_check_updates"] = self._auto_check_updates
         latest_settings["menu_bar_mode_enabled"] = self._menu_bar_mode_enabled
         latest_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
         latest_settings["last_connected_address"] = self._last_connected_address
+        latest_settings["last_connected_bridge_id"] = self._last_connected_bridge_id
         self._save_settings(latest_settings)
         self._hide_overlay_window()
         self.client.stop()

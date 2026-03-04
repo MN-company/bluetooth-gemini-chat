@@ -130,10 +130,13 @@ class BleKeepAliveService : Service() {
         } else if (bleServerManager != null) {
             return
         }
+        val bridgeId = settingsRepository.getOrCreateBridgeId()
+        appendLog("Using stable bridgeId: $bridgeId")
 
         val manager = BleServerManager(
             context = applicationContext,
             scope = serviceScope,
+            bridgeId = bridgeId,
             onPromptJson = { rawJson, sourceAddress -> handleIncomingJson(rawJson, sourceAddress) },
             onLog = { appendLog(it) },
             onBridgeStatus = { status -> updateBridgeStatus(status) },

@@ -20,6 +20,7 @@ import android.content.Context
 import android.os.Build
 import android.os.ParcelUuid
 import java.util.concurrent.ConcurrentHashMap
+import java.util.Locale
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -31,6 +32,7 @@ import kotlinx.coroutines.yield
 class BleServerManager(
     context: Context,
     private val scope: CoroutineScope,
+    private val bridgeId: String,
     private val onPromptJson: suspend (String, String) -> Unit,
     private val onLog: (String) -> Unit,
     private val onBridgeStatus: (String) -> Unit,
@@ -50,6 +52,7 @@ class BleServerManager(
     private var gattServer: BluetoothGattServer? = null
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
     private var advertiseCallback: AdvertiseCallback? = null
+    private val normalizedBridgeId = normalizeBridgeId(bridgeId)
 
     @Volatile
     private var lastActiveDeviceAddress: String? = null
@@ -64,7 +67,7 @@ class BleServerManager(
                     connectedDevices[device.address] = device
                     sendMutexByDevice.putIfAbsent(device.address, Mutex())
                     lastActiveDeviceAddress = device.address
-                    onLog("BLE connected: ${device.address}")
+                    onLog("BLE connected: ${device.address} (bridgeId=$normalizedBridgeId)")
                     requestLowLatencyPhy(device)
                     onBridgeStatus("Connected clients: ${connectedDevices.size}")
                 }
@@ -77,11 +80,11 @@ class BleServerManager(
                     mtuByDevice.remove(device.address)
                     frameAssemblersByDevice.remove(device.address)
                     sendMutexByDevice.remove(device.address)
-                    onLog("BLE disconnected: ${device.address}")
+                    onLog("BLE disconnected: ${device.address} (bridgeId=$normalizedBridgeId)")
                     if (connectedDevices.isNotEmpty()) {
                         onBridgeStatus("Connected clients: ${connectedDevices.size}")
                     } else if (advertisingActive) {
-                        onBridgeStatus("Advertising BLE bridge")
+                        onBridgeStatus("Advertising BLE bridge #$normalizedBridgeId")
                     } else {
                         onBridgeStatus("BLE idle, waiting for advertising restart")
                     }
@@ -329,8 +332,8 @@ class BleServerManager(
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
                 advertisingActive = true
-                onLog("BLE advertising started")
-                onBridgeStatus("Advertising BLE bridge")
+                onLog("BLE advertising started (bridgeId=$normalizedBridgeId)")
+                onBridgeStatus("Advertising BLE bridge #$normalizedBridgeId")
             }
 
             override fun onStartFailure(errorCode: Int) {
@@ -338,7 +341,7 @@ class BleServerManager(
                 advertisingActive = errorCode == AdvertiseCallback.ADVERTISE_FAILED_ALREADY_STARTED
                 onLog("BLE advertising failed: $reason")
                 if (advertisingActive) {
-                    onBridgeStatus("Advertising BLE bridge")
+                    onBridgeStatus("Advertising BLE bridge #$normalizedBridgeId")
                 } else {
                     onBridgeStatus("BLE advertising failed: $reason")
                 }
@@ -356,11 +359,15 @@ class BleServerManager(
             .addServiceUuid(ParcelUuid(BleConstants.serviceUuid))
             .setIncludeDeviceName(false)
             .build()
+        val scanResponse = AdvertiseData.Builder()
+            .addManufacturerData(BleConstants.bridgeManufacturerId, bridgeIdBytes(normalizedBridgeId))
+            .setIncludeDeviceName(false)
+            .build()
 
         return runCatching {
             advertiseCallback = callback
             onBridgeStatus("Starting BLE advertising...")
-            advertiser.startAdvertising(settings, data, callback)
+            advertiser.startAdvertising(settings, data, scanResponse, callback)
         }
     }
 
@@ -445,5 +452,22 @@ class BleServerManager(
             AdvertiseCallback.ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "FEATURE_UNSUPPORTED (5)"
             else -> "UNKNOWN ($errorCode)"
         }
+    }
+
+    private fun normalizeBridgeId(raw: String): String {
+        val cleaned = raw.trim().uppercase(Locale.US).replace("[^0-9A-F]".toRegex(), "")
+        if (cleaned.length >= 12) {
+            return cleaned.take(12)
+        }
+        return cleaned.padEnd(12, '0')
+    }
+
+    private fun bridgeIdBytes(raw: String): ByteArray {
+        return runCatching {
+            val clean = normalizeBridgeId(raw)
+            ByteArray(clean.length / 2) { idx ->
+                clean.substring(idx * 2, idx * 2 + 2).toInt(16).toByte()
+            }
+        }.getOrDefault(byteArrayOf(0, 0, 0, 0, 0, 0))
     }
 }

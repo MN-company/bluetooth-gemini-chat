@@ -30,6 +30,7 @@ except Exception:  # pragma: no cover - Pillow is optional but recommended
 SERVICE_UUID = "8e7f1f10-6c7a-4a89-b2e8-4e20f4f31c01"
 WRITE_CHAR_UUID = "8e7f1f10-6c7a-4a89-b2e8-4e20f4f31c02"
 NOTIFY_CHAR_UUID = "8e7f1f10-6c7a-4a89-b2e8-4e20f4f31c03"
+BRIDGE_MANUFACTURER_ID = 0x02E5
 MAX_GATT_ATTRIBUTE_VALUE_BYTES = 512
 MAX_IMAGE_BYTES = 140 * 1024
 TARGET_IMAGE_BYTES = 56 * 1024
@@ -56,6 +57,7 @@ class BleChatClient:
         self._closing = False
         self._last_connected_address: str | None = None
         self._last_connected_name: str | None = None
+        self._last_connected_bridge_id: str | None = None
         self._heartbeat_task: asyncio.Task[Any] | None = None
         self._reconnect_task: asyncio.Task[Any] | None = None
         self._pending_pings: dict[str, float] = {}
@@ -64,6 +66,7 @@ class BleChatClient:
         self._is_windows = platform.system().lower().startswith("windows")
         self._discovered_devices: dict[str, Any] = {}
         self._known_device_names: dict[str, str] = {}
+        self._known_bridge_id_by_address: dict[str, str] = {}
 
     def start(self) -> None:
         if self._thread_started:
@@ -91,13 +94,17 @@ class BleChatClient:
     def scan_devices(self) -> None:
         self._run_coro(self._scan_devices())
 
-    def connect(self, address: str) -> None:
-        self._last_connected_address = address
+    def connect(self, address: str, bridge_id: str | None = None) -> None:
+        self._last_connected_address = address.strip() or None
+        normalized_bridge = self._normalize_bridge_id(bridge_id)
+        if normalized_bridge:
+            self._last_connected_bridge_id = normalized_bridge
         self._stop_reconnect()
-        self._run_coro(self._connect(address))
+        self._run_coro(self._connect(address, preferred_bridge_id=normalized_bridge))
 
     def disconnect(self) -> None:
         self._last_connected_address = None
+        self._last_connected_bridge_id = None
         self._stop_reconnect()
         self._run_coro(self._disconnect())
 
@@ -161,7 +168,8 @@ class BleChatClient:
                 f"Request payload too large ({len(payload)} bytes). "
                 f"Reduce prompt/context/image (max {MAX_REQUEST_BYTES} bytes)."
             )
-        self._run_coro(self._send_payload(payload, request_id))
+        reliable = image_path is not None or len(payload) >= 60 * 1024
+        self._run_coro(self._send_payload(payload, request_id, reliable=reliable))
         return request_id
 
     def request_container_list(self, request_type: str = "list_containers") -> str:
@@ -241,6 +249,23 @@ class BleChatClient:
     def _normalize_address(self, value: str) -> str:
         return value.strip().lower()
 
+    def _normalize_bridge_id(self, value: str | None) -> str | None:
+        if value is None:
+            return None
+        clean = "".join(ch for ch in value.strip().upper() if ch in "0123456789ABCDEF")
+        if len(clean) < 6:
+            return None
+        return clean[:12]
+
+    def _extract_bridge_id(self, manufacturer_data: Any) -> str | None:
+        if not isinstance(manufacturer_data, dict):
+            return None
+        raw = manufacturer_data.get(BRIDGE_MANUFACTURER_ID)
+        if isinstance(raw, (bytes, bytearray)) and len(raw) >= 3:
+            candidate = bytes(raw).hex().upper()
+            return self._normalize_bridge_id(candidate)
+        return None
+
     def _is_device_not_found_error(self, exc: Exception) -> bool:
         text = str(exc).strip().lower()
         if not text:
@@ -277,9 +302,12 @@ class BleChatClient:
                     continue
                 seen.add(key)
                 name = str(getattr(device, "name", "") or adv_data.local_name or "Gemini Bridge").strip() or "Gemini Bridge"
+                bridge_id = self._extract_bridge_id(getattr(adv_data, "manufacturer_data", {}))
                 self._discovered_devices[key] = device
                 self._known_device_names[key] = name
-                results.append({"name": name, "address": address, "device": device})
+                if bridge_id is not None:
+                    self._known_bridge_id_by_address[key] = bridge_id
+                results.append({"name": name, "address": address, "device": device, "bridge_id": bridge_id})
             return results
         except TypeError:
             pass
@@ -296,25 +324,57 @@ class BleChatClient:
             name = str(getattr(device, "name", "") or "Gemini Bridge").strip() or "Gemini Bridge"
             self._discovered_devices[key] = device
             self._known_device_names[key] = name
-            results.append({"name": name, "address": address, "device": device})
+            bridge_id = self._known_bridge_id_by_address.get(key)
+            results.append({"name": name, "address": address, "device": device, "bridge_id": bridge_id})
         return results
 
-    async def _resolve_connect_target(self, address: str, allow_scan: bool = False) -> tuple[Any, str]:
+    async def _resolve_connect_target(
+        self,
+        address: str,
+        preferred_bridge_id: str | None = None,
+        allow_scan: bool = False,
+    ) -> tuple[Any, str, str | None]:
         raw_address = str(address).strip()
         normalized = self._normalize_address(raw_address)
+        expected_bridge_id = self._normalize_bridge_id(preferred_bridge_id)
+        known_bridge_id = self._known_bridge_id_by_address.get(normalized) if normalized else None
+        if expected_bridge_id is None and known_bridge_id is not None:
+            expected_bridge_id = known_bridge_id
         if not normalized:
-            return raw_address, raw_address
+            if expected_bridge_id is not None:
+                discovered = await self._discover_ble_devices(timeout=4.5)
+                by_bridge = [item for item in discovered if item.get("bridge_id") == expected_bridge_id]
+                if by_bridge:
+                    choice = by_bridge[0]
+                    return choice["device"], choice["address"], choice.get("bridge_id")
+            return raw_address, raw_address, expected_bridge_id
 
         cached = self._discovered_devices.get(normalized)
-        if cached is not None:
+        if cached is not None and (expected_bridge_id is None or self._known_bridge_id_by_address.get(normalized) == expected_bridge_id):
             cached_address = str(getattr(cached, "address", "")).strip() or raw_address
-            return cached, cached_address
+            return cached, cached_address, self._known_bridge_id_by_address.get(normalized)
 
-        if allow_scan:
+        if allow_scan or expected_bridge_id is not None:
             discovered = await self._discover_ble_devices(timeout=4.5)
+            if expected_bridge_id is not None:
+                by_bridge = [item for item in discovered if item.get("bridge_id") == expected_bridge_id]
+                if len(by_bridge) == 1:
+                    selected = by_bridge[0]
+                    return selected["device"], selected["address"], selected.get("bridge_id")
+                if len(by_bridge) > 1 and normalized:
+                    exact_bridge = next(
+                        (item for item in by_bridge if self._normalize_address(item["address"]) == normalized),
+                        None,
+                    )
+                    if exact_bridge is not None:
+                        return exact_bridge["device"], exact_bridge["address"], exact_bridge.get("bridge_id")
+                if by_bridge:
+                    selected = by_bridge[0]
+                    return selected["device"], selected["address"], selected.get("bridge_id")
+
             exact = next((item for item in discovered if self._normalize_address(item["address"]) == normalized), None)
             if exact is not None:
-                return exact["device"], exact["address"]
+                return exact["device"], exact["address"], exact.get("bridge_id")
 
             # Addresses can rotate on some platforms: fallback by known device name.
             expected_name = self._known_device_names.get(normalized) or self._last_connected_name
@@ -323,9 +383,10 @@ class BleChatClient:
                     item for item in discovered if str(item["name"]).strip().lower() == expected_name.strip().lower()
                 ]
                 if len(name_matches) == 1:
-                    return name_matches[0]["device"], name_matches[0]["address"]
+                    selected = name_matches[0]
+                    return selected["device"], selected["address"], selected.get("bridge_id")
 
-        return raw_address, raw_address
+        return raw_address, raw_address, expected_bridge_id
 
     async def _connect_once(self, target: Any, address_hint: str) -> tuple[BleakClient, str, str, int]:
         client = BleakClient(target, disconnected_callback=self._on_disconnected)
@@ -352,7 +413,14 @@ class BleChatClient:
         self._emit({"type": "status", "text": "Scanning BLE devices..."})
         try:
             discovered = await self._discover_ble_devices(timeout=6.0)
-            payload = [{"name": item["name"], "address": item["address"]} for item in discovered]
+            payload = [
+                {
+                    "name": item["name"],
+                    "address": item["address"],
+                    "bridge_id": item.get("bridge_id"),
+                }
+                for item in discovered
+            ]
 
             self._emit({"type": "scan_result", "devices": payload})
             if not payload:
@@ -365,21 +433,30 @@ class BleChatClient:
         except Exception as exc:
             self._emit({"type": "error", "text": f"Scan failed: {exc}"})
 
-    async def _connect(self, address: str, from_reconnect: bool = False) -> None:
+    async def _connect(self, address: str, from_reconnect: bool = False, preferred_bridge_id: str | None = None) -> None:
         await self._disconnect(silent=True)
+        target_hint = self._normalize_bridge_id(preferred_bridge_id) or str(address).strip()
         if from_reconnect:
-            self._emit({"type": "status", "text": f"Reconnecting to {address}..."})
+            self._emit({"type": "status", "text": f"Reconnecting to {target_hint}..."})
         else:
-            self._emit({"type": "status", "text": f"Connecting to {address}..."})
+            self._emit({"type": "status", "text": f"Connecting to {target_hint}..."})
 
         try:
-            target, resolved_address = await self._resolve_connect_target(address, allow_scan=from_reconnect)
+            target, resolved_address, resolved_bridge_id = await self._resolve_connect_target(
+                address,
+                preferred_bridge_id=preferred_bridge_id,
+                allow_scan=from_reconnect,
+            )
             client, resolved_address, device_name, max_packet_size = await self._connect_once(target, resolved_address)
         except Exception as first_exc:
             if from_reconnect and self._is_device_not_found_error(first_exc):
                 try:
-                    retry_target, retry_address = await self._resolve_connect_target(address, allow_scan=True)
-                    if self._normalize_address(retry_address) != self._normalize_address(address):
+                    retry_target, retry_address, retry_bridge_id = await self._resolve_connect_target(
+                        address,
+                        preferred_bridge_id=preferred_bridge_id,
+                        allow_scan=True,
+                    )
+                    if self._normalize_address(retry_address) != self._normalize_address(address) and retry_address.strip():
                         self._emit(
                             {
                                 "type": "status",
@@ -390,6 +467,7 @@ class BleChatClient:
                         retry_target,
                         retry_address,
                     )
+                    resolved_bridge_id = retry_bridge_id
                 except Exception as exc:
                     first_exc = exc
                 else:
@@ -407,12 +485,19 @@ class BleChatClient:
         try:
             self._max_packet_size = max_packet_size
             self._client = client
-            self._last_connected_address = resolved_address
+            self._last_connected_address = resolved_address or self._last_connected_address
             self._last_connected_name = device_name
+            normalized_bridge = self._normalize_bridge_id(resolved_bridge_id) or self._normalize_bridge_id(preferred_bridge_id)
+            if normalized_bridge is not None:
+                self._last_connected_bridge_id = normalized_bridge
             if resolved_address:
                 self._known_device_names[self._normalize_address(resolved_address)] = device_name
+                if normalized_bridge is not None:
+                    self._known_bridge_id_by_address[self._normalize_address(resolved_address)] = normalized_bridge
             if address:
                 self._known_device_names[self._normalize_address(address)] = device_name
+                if normalized_bridge is not None:
+                    self._known_bridge_id_by_address[self._normalize_address(address)] = normalized_bridge
             self._pending_pings.clear()
             self._last_pong_monotonic = time.monotonic()
             self._stop_reconnect()
@@ -422,6 +507,7 @@ class BleChatClient:
                     "type": "connected",
                     "address": resolved_address,
                     "device": device_name,
+                    "bridge_id": self._last_connected_bridge_id,
                     "max_packet_size": self._max_packet_size,
                 }
             )
@@ -504,11 +590,15 @@ class BleChatClient:
             await asyncio.sleep(PING_INTERVAL_SECONDS)
 
     def _start_reconnect(self) -> None:
-        if self._closing or self._last_connected_address is None or not self._auto_reconnect_enabled:
+        if self._closing or not self._auto_reconnect_enabled:
+            return
+        if not (self._last_connected_address or self._last_connected_bridge_id):
             return
         if self._reconnect_task is not None and not self._reconnect_task.done():
             return
-        self._reconnect_task = self._loop.create_task(self._reconnect_loop(self._last_connected_address))
+        self._reconnect_task = self._loop.create_task(
+            self._reconnect_loop(self._last_connected_address or "", self._last_connected_bridge_id)
+        )
 
     def _stop_reconnect(self) -> None:
         task = self._reconnect_task
@@ -516,16 +606,17 @@ class BleChatClient:
         if task is not None and not task.done():
             task.cancel()
 
-    async def _reconnect_loop(self, address: str) -> None:
+    async def _reconnect_loop(self, address: str, bridge_id: str | None) -> None:
         attempt = 1
+        target_hint = self._normalize_bridge_id(bridge_id) or address or "known bridge"
         while not self._closing:
             if self._client is not None and self._client.is_connected:
                 return
-            if self._last_connected_address != address:
+            if self._last_connected_address != address and self._last_connected_bridge_id != bridge_id:
                 return
 
-            self._emit({"type": "status", "text": f"Auto-reconnect attempt {attempt}..."})
-            await self._connect(address, from_reconnect=True)
+            self._emit({"type": "status", "text": f"Auto-reconnect attempt {attempt} ({target_hint})..."})
+            await self._connect(address, from_reconnect=True, preferred_bridge_id=bridge_id)
             if self._client is not None and self._client.is_connected:
                 self._emit({"type": "status", "text": "Reconnected"})
                 return
@@ -561,7 +652,8 @@ class BleChatClient:
                 throttle_every = 12 if packet_count > 140 else 5
                 throttle_delay = 0.0015 if packet_count > 140 else 0.003
             progress_step = max(packet_count // 12, 1)
-            use_write_response = reliable or (self._is_windows and packet_count <= 8)
+            # Large payloads without response can silently drop packets on some stacks.
+            use_write_response = reliable or packet_count >= 150 or (self._is_windows and packet_count <= 8)
 
             for idx, packet in enumerate(packets, start=1):
                 try:

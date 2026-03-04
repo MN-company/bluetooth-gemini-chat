@@ -7,6 +7,7 @@ object BleConstants {
     val writeCharUuid: UUID = UUID.fromString("8e7f1f10-6c7a-4a89-b2e8-4e20f4f31c02")
     val notifyCharUuid: UUID = UUID.fromString("8e7f1f10-6c7a-4a89-b2e8-4e20f4f31c03")
     val cccdUuid: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+    const val bridgeManufacturerId: Int = 0x02E5
 
     const val protocolVersion: Int = 1
     const val frameHeaderBytes: Int = 7

@@ -40,7 +40,7 @@ python app.py
 17. In `Settings`:
    - abilita/disabilita `Auto-connect all'avvio` e `Auto-retry su disconnessione`
    - abilita/disabilita `Auto-check updates`
-   - su macOS puoi attivare `menu bar mode` e `nascondi Dock icon`.
+   - opzioni specifiche per piattaforma: su macOS `menu bar mode` + `hide Dock`; su Windows/Linux solo opzioni supportate.
 18. Al primo avvio su macOS compare una schermata guidata permessi (Bluetooth, Screen Recording, Accessibility).
 
 ## Dettagli
@@ -56,8 +56,9 @@ python app.py
 - Supporta chat multiple con cronologia persistente (file `chat_sessions.json`).
 - Rendering markdown nelle risposte Gemini (heading, code block, link cliccabili).
 - Heartbeat ping/pong e auto-reconnect BLE per mantenere la sessione stabile.
+- Identita bridge stabile (`bridge_id`) in advertising per reconnect affidabile anche con address BLE variabile.
 - Mostra stima token prima invio e warning su richieste a rischio timeout.
-- Mostra progress upload su payload BLE grandi (es. immagini).
+- Mostra progress upload su payload BLE grandi (es. immagini) e stato esplicito dopo upload completato.
 - Supporta streaming progressivo delle risposte Gemini anche con web search (fallback automatici).
 - Supporta Thinking Mode + Think Budget + thought trace (`includeThoughts`) nel payload API.
 - Supporta stop generazione (`cancel`) dal bottone `STOP`.

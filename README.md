@@ -6,6 +6,7 @@ Chat PC <-> Android via BLE (senza Wi-Fi sul PC), con Gemini sul telefono.
 - Desktop app (Python/Tkinter) con chat multipla, PDF, immagini, markdown, streaming.
 - Bridge Android BLE + chiamata Gemini API.
 - Supporto multi-client BLE (piu desktop connessi allo stesso telefono, risposta routata al client corretto).
+- Reconnect robusto con `bridge_id` stabile (advertising identity) anche se l'indirizzo BLE cambia.
 - Ottimizzazione multi-client: coda invio per-device, priorita messaggi critici (pong/result/error), preferenza PHY 2M.
 - Autoupdater:
   - desktop: check release GitHub + download asset corretto per piattaforma,
