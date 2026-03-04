@@ -48,7 +48,7 @@ class BleChatClient:
     def __init__(self, event_sink: EventSink) -> None:
         self._event_sink = event_sink
         self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread = threading.Thread(target=self._run_loop, name="BleChatClientLoop", daemon=False)
         self._client: BleakClient | None = None
         self._max_packet_size = DEFAULT_MAX_PACKET_SIZE
         self._assembler = FrameAssembler()
@@ -67,6 +67,7 @@ class BleChatClient:
         self._discovered_devices: dict[str, Any] = {}
         self._known_device_names: dict[str, str] = {}
         self._known_bridge_id_by_address: dict[str, str] = {}
+        self._loop_closed = False
 
     def start(self) -> None:
         if self._thread_started:
@@ -80,15 +81,34 @@ class BleChatClient:
             return
 
         self._closing = True
+        self._stop_reconnect()
+        self._stop_heartbeat()
 
         disconnect_future = self._run_coro(self._disconnect())
         try:
-            disconnect_future.result(timeout=5)
+            disconnect_future.result(timeout=8)
         except Exception:
             pass
 
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout=2)
+        def shutdown_loop() -> None:
+            if self._loop.is_closed():
+                return
+            self._stop_reconnect()
+            self._stop_heartbeat()
+            current = asyncio.current_task(loop=self._loop)
+            for task in asyncio.all_tasks(self._loop):
+                if task is current:
+                    continue
+                if not task.done():
+                    task.cancel()
+            self._loop.stop()
+
+        try:
+            self._loop.call_soon_threadsafe(shutdown_loop)
+        except Exception:
+            pass
+
+        self._thread.join(timeout=15)
         self._thread_started = False
 
     def scan_devices(self) -> None:
@@ -238,9 +258,37 @@ class BleChatClient:
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
+        try:
+            self._loop.run_forever()
+        finally:
+            if not self._loop.is_closed():
+                pending = [task for task in asyncio.all_tasks(self._loop) if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    try:
+                        self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    except Exception:
+                        pass
+                try:
+                    self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+                try:
+                    self._loop.run_until_complete(self._loop.shutdown_default_executor())
+                except Exception:
+                    pass
+                try:
+                    self._loop.close()
+                except Exception:
+                    pass
+            self._loop_closed = True
 
     def _run_coro(self, coro: Any) -> Future:
+        if self._loop_closed or self._loop.is_closed():
+            future: Future = Future()
+            future.set_exception(RuntimeError("BLE event loop is closed"))
+            return future
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     def _emit(self, event: dict[str, Any]) -> None:
@@ -804,4 +852,10 @@ class BleChatClient:
         self._client = None
         self._stop_heartbeat()
         self._emit({"type": "disconnected"})
-        self._loop.call_soon_threadsafe(self._start_reconnect)
+        if self._closing:
+            return
+        try:
+            if not self._loop.is_closed():
+                self._loop.call_soon_threadsafe(self._start_reconnect)
+        except Exception:
+            pass

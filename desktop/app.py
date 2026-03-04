@@ -130,7 +130,7 @@ MODEL_PRESETS = [
     "gemini-2.0-pro-exp",
 ]
 
-APP_VERSION = "0.1.12"
+APP_VERSION = "0.1.13"
 GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
 
 
