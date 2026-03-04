@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import json
 import hashlib
 import os
@@ -130,7 +131,7 @@ MODEL_PRESETS = [
     "gemini-2.0-pro-exp",
 ]
 
-APP_VERSION = "0.1.14"
+APP_VERSION = "0.1.15"
 GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
 
 
@@ -156,6 +157,7 @@ else:
 
 class DesktopChatApp:
     def __init__(self) -> None:
+        self._closing_app = False
         self.root = CTkinterDnD()
         self.root.title("Gemini BLE Chat")
         self.root.geometry("1240x780")
@@ -285,6 +287,13 @@ class DesktopChatApp:
         self._auto_install_quick_action()
         self._start_overlay_hotkey_listener()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        if self._is_macos:
+            try:
+                self.root.createcommand("tk::mac::Quit", self.on_close)
+            except Exception:
+                pass
+        self.root.bind_all("<Command-q>", self._on_app_quit_shortcut, add="+")
+        atexit.register(self._atexit_shutdown)
         self.root.after(100, self._poll_events)
         self.root.after(1200, self._maybe_auto_connect_on_start)
         self.root.after(1500, self._maybe_show_permissions_onboarding)
@@ -3620,6 +3629,9 @@ class DesktopChatApp:
             self.root.iconify()
 
     def on_close(self) -> None:
+        if self._closing_app:
+            return
+        self._closing_app = True
         if self._overlay_listener is not None:
             try:
                 self._overlay_listener.stop()
@@ -3642,8 +3654,37 @@ class DesktopChatApp:
         latest_settings["last_connected_bridge_id"] = self._last_connected_bridge_id
         self._save_settings(latest_settings)
         self._hide_overlay_window()
-        self.client.stop()
-        self.root.destroy()
+        try:
+            self.client.stop()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def _on_app_quit_shortcut(self, _event: tk.Event[Any] | None = None) -> str:
+        self.on_close()
+        return "break"
+
+    def _atexit_shutdown(self) -> None:
+        if self._closing_app:
+            return
+        self._closing_app = True
+        if self._overlay_listener is not None:
+            try:
+                self._overlay_listener.stop()
+            except Exception:
+                pass
+            self._overlay_listener = None
+        try:
+            self._stop_menu_bar_icon()
+        except Exception:
+            pass
+        try:
+            self.client.stop()
+        except Exception:
+            pass
 
     def run(self) -> None:
         self.root.mainloop()
