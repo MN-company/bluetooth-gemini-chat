@@ -130,7 +130,7 @@ MODEL_PRESETS = [
     "gemini-2.0-pro-exp",
 ]
 
-APP_VERSION = "0.1.13"
+APP_VERSION = "0.1.14"
 GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
 
 
@@ -504,7 +504,7 @@ class DesktopChatApp:
         ctk.CTkButton(context_actions, text="Clipboard", width=90, command=self.on_clipboard_send).pack(side=tk.LEFT, padx=(0, 4))
         ctk.CTkButton(context_actions, text="Add PDF", width=86, command=self.on_add_pdf).pack(side=tk.LEFT, padx=(0, 4))
         ctk.CTkButton(context_actions, text="Clear Img", width=78, command=self.on_clear_image).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(context_actions, text="Clear PDFs", width=84, command=self.on_clear_pdf).pack(side=tk.LEFT)
+        ctk.CTkButton(context_actions, text="Clear PDFs", width=84, command=self.on_clear_pdfs).pack(side=tk.LEFT)
 
         quick_row = ctk.CTkFrame(composer_card, fg_color="transparent")
         quick_row.pack(fill=tk.X, padx=10, pady=(0, 4))
@@ -2949,6 +2949,10 @@ class DesktopChatApp:
         self._refresh_pdf_label()
         self._refresh_context_preview()
         self._append_log("System", "PDF context cleared")
+
+    # Backward-compatible alias (older callbacks referenced singular name).
+    def on_clear_pdf(self) -> None:
+        self.on_clear_pdfs()
 
     def _on_file_drop(self, event) -> None:
         data = getattr(event, 'data', "")
