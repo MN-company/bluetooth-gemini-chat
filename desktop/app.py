@@ -71,7 +71,7 @@ except Exception:
     pynput_keyboard = None
 
 
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 
 MODEL_PRESETS = [
     "phone-default",
@@ -619,6 +619,14 @@ class DesktopOverlayApp:
             self.activity_box.insert("1.0", "\n".join(self._activity_lines))
             self.activity_box.configure(state="disabled")
             self.activity_box.see(tk.END)
+        except Exception:
+            pass
+
+    def _enqueue_menu_action(self, action: str, **payload: Any) -> None:
+        event: dict[str, Any] = {"type": "menu_action", "action": action}
+        event.update(payload)
+        try:
+            self.events.put_nowait(event)
         except Exception:
             pass
 
@@ -1302,6 +1310,41 @@ class DesktopOverlayApp:
                 self._send_text_overlay_request(text)
             return
 
+        if event_type == "menu_action":
+            action = str(event.get("action", "")).strip().lower()
+            if action == "show_window":
+                self.show_window()
+                return
+            if action == "scan_devices":
+                self.on_scan_devices()
+                return
+            if action == "connect_last":
+                self.on_connect_last()
+                return
+            if action == "connect_hint":
+                address = str(event.get("address", "")).strip()
+                bridge_id = self._normalize_bridge_id(event.get("bridge_id"))
+                self._connect_with_hint(address, bridge_id)
+                return
+            if action == "disconnect":
+                self.on_disconnect()
+                return
+            if action == "shot":
+                self.on_hotkey_overlay_triggered()
+                return
+            if action == "clipboard":
+                self.on_hotkey_clipboard_triggered()
+                return
+            if action == "hide_overlay":
+                self.hide_overlay()
+                return
+            if action == "set_model":
+                self._set_model_from_menu(str(event.get("model", "")).strip())
+                return
+            if action == "quit":
+                self.quit_app()
+                return
+
         if event_type == "status":
             text = str(event.get("text", "")).strip()
             if text:
@@ -1676,9 +1719,9 @@ class DesktopOverlayApp:
         status_line = add_item(self.status_var.get().strip() or "Disconnected", lambda: None, enabled=False)
         status_line.setToolTip_(self.link_var.get().strip())
         menu.addItem_(NSMenuItem.separatorItem())
-        add_item("Show Settings", self.show_window)
-        add_item("Scan Devices", self.on_scan_devices)
-        add_item("Connect Last", self.on_connect_last)
+        add_item("Show Settings", lambda: self._enqueue_menu_action("show_window"))
+        add_item("Scan Devices", lambda: self._enqueue_menu_action("scan_devices"))
+        add_item("Connect Last", lambda: self._enqueue_menu_action("connect_last"))
 
         connect_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Connect Scanned", None, "")
         connect_submenu = NSMenu.alloc().init()
@@ -1688,7 +1731,9 @@ class DesktopOverlayApp:
                 address = str(device.get("address", "")).strip()
                 bridge_id = self._normalize_bridge_id(device.get("bridge_id"))
                 target = _MacMenuActionTarget.alloc().initWithCallback_(
-                    lambda address=address, bridge_id=bridge_id: self._connect_with_hint(address, bridge_id)
+                    lambda address=address, bridge_id=bridge_id: self._enqueue_menu_action(
+                        "connect_hint", address=address, bridge_id=bridge_id
+                    )
                 )
                 sub_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(label, "onAction:", "")
                 sub_item.setTarget_(target)
@@ -1701,18 +1746,18 @@ class DesktopOverlayApp:
         connect_item.setSubmenu_(connect_submenu)
         menu.addItem_(connect_item)
 
-        add_item("Disconnect", self.on_disconnect, enabled=self.connected)
+        add_item("Disconnect", lambda: self._enqueue_menu_action("disconnect"), enabled=self.connected)
         menu.addItem_(NSMenuItem.separatorItem())
-        add_item("Shot+Ask", self.on_hotkey_overlay_triggered)
-        add_item("Clipboard Ask", self.on_hotkey_clipboard_triggered)
-        add_item("Hide Overlay", self.hide_overlay)
+        add_item("Shot+Ask", lambda: self._enqueue_menu_action("shot"))
+        add_item("Clipboard Ask", lambda: self._enqueue_menu_action("clipboard"))
+        add_item("Hide Overlay", lambda: self._enqueue_menu_action("hide_overlay"))
         menu.addItem_(NSMenuItem.separatorItem())
 
         models_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Model", None, "")
         models_menu = NSMenu.alloc().init()
         for model in MODEL_PRESETS:
             target = _MacMenuActionTarget.alloc().initWithCallback_(
-                lambda model_name=model: self._set_model_from_menu(model_name)
+                lambda model_name=model: self._enqueue_menu_action("set_model", model=model_name)
             )
             item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(model, "onAction:", "")
             item.setTarget_(target)
@@ -1727,7 +1772,7 @@ class DesktopOverlayApp:
         menu.addItem_(models_item)
 
         menu.addItem_(NSMenuItem.separatorItem())
-        add_item("Quit", self.quit_app)
+        add_item("Quit", lambda: self._enqueue_menu_action("quit"))
 
         status_item.setMenu_(menu)
         self._mac_status_item = status_item
