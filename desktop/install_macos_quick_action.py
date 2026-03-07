@@ -292,6 +292,7 @@ def _ensure_wrapper(script_path: Path) -> Path:
     default_wrapper = runtime_dir / "ask_gemini_ble.sh"
     shot_wrapper = runtime_dir / "ask_gemini_ble_shot.sh"
     clipboard_wrapper = runtime_dir / "ask_gemini_ble_clipboard.sh"
+    hide_overlay_wrapper = runtime_dir / "hide_gemini_ble_overlay.sh"
     toggle_wrapper = runtime_dir / "toggle_gemini_ble.sh"
     helper_path = script_path.with_name("macos_quick_ask.py")
     inbox_path = runtime_dir / "quick_inbox.jsonl"
@@ -309,6 +310,10 @@ def _ensure_wrapper(script_path: Path) -> Path:
     _write_wrapper(
         clipboard_wrapper,
         f'GEMINI_INPUT_TEXT="" exec python3 "{runtime_helper}" "{inbox_path}" quick_clipboard "$*"',
+    )
+    _write_wrapper(
+        hide_overlay_wrapper,
+        f'GEMINI_INPUT_TEXT="" exec python3 "{runtime_helper}" "{inbox_path}" hide_overlay ""',
     )
     _write_wrapper(
         toggle_wrapper,

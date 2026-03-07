@@ -188,7 +188,8 @@ class BleChatClient:
                 f"Request payload too large ({len(payload)} bytes). "
                 f"Reduce prompt/context/image (max {MAX_REQUEST_BYTES} bytes)."
             )
-        reliable = image_path is not None or len(payload) >= 60 * 1024
+        # Small optimized screenshots are faster and usually stable enough with write-without-response.
+        reliable = len(payload) >= 96 * 1024 or (image_path is not None and len(payload) >= 52 * 1024)
         self._run_coro(self._send_payload(payload, request_id, reliable=reliable))
         return request_id
 

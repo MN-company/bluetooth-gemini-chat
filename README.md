@@ -1,96 +1,83 @@
-# Bluetooth Gemini Chat
+# Bluetooth Gemini Overlay
 
-Chat PC <-> Android via BLE (senza Wi-Fi sul PC), con Gemini sul telefono.
+BLE bridge between desktop and Android phone for `Shot+Ask`.
 
-## Cosa include
-- Desktop app (Python/Tkinter) con chat multipla, PDF, immagini, markdown, streaming.
-- Bridge Android BLE + chiamata Gemini API.
-- Supporto multi-client BLE (piu desktop connessi allo stesso telefono, risposta routata al client corretto).
-- Reconnect robusto con `bridge_id` stabile (advertising identity) anche se l'indirizzo BLE cambia.
-- Ottimizzazione multi-client: coda invio per-device, priorita messaggi critici (pong/result/error), preferenza PHY 2M.
-- Autoupdater:
-  - desktop: check release GitHub + download asset corretto per piattaforma,
-  - Android: check release in-app + apertura diretta APK release.
-- Selettore modello da PC (`phone-default` o override per richiesta).
-- Lista modelli disponibili da API direttamente nell'app Android.
-- Screenshot rapido con overlay risposta (Windows: hotkey globale, macOS: Apple Shortcuts wrapper).
-- Modalita macOS menu bar + opzione nascondi icona Dock.
-- APK pronta in `dist/app-debug.apk`.
+The desktop app is now a background utility, not a full chat UI:
+- macOS: menu bar app
+- Windows: tray/background app
+- BLE transport unchanged
+- main interaction path: screenshot or clipboard -> Gemini on the phone -> overlay text on desktop
 
-## Installazione rapida (altri dispositivi)
+## Architecture
 
-### 0) Desktop senza Python (macOS/Windows/Linux)
-1. Vai su GitHub -> `Actions` -> workflow `Build Desktop Clients`.
-2. Apri l'ultima run riuscita.
-3. Scarica artifact:
-   - `desktop-macOS` -> `BluetoothGeminiChat-macos.dmg`
-   - `desktop-Windows` -> `BluetoothGeminiChat-windows.zip`
-   - `desktop-Linux` -> `BluetoothGeminiChat-linux.tar.gz`
-4. Su macOS apri il DMG e trascina `BluetoothGeminiChat.app` in `Applications`.
-5. Su Windows estrai lo ZIP e avvia `BluetoothGeminiChat.exe`.
-6. Su Linux estrai il `.tar.gz`, rendi eseguibile e avvia:
-   ```bash
-   tar -xzf BluetoothGeminiChat-linux.tar.gz
-   cd BluetoothGeminiChat
-   chmod +x BluetoothGeminiChat
-   ./BluetoothGeminiChat
-   ```
+- Desktop:
+  - `desktop/app.py`: settings window, menu bar/tray, overlay, shortcut inbox
+  - `desktop/ble_client.py`: BLE central client
+- Android:
+  - `android/GeminiBluetoothBridge/.../BleServerManager.kt`: BLE server
+  - `android/GeminiBluetoothBridge/.../BleKeepAliveService.kt`: request routing + Gemini + streaming
 
-Nota: su macOS devi concedere `Screen Recording` per gli screenshot area.
-Nota Linux: per screenshot area installa almeno uno tra:
-- Wayland: `grim` + `slurp` (+ `wl-clipboard` per immagini da clipboard)
-- X11: `gnome-screenshot` oppure `maim`/`scrot` (+ `xclip` per immagini da clipboard)
+## Install
 
-### Linux (Arch) dipendenze consigliate
+### Desktop release builds
+
+Download the latest release assets:
+- macOS: `BluetoothGeminiChat-macos.dmg`
+- Windows: `BluetoothGeminiChat-windows.zip`
+- Linux: `BluetoothGeminiChat-linux.tar.gz`
+
+### Local desktop run
+
 ```bash
-sudo pacman -S --needed bluez bluez-utils libnotify xclip wl-clipboard grim slurp maim scrot
+cd desktop
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python app.py
 ```
 
-### 1) Android (APK)
-1. Abilita `USB debugging` sul telefono.
-2. Collega via USB.
-3. Installa:
-   ```bash
-   ./scripts/install_android_apk.sh
-   ```
-4. Apri app `Gemini Bridge`, inserisci API key, salva, concedi permessi BLE.
-5. Premi `Disable Battery Optimization` nell'app Android (consigliato).
-6. In `Settings` dell'app Android usa `Check update` e `Scarica APK` per aggiornare.
+### Android
 
-### 2) Desktop
 ```bash
-./scripts/setup_desktop.sh
-./scripts/run_desktop.sh
+./scripts/build_android_apk.sh
+./scripts/install_android_apk.sh
 ```
 
-## Uso minimo
-1. Avvia app Android (bridge attivo).
-2. Avvia app desktop.
-3. `Scan` -> seleziona telefono -> `Connect`.
-4. Scrivi prompt e `Send`.
-5. Overlay rapido:
-   - macOS: Shortcut Apple con `~/.gemini_ble/ask_gemini_ble_shot.sh` (es. `Cmd+Shift+G`)
-   - macOS (clipboard): Shortcut Apple con `~/.gemini_ble/ask_gemini_ble_clipboard.sh`
-   - Windows: `Ctrl+Shift+G` (hotkey globale integrata)
+## Current desktop flow
 
-## Apple Shortcuts (link pronti)
-- BLE clipboard: [https://www.icloud.com/shortcuts/ae088b6775b042e38ffab54275f46c0c](https://www.icloud.com/shortcuts/ae088b6775b042e38ffab54275f46c0c)
-- BLE screenshot: [https://www.icloud.com/shortcuts/cd88dd6781a5427390f8034fe265a75b](https://www.icloud.com/shortcuts/cd88dd6781a5427390f8034fe265a75b)
+1. Launch desktop app.
+2. Keep Android bridge app active.
+3. Auto-connect or use `Scan` + `Connect Selected`.
+4. Trigger:
+   - screenshot ask
+   - clipboard ask
+5. Read the streamed answer directly in the desktop overlay.
 
-## Script utili
-- `scripts/setup_desktop.sh`: crea venv e installa dipendenze desktop.
-- `scripts/run_desktop.sh`: avvia la chat desktop.
-- `scripts/build_desktop_bundle.sh`: genera bundle desktop locale con PyInstaller.
-- `scripts/install_android_apk.sh`: installa APK via adb.
-- `scripts/build_android_apk.sh`: rebuild APK debug e copia in `dist/`.
+## Shortcut wrappers
 
-## Dove sono i file principali
-- Desktop UI: `desktop/app.py`
-- BLE desktop: `desktop/ble_client.py`
-- Android service: `android/GeminiBluetoothBridge/app/src/main/java/com/example/geminibridge/BleKeepAliveService.kt`
-- Gemini client Android: `android/GeminiBluetoothBridge/app/src/main/java/com/example/geminibridge/GeminiApiClient.kt`
+### macOS
 
-## Note
-- Quota e billing sono della Gemini API key/progetto, non del piano consumer Gemini app.
-- Su telefoni Xiaomi/MIUI/HyperOS: disattivare ottimizzazione batteria è fondamentale.
-- Valutazione rete mesh BLE: vedi `docs/mesh-evaluation.md` (non consigliata per questa architettura GATT).
+The app installs these wrappers into `~/.gemini_ble/`:
+- `ask_gemini_ble_shot.sh`
+- `ask_gemini_ble_clipboard.sh`
+- `hide_gemini_ble_overlay.sh`
+- `toggle_gemini_ble.sh`
+
+These are intended for Apple Shortcuts / keyboard shortcuts.
+
+### Windows / Linux
+
+Built-in global shortcuts:
+- `Ctrl+Shift+G`: Shot+Ask
+- `Ctrl+Shift+C`: Clipboard Ask
+- `Ctrl+Shift+H`: Hide overlay
+
+## Performance strategy
+
+This version improves responsiveness without breaking cross-platform BLE compatibility:
+- smaller screenshot payloads before BLE upload
+- faster partial streaming from Android
+- high-priority transmission for partial/result/error messages
+- reconnect based on stable `bridge_id`
+
+L2CAP CoC and server-side connection-priority forcing were not adopted because the current cross-platform stack (`Bleak` + macOS + Windows) would become less portable and less stable.

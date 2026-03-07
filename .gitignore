@@ -7,6 +7,7 @@ __pycache__/
 *.pyo
 *.pyd
 .venv/
+.venv-test/
 
 # Desktop local state
 desktop/.venv/
@@ -15,6 +16,7 @@ desktop/__pycache__/
 desktop/chat_sessions.json
 desktop/chat_memory.json
 desktop/quick_inbox.jsonl
+desktop/settings.json
 
 # Android build/local
 android/**/build/

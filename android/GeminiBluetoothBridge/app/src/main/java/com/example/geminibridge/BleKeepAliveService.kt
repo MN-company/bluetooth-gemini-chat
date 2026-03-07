@@ -458,14 +458,20 @@ class BleKeepAliveService : Service() {
                 activeContainerName = request.activeContainerName?.takeIf { it.isNotBlank() },
                 onPartialText = { partial ->
                     val now = System.currentTimeMillis()
-                    val longEnough = partial.length >= (lastPartialLength + 12)
-                    val timed = (now - lastAnswerPartialSentMs) >= 350L
+                    val longEnough = partial.length >= (lastPartialLength + 5)
+                    val timed = (now - lastAnswerPartialSentMs) >= 180L
                     if (longEnough && timed) {
                         lastPartialLength = partial.length
                         lastAnswerPartialSentMs = now
                         serviceScope.launch {
                             runCatching {
-                                sendPartial(request.messageId, partial, channel = "answer", targetAddress = sourceAddress)
+                                sendPartial(
+                                    request.messageId,
+                                    partial,
+                                    channel = "answer",
+                                    targetAddress = sourceAddress,
+                                    highPriority = true,
+                                )
                             }
                         }
                     }
@@ -473,8 +479,8 @@ class BleKeepAliveService : Service() {
                 onPartialThought = { partialThought ->
                     if (includeThoughts) {
                         val now = System.currentTimeMillis()
-                        val longEnough = partialThought.length >= (lastThoughtLength + 12)
-                        val timed = (now - lastThoughtPartialSentMs) >= 450L
+                        val longEnough = partialThought.length >= (lastThoughtLength + 8)
+                        val timed = (now - lastThoughtPartialSentMs) >= 260L
                         if (longEnough && timed) {
                             lastThoughtLength = partialThought.length
                             lastThoughtPartialSentMs = now
@@ -485,6 +491,7 @@ class BleKeepAliveService : Service() {
                                         partialThought,
                                         channel = "thought",
                                         targetAddress = sourceAddress,
+                                        highPriority = true,
                                     )
                                 }
                             }
@@ -545,6 +552,7 @@ class BleKeepAliveService : Service() {
         text: String,
         channel: String,
         targetAddress: String? = null,
+        highPriority: Boolean = false,
     ) {
         val safeChannel = if (channel == "thought") "thought" else "answer"
         val payload = json.encodeToString(
@@ -554,7 +562,7 @@ class BleKeepAliveService : Service() {
                 channel = safeChannel,
             )
         )
-        sendToPc(payload, "partial", messageId, targetAddress)
+        sendToPc(payload, "partial", messageId, targetAddress, highPriority = highPriority)
     }
 
     private suspend fun sendError(messageId: String, error: String, targetAddress: String? = null) {

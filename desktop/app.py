@@ -2,65 +2,37 @@ from __future__ import annotations
 
 import atexit
 import json
-import hashlib
 import os
 import platform
 import queue
-import re
 import shlex
-import shutil
-import ssl
 import subprocess
 import tempfile
 import threading
 import time
 import tkinter as tk
-import customtkinter as ctk
-import webbrowser
 from pathlib import Path
-from tkinter import colorchooser, filedialog, simpledialog, ttk
+from tkinter import colorchooser, simpledialog
+from tkinter import font as tkfont
 from typing import Any
-from urllib import error as urlerror
-from urllib import request as urlrequest
 
-try:
-    from tkinterdnd2 import TkinterDnD, DND_FILES
-except Exception:
-    TkinterDnD = None
-    DND_FILES = "DND_FILES"
-
-
-if TkinterDnD is not None:
-    class CTkinterDnD(ctk.CTk, TkinterDnD.DnDWrapper):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.TkdndVersion = TkinterDnD._require(self)
-else:
-    class CTkinterDnD(ctk.CTk):
-        pass
-
+import customtkinter as ctk
 
 from ble_client import BleChatClient
-from chat_sessions import ChatSessionsStore
-from context_store import ContextStore
-from pdf_context import PdfContextEngine
 
 try:
-    from PIL import ImageGrab, Image as PILImage, ImageDraw
+    from PIL import Image as PILImage
+    from PIL import ImageDraw
+    from PIL import ImageGrab
 except Exception:
-    ImageGrab = None
     PILImage = None
     ImageDraw = None
+    ImageGrab = None
 
 try:
     import pystray
 except Exception:
     pystray = None
-
-try:
-    import certifi
-except Exception:
-    certifi = None
 
 try:
     import objc
@@ -94,45 +66,63 @@ except Exception:
     NSObject = None
 
 try:
-    from ApplicationServices import (
-        AXIsProcessTrusted,
-        AXIsProcessTrustedWithOptions,
-        kAXTrustedCheckOptionPrompt,
-    )
-except Exception:
-    AXIsProcessTrusted = None
-    AXIsProcessTrustedWithOptions = None
-    kAXTrustedCheckOptionPrompt = None
-
-try:
-    from Quartz import CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess
-except Exception:
-    CGPreflightScreenCaptureAccess = None
-    CGRequestScreenCaptureAccess = None
-
-try:
-    from CoreBluetooth import CBCentralManager
-except Exception:
-    CBCentralManager = None
-
-try:
     from pynput import keyboard as pynput_keyboard
 except Exception:
     pynput_keyboard = None
 
+
+APP_VERSION = "0.2.0"
+
 MODEL_PRESETS = [
     "phone-default",
-    "gemini-2.5-pro",
     "gemini-2.5-flash",
-    "gemini-2.5-pro-preview-03-25",
-    "gemini-2.5-flash-preview-04-17",
+    "gemini-2.5-pro",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
-    "gemini-2.0-pro-exp",
+    "gemini-2.5-pro-preview-03-25",
+    "gemini-2.5-flash-preview-04-17",
 ]
 
-APP_VERSION = "0.1.15"
-GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
+OVERLAY_POSITIONS = {
+    "top-right": "Top Right",
+    "top-left": "Top Left",
+    "bottom-right": "Bottom Right",
+    "bottom-left": "Bottom Left",
+}
+
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "system_instruction": "",
+    "model": "phone-default",
+    "overlay_position": "bottom-right",
+    "overlay_text_color": "#F8FAFC",
+    "overlay_opacity": 0.72,
+    "overlay_text_size": 22,
+    "overlay_timeout_seconds": 15,
+    "auto_connect_on_start": True,
+    "auto_retry_known_device": True,
+    "menu_bar_mode_enabled": True,
+    "hide_dock_icon_enabled": True,
+    "last_connected_address": "",
+    "last_connected_bridge_id": "",
+    "last_selected_device": "",
+}
+
+DEFAULT_SCREENSHOT_PROMPT = (
+    "Analizza rapidamente questo screenshot. Rispondi in italiano in modo utile, sintetico e concreto."
+)
+DEFAULT_CLIPBOARD_PROMPT = (
+    "Analizza rapidamente questo contenuto dagli appunti. Rispondi in italiano in modo utile, sintetico e concreto."
+)
+DEFAULT_QUICK_TEXT_PROMPT = (
+    "Analizza rapidamente questo testo. Rispondi in italiano in modo utile, sintetico e concreto."
+)
+FAST_SCREENSHOT_TARGET_BYTES = 38 * 1024
+FAST_SCREENSHOT_MAX_DIMENSION = 640
+FAST_CLIPBOARD_TARGET_BYTES = 32 * 1024
+FAST_CLIPBOARD_MAX_DIMENSION = 560
+OVERLAY_HARD_TIMEOUT_SECONDS = 95.0
+OVERLAY_IDLE_TIMEOUT_SECONDS = 24.0
+POLL_INTERVAL_MS = 90
 
 
 if objc is not None and NSObject is not None:
@@ -145,987 +135,1480 @@ if objc is not None and NSObject is not None:
             return self
 
         def onAction_(self, _sender: Any) -> None:
+            callback = getattr(self, "_callback", None)
+            if callback is None:
+                return
             try:
-                cb = getattr(self, "_callback", None)
-                if cb is not None:
-                    cb()
+                callback()
             except Exception:
                 pass
 else:
     _MacMenuActionTarget = None
 
 
-class DesktopChatApp:
+class DesktopOverlayApp:
     def __init__(self) -> None:
         self._closing_app = False
-        self.root = CTkinterDnD()
-        self.root.title("Gemini BLE Chat")
-        self.root.geometry("1240x780")
-        self.root.minsize(980, 640)
-        self._dnd_available = False
-        if TkinterDnD is not None:
-            try:
-                self.root.drop_target_register(DND_FILES)
-                self.root.dnd_bind("<<Drop>>", self._on_file_drop)
-                self._dnd_available = True
-            except Exception:
-                self._dnd_available = False
+        self._window_visible = True
+        self._platform_name = platform.system().lower()
+        self._is_macos = self._platform_name == "darwin"
+        self._is_windows = self._platform_name.startswith("windows")
+        self._runtime_bridge_dir = Path.home() / ".gemini_ble"
+        self._runtime_bridge_dir.mkdir(parents=True, exist_ok=True)
+        self._settings_path = Path(__file__).with_name("settings.json")
+        self._first_run = not self._settings_path.exists()
+        self._settings = self._load_settings()
+
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+
+        self.root = ctk.CTk()
+        self.root.title("Gemini BLE Overlay")
+        self.root.geometry("680x820")
+        self.root.minsize(560, 620)
 
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.client = BleChatClient(self.events.put)
         self.client.start()
 
         self.devices: list[dict[str, str]] = []
+        self._device_label_map: dict[str, dict[str, str]] = {}
         self.connected = False
-        self.selected_image_path: str | None = None
-        self.selected_pdf_paths: list[str] = []
-        self.pdf_context_engine = PdfContextEngine()
+        self._current_link_rtt: int | None = None
+        self._last_link_state = "offline"
+        self._last_connected_address = str(self._settings.get("last_connected_address", "")).strip() or None
+        self._last_connected_bridge_id = self._normalize_bridge_id(self._settings.get("last_connected_bridge_id"))
+        self._pending_quick_action: dict[str, Any] | None = None
 
-        sessions_path = str(Path(__file__).with_name("chat_sessions.json"))
-        self.sessions_store = ChatSessionsStore(sessions_path)
-        self.active_session_id = self.sessions_store.active_session_id
-
-        self._pending_request_session: dict[str, str] = {}
-        self._pending_request_order: list[str] = []
-        self._streaming_preview_by_session: dict[str, str] = {}
-        self._streaming_thought_by_session: dict[str, str] = {}
-        self._session_ids_in_view: list[str] = []
-        self._last_link_state = "unknown"
-        self._runtime_bridge_dir = Path.home() / ".gemini_ble"
-        self._runtime_bridge_dir.mkdir(parents=True, exist_ok=True)
         self._quick_inbox_path = self._runtime_bridge_dir / "quick_inbox.jsonl"
         self._quick_inbox_offset = 0
-        self._md_link_seq = 0
-        self._md_link_urls: dict[str, str] = {}
-        self._pip_mode_active = False
-        self._pre_pip_geometry = ""
-        self._platform_name = platform.system().lower()
-        self._is_macos = self._platform_name == "darwin"
-        self._overlay_listener: Any | None = None
-        self._overlay_hotkey = "Apple Shortcut (Cmd+Shift+G)" if self._is_macos else "Ctrl+Shift+G"
-        self._overlay_request_ids: set[str] = set()
-        self._overlay_image_paths_by_request: dict[str, str] = {}
-        self._overlay_started_at: dict[str, float] = {}
-        self._overlay_last_update_at: dict[str, float] = {}
-        self._overlay_timeout_seconds = 95.0
-        self._overlay_idle_timeout_seconds = 22.0
-        self._overlay_last_present_at = 0.0
-        self._overlay_hide_after_id: str | None = None
-        self._overlay_window: tk.Toplevel | None = None
-        self._overlay_message_widget: tk.Message | None = None
-        self._overlay_text_var = tk.StringVar(value="")
         self._toggle_flag_path = self._runtime_bridge_dir / "toggle.flag"
         self._toggle_flag_mtime = 0.0
         self._clipboard_flag_path = self._runtime_bridge_dir / "clipboard.flag"
         self._clipboard_flag_mtime = 0.0
 
-        self._settings_path = Path(__file__).with_name("settings.json")
-        _saved = self._load_settings()
-        self.system_instructions_var = tk.StringVar(value=_saved.get("system_instructions", ""))
-        self.pinned_pdf_paths: list[str] = _saved.get("pinned_pdf_paths", [])
-        self._last_connected_address = str(_saved.get("last_connected_address", "")).strip() or None
-        self._last_connected_bridge_id = self._normalize_bridge_id(_saved.get("last_connected_bridge_id"))
-        self._auto_connect_on_start = bool(_saved.get("auto_connect_on_start", True))
-        self._auto_retry_known_device = bool(_saved.get("auto_retry_known_device", True))
-        self._auto_check_updates = bool(_saved.get("auto_check_updates", True))
-        self._menu_bar_mode_enabled = bool(_saved.get("menu_bar_mode_enabled", self._is_macos))
-        self._hide_dock_icon_enabled = bool(_saved.get("hide_dock_icon_enabled", self._is_macos))
-        self._overlay_bg_color = self._normalize_hex_color(_saved.get("overlay_bg_color"), "#0f172a")
-        self._overlay_width = self._parse_int_setting(_saved.get("overlay_width"), 460, 320, 1280)
-        self._overlay_height = self._parse_int_setting(_saved.get("overlay_height"), 220, 160, 900)
-        self._overlay_resizable = bool(_saved.get("overlay_resizable", True))
-        self._overlay_timeout_seconds = float(
-            self._parse_int_setting(_saved.get("overlay_timeout_seconds"), int(self._overlay_timeout_seconds), 30, 240)
-        )
+        self._overlay_hotkey_listener: Any | None = None
+        self._overlay_request_ids: set[str] = set()
+        self._overlay_primary_request_id: str | None = None
+        self._overlay_image_paths_by_request: dict[str, str] = {}
+        self._overlay_started_at: dict[str, float] = {}
+        self._overlay_last_update_at: dict[str, float] = {}
+        self._overlay_window: tk.Toplevel | None = None
+        self._overlay_canvas: tk.Canvas | None = None
+        self._overlay_text_id: int | None = None
+        self._overlay_hide_after_id: str | None = None
+        self._overlay_pending_render_id: str | None = None
+        self._overlay_pending_text: str = ""
+        self._overlay_pending_ttl_ms: int = 0
+        self._overlay_visible = False
+
         self._tray_icon: Any | None = None
         self._tray_thread: threading.Thread | None = None
         self._mac_status_item: Any | None = None
         self._mac_status_menu: Any | None = None
         self._mac_status_targets: list[Any] = []
-        self._permissions_dialog: ctk.CTkToplevel | None = None
-        self._bluetooth_probe_manager: Any | None = None
-        self._macos_policy_applied = False
-        if self._is_macos:
-            self._menu_bar_available = (
-                NSStatusBar is not None
-                and NSMenu is not None
-                and NSMenuItem is not None
-                and NSApplication is not None
-                and _MacMenuActionTarget is not None
-            )
-        else:
-            self._menu_bar_available = pystray is not None and PILImage is not None
 
-        self._context_store = ContextStore(Path(__file__).parent)
-        self._active_container_id: str | None = None
-        self._selected_container_idx: int | None = None
-        self._container_transfer_request_id: str | None = None
-        self._container_transfer_container_id_by_request: dict[str, str] = {}
-        self._remote_containers: list[dict[str, Any]] = []
-        self._pending_remote_container_requests: set[str] = set()
-        self._remote_list_feature_supported = True
-        self._remote_list_legacy_attempted = False
-        self._transfer_dialog: ctk.CTkToplevel | None = None
-        self._transfer_progress_var: tk.DoubleVar | None = None
-        self._transfer_label_var: tk.StringVar | None = None
-        self._transfer_started_time: float = 0.0
+        self.status_var = tk.StringVar(value="Disconnected")
+        self.link_var = tk.StringVar(value="Link: offline")
+        self.model_var = tk.StringVar(value=str(self._settings.get("model", "phone-default")))
+        self.device_selection_var = tk.StringVar(value="")
+        self.overlay_position_var = tk.StringVar(value=str(self._settings.get("overlay_position", "bottom-right")))
+        self.overlay_text_color_var = tk.StringVar(value=str(self._settings.get("overlay_text_color", "#F8FAFC")))
+        self.overlay_opacity_var = tk.DoubleVar(value=float(self._settings.get("overlay_opacity", 0.72)))
+        self.overlay_text_size_var = tk.IntVar(value=int(self._settings.get("overlay_text_size", 22)))
+        self.overlay_timeout_var = tk.IntVar(value=int(self._settings.get("overlay_timeout_seconds", 15)))
+        self.auto_connect_var = tk.BooleanVar(value=bool(self._settings.get("auto_connect_on_start", True)))
+        self.auto_retry_var = tk.BooleanVar(value=bool(self._settings.get("auto_retry_known_device", True)))
 
-        self._configure_theme()
+        self._activity_lines: list[str] = []
         self._build_ui()
-        self.client.set_auto_reconnect(self._auto_retry_known_device)
+
+        self.client.set_auto_reconnect(self.auto_retry_var.get())
         self._start_menu_bar_icon_if_needed()
         self._apply_macos_activation_policy()
-        self._refresh_sessions_list(self.active_session_id)
-        self._render_active_chat()
-        self._refresh_memory_label()
-        self._refresh_context_preview()
-        if not self._dnd_available:
-            self._append_log(
-                "System",
-                "Drag & drop non disponibile su questo sistema: usa i pulsanti Add PDF / Screenshot / Clipboard.",
-            )
         self._auto_install_quick_action()
         self._start_overlay_hotkey_listener()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         if self._is_macos:
             try:
-                self.root.createcommand("tk::mac::Quit", self.on_close)
+                self.root.createcommand("tk::mac::Quit", self.quit_app)
             except Exception:
                 pass
         self.root.bind_all("<Command-q>", self._on_app_quit_shortcut, add="+")
         atexit.register(self._atexit_shutdown)
-        self.root.after(100, self._poll_events)
-        self.root.after(1200, self._maybe_auto_connect_on_start)
-        self.root.after(1500, self._maybe_show_permissions_onboarding)
-        if self._auto_check_updates:
-            self.root.after(2200, lambda: self.on_check_updates(background=True))
+        self.root.after(POLL_INTERVAL_MS, self._poll_events)
+        self.root.after(1100, self._maybe_auto_connect_on_start)
 
-    def _configure_theme(self) -> None:
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
-
+        if self._menu_bar_mode_enabled() and not self._first_run:
+            self.root.after(250, self.hide_window)
 
     def _build_ui(self) -> None:
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(0, weight=1)
 
-        self.header_frame = ctk.CTkFrame(self.root, fg_color="transparent")
-        self.header_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        self.header_frame.columnconfigure(0, weight=0, minsize=300)
-        self.header_frame.columnconfigure(1, weight=1, minsize=520)
-        self.header_frame.columnconfigure(2, weight=0, minsize=390)
-        self.header_frame.rowconfigure(0, weight=1)
+        outer = ctk.CTkFrame(self.root, fg_color="transparent")
+        outer.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(0, weight=1)
 
-        # Left panel: chats + context library
-        self.sidebar_frame = ctk.CTkFrame(self.header_frame)
-        self.sidebar_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        scroll = ctk.CTkScrollableFrame(outer, corner_radius=16)
+        scroll.grid(row=0, column=0, sticky="nsew")
+        scroll.grid_columnconfigure(0, weight=1)
+        self.scroll_frame = scroll
 
-        chats_head = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        chats_head.pack(fill=tk.X, padx=10, pady=(10, 6))
-        ctk.CTkLabel(chats_head, text="CHATS", font=("Avenir", 16, "bold")).pack(side=tk.LEFT)
-        ctk.CTkButton(chats_head, text="Settings", width=84, command=self.on_open_settings).pack(side=tk.RIGHT)
-
-        chat_actions = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        chat_actions.pack(fill=tk.X, padx=10, pady=(0, 6))
-        ctk.CTkButton(chat_actions, text="New", width=72, command=self.on_new_chat).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(chat_actions, text="Rename", width=82, command=self.on_rename_chat).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(chat_actions, text="Delete", width=72, fg_color="#442323", hover_color="#5c2b2b", command=self.on_delete_chat).pack(side=tk.LEFT)
-
-        self.search_var = tk.StringVar()
-        self.search_entry = ctk.CTkEntry(
-            self.sidebar_frame,
-            textvariable=self.search_var,
-            placeholder_text="Search chat...",
-            height=30,
+        header = ctk.CTkFrame(scroll, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 12))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(header, text="Gemini BLE Overlay", font=("SF Pro Display", 26, "bold")).grid(
+            row=0, column=0, sticky="w"
         )
-        self.search_entry.pack(fill=tk.X, padx=10, pady=(0, 6))
-        self.search_entry.bind("<KeyRelease>", lambda _e: self._refresh_sessions_list(self.active_session_id))
-
-        self.chats_list = tk.Listbox(
-            self.sidebar_frame,
-            bg="#161a22",
-            fg="#f1f5f9",
-            selectbackground="#1f538d",
-            activestyle=tk.NONE,
-            borderwidth=1,
-            relief=tk.SOLID,
-            highlightthickness=0,
-            height=16,
-        )
-        self.chats_list.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
-        self.chats_list.bind("<<ListboxSelect>>", self._on_session_selected)
-
-        context_card = ctk.CTkFrame(self.sidebar_frame)
-        context_card.pack(fill=tk.BOTH, padx=10, pady=(0, 10))
-        ctk.CTkLabel(context_card, text="CONTEXT LIBRARY", font=("Avenir", 13, "bold")).pack(anchor=tk.W, padx=8, pady=(8, 4))
-        self.container_list = tk.Listbox(
-            context_card,
-            bg="#161a22",
-            fg="#dbe3ed",
-            selectbackground="#1e5c1e",
-            selectforeground="#ffffff",
-            activestyle=tk.NONE,
-            borderwidth=1,
-            relief=tk.SOLID,
-            highlightthickness=0,
-            height=6,
-            font=("Avenir", 11),
-        )
-        self.container_list.pack(fill=tk.X, padx=8, pady=(0, 6))
-        self.container_list.bind("<<ListboxSelect>>", self._on_container_list_click)
-        self.container_list.bind("<Double-Button-1>", self._on_activate_container)
-
-        kb_row1 = ctk.CTkFrame(context_card, fg_color="transparent")
-        kb_row1.pack(fill=tk.X, padx=8, pady=(0, 4))
-        ctk.CTkButton(kb_row1, text="Browse PDF", height=28, command=self._on_add_pdf_to_container).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        ctk.CTkButton(kb_row1, text="Activate", width=74, height=28, command=self._on_activate_container).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(kb_row1, text="Upload", width=70, height=28, command=self._on_upload_container).pack(side=tk.LEFT)
-
-        kb_row2 = ctk.CTkFrame(context_card, fg_color="transparent")
-        kb_row2.pack(fill=tk.X, padx=8, pady=(0, 8))
-        ctk.CTkButton(kb_row2, text="Remote", width=72, height=26, command=self._on_sync_remote_containers).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(kb_row2, text="New", width=62, height=26, command=self._on_create_container).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(kb_row2, text="Delete", width=68, height=26, fg_color="#442323", hover_color="#5c2b2b", command=self._on_delete_container).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(kb_row2, text="Clear Mem", width=84, height=26, command=self.on_clear_memory).pack(side=tk.LEFT)
-
-        self._kb_active_label = ctk.CTkLabel(context_card, text="nessun container attivo", text_color="#74839a", font=("Avenir", 10))
-        self._kb_active_label.pack(fill=tk.X, padx=8, pady=(0, 8))
-        self._refresh_container_list()
-
-        # Middle panel: chat stream
-        self.chat_area_frame = ctk.CTkFrame(self.header_frame)
-        self.chat_area_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
-
-        stream_head = ctk.CTkFrame(self.chat_area_frame, fg_color="transparent")
-        stream_head.pack(fill=tk.X, padx=10, pady=(10, 6))
-        ctk.CTkLabel(stream_head, text="CHAT", font=("Avenir", 16, "bold")).pack(side=tk.LEFT)
-        self.memory_var = tk.StringVar(value="")
-        ctk.CTkLabel(stream_head, textvariable=self.memory_var, font=("Avenir", 11), text_color="#8ea0b8").pack(side=tk.RIGHT)
-
-        self.chat_log = ctk.CTkTextbox(
-            self.chat_area_frame,
-            wrap=tk.WORD,
-            state="disabled",
-            fg_color="#0f1724",
-            text_color="#e8edf5",
-            border_width=1,
-            border_color="#2a3444",
-            font=("Avenir", 13),
-        )
-        self.chat_log.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-        self._configure_chat_tags()
-
-        # Right panel: bridge + composer
-        right_panel = ctk.CTkFrame(self.header_frame)
-        right_panel.grid(row=0, column=2, sticky="nsew")
-
-        bridge_card = ctk.CTkFrame(right_panel)
-        bridge_card.pack(fill=tk.X, padx=10, pady=(10, 8))
-        bridge_top = ctk.CTkFrame(bridge_card, fg_color="transparent")
-        bridge_top.pack(fill=tk.X, padx=8, pady=(8, 4))
-        ctk.CTkLabel(bridge_top, text="BRIDGE", font=("Avenir", 14, "bold")).pack(side=tk.LEFT)
-        ctk.CTkButton(bridge_top, text="Update", width=70, command=lambda: self.on_check_updates(background=False)).pack(side=tk.RIGHT)
-
-        self.status_var = tk.StringVar(value="Not connected")
-        self.link_var = tk.StringVar(value="Link: n/a")
-        ctk.CTkLabel(bridge_card, textvariable=self.status_var, font=("Avenir", 12, "bold")).pack(anchor=tk.W, padx=10)
-        ctk.CTkLabel(bridge_card, textvariable=self.link_var, text_color="#9aa7bc", font=("Avenir", 11)).pack(anchor=tk.W, padx=10, pady=(0, 6))
-
-        bridge_actions = ctk.CTkFrame(bridge_card, fg_color="transparent")
-        bridge_actions.pack(fill=tk.X, padx=10, pady=(0, 6))
-        ctk.CTkButton(bridge_actions, text="Scan", width=72, command=self.on_scan).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(bridge_actions, text="Connect", width=78, command=self.on_connect).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(bridge_actions, text="Disconnect", width=88, command=self.on_disconnect).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(bridge_actions, text="Reconnect", width=86, command=self._reconnect_last_or_selected).pack(side=tk.LEFT)
-
-        self.devices_list = tk.Listbox(
-            bridge_card,
-            height=5,
-            bg="#161a22",
-            fg="#e9eef7",
-            selectbackground="#1f538d",
-            activestyle=tk.NONE,
-            borderwidth=1,
-            relief=tk.SOLID,
-            highlightthickness=0,
-        )
-        self.devices_list.pack(fill=tk.X, padx=10, pady=(0, 6))
         ctk.CTkLabel(
-            bridge_card,
-            text=f"Shot+Ask trigger: {self._overlay_hotkey}",
-            text_color="#8ea0b8",
-            font=("Avenir", 10),
-        ).pack(anchor=tk.W, padx=10, pady=(0, 8))
-
-        composer_card = ctk.CTkFrame(right_panel)
-        composer_card.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-
-        model_row = ctk.CTkFrame(composer_card, fg_color="transparent")
-        model_row.pack(fill=tk.X, padx=10, pady=(10, 6))
-        self.model_var = tk.StringVar(value=MODEL_PRESETS[0])
-        self.model_combo = ctk.CTkComboBox(
-            model_row,
-            variable=self.model_var,
-            values=MODEL_PRESETS,
-            state="readonly",
-            width=220,
-            command=lambda _v: self._refresh_context_preview(),
+            header,
+            text="Background utility for Shot+Ask over Bluetooth",
+            text_color="#94A3B8",
+            font=("SF Pro Text", 13),
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.header_status_label = ctk.CTkLabel(
+            header,
+            textvariable=self.status_var,
+            width=180,
+            anchor="e",
+            font=("SF Pro Text", 13, "bold"),
         )
-        self.model_combo.pack(side=tk.LEFT)
-        ctk.CTkButton(model_row, text="Set Default", width=88, command=self._set_phone_default_model).pack(side=tk.RIGHT)
-
-        toggles_row = ctk.CTkFrame(composer_card, fg_color="transparent")
-        toggles_row.pack(fill=tk.X, padx=10, pady=(0, 6))
-        self.web_search_enabled = tk.BooleanVar(value=False)
-        self.thinking_enabled = tk.BooleanVar(value=False)
-        self.pip_enabled = tk.BooleanVar(value=False)
-        self.thinking_auto_var = tk.BooleanVar(value=False)
-        self.thinking_budget_var = tk.StringVar(value="1024")
-        self.show_thoughts_var = tk.BooleanVar(value=True)
-
-        ctk.CTkCheckBox(toggles_row, text="WEB", variable=self.web_search_enabled, command=self._refresh_context_preview).pack(side=tk.LEFT, padx=(0, 8))
-        ctk.CTkCheckBox(toggles_row, text="THINK", variable=self.thinking_enabled, command=self._refresh_context_preview).pack(side=tk.LEFT, padx=(0, 8))
-        ctk.CTkCheckBox(toggles_row, text="PiP", variable=self.pip_enabled, command=self._toggle_pip).pack(side=tk.LEFT, padx=(0, 8))
-        ctk.CTkEntry(toggles_row, textvariable=self.thinking_budget_var, width=64, placeholder_text="1024").pack(side=tk.LEFT, padx=(0, 6))
-        ctk.CTkCheckBox(toggles_row, text="Auto", variable=self.thinking_auto_var, command=self._refresh_context_preview).pack(side=tk.LEFT, padx=(0, 6))
-        ctk.CTkCheckBox(toggles_row, text="Trace", variable=self.show_thoughts_var, command=self._refresh_context_preview).pack(side=tk.LEFT)
-
-        self.prompt_entry = ctk.CTkTextbox(
-            composer_card,
-            height=210,
-            wrap=tk.WORD,
-            fg_color="#0f1724",
-            text_color="#e8edf5",
-            border_width=1,
-            border_color="#2a3444",
-            font=("Avenir", 13),
-        )
-        self.prompt_entry.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
-        self.prompt_entry.bind("<Return>", self._on_prompt_return)
-        self.prompt_entry.bind("<KeyRelease>", self._adjust_input_height)
-        self.prompt_entry.bind("<Command-BackSpace>", self._on_clear_composer_hotkey)
-        self.prompt_entry.bind("<Command-Delete>", self._on_clear_composer_hotkey)
-
-        context_actions = ctk.CTkFrame(composer_card, fg_color="transparent")
-        context_actions.pack(fill=tk.X, padx=10, pady=(0, 6))
-        ctk.CTkButton(context_actions, text="Attach Image", width=100, command=self.on_attach_image).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(context_actions, text="Screenshot", width=96, command=self.on_quick_screenshot).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(context_actions, text="Clipboard", width=90, command=self.on_clipboard_send).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(context_actions, text="Add PDF", width=86, command=self.on_add_pdf).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(context_actions, text="Clear Img", width=78, command=self.on_clear_image).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(context_actions, text="Clear PDFs", width=84, command=self.on_clear_pdfs).pack(side=tk.LEFT)
-
-        quick_row = ctk.CTkFrame(composer_card, fg_color="transparent")
-        quick_row.pack(fill=tk.X, padx=10, pady=(0, 4))
-        ctk.CTkButton(quick_row, text="Shot+Ask", width=98, command=self.on_hotkey_overlay_triggered).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(quick_row, text="Clip+Ask", width=98, command=self.on_hotkey_clipboard_triggered).pack(side=tk.LEFT, padx=(0, 4))
-        ctk.CTkButton(quick_row, text="Ask Clipboard", width=110, command=self.on_clipboard_send).pack(side=tk.LEFT)
-
-        self.context_preview_var = tk.StringVar(value="No active attachments")
+        self.header_status_label.grid(row=0, column=1, sticky="e", padx=(12, 0))
         ctk.CTkLabel(
-            composer_card,
-            textvariable=self.context_preview_var,
-            text_color="#90a0b8",
-            font=("Avenir", 10),
-            justify=tk.LEFT,
-            anchor=tk.W,
-        ).pack(fill=tk.X, padx=10, pady=(0, 6))
+            header,
+            textvariable=self.link_var,
+            text_color="#A5B4FC",
+            font=("SF Pro Text", 12),
+        ).grid(row=1, column=1, sticky="e", padx=(12, 0), pady=(4, 0))
 
-        send_row = ctk.CTkFrame(composer_card, fg_color="transparent")
-        send_row.pack(fill=tk.X, padx=10, pady=(0, 10))
-        self.stop_btn = ctk.CTkButton(
-            send_row,
-            text="STOP",
-            command=self.on_stop_active_request,
-            fg_color="#3a1c1c",
-            border_width=1,
-            border_color="#5a2d2d",
-            hover_color="#5a2d2d",
-            text_color="#f5d0d0",
-            width=88,
-            state="disabled",
+        self._build_connection_card(scroll, row=1)
+        self._build_prompt_card(scroll, row=2)
+        self._build_overlay_card(scroll, row=3)
+        self._build_shortcut_card(scroll, row=4)
+        self._build_activity_card(scroll, row=5)
+        self._build_footer(scroll, row=6)
+
+    def _build_connection_card(self, parent: ctk.CTkScrollableFrame, row: int) -> None:
+        card = ctk.CTkFrame(parent, corner_radius=18)
+        card.grid(row=row, column=0, sticky="ew", padx=6, pady=(0, 12))
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(card, text="Connection", font=("SF Pro Display", 18, "bold")).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 4)
         )
-        self.stop_btn.pack(side=tk.RIGHT, padx=(6, 0))
-        ctk.CTkButton(send_row, text="SEND", width=92, command=self.on_send).pack(side=tk.RIGHT)
+        hint = "Auto-connect keeps the bridge ready for shortcuts."
+        ctk.CTkLabel(card, text=hint, text_color="#94A3B8", font=("SF Pro Text", 12)).grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 10)
+        )
 
-        self.image_var = tk.StringVar(value="Image: none")
-        self.pdf_var = tk.StringVar(value="PDF: none")
+        self.device_selector = ctk.CTkOptionMenu(
+            card,
+            variable=self.device_selection_var,
+            values=["No scanned device"],
+            dynamic_resizing=False,
+            width=320,
+        )
+        self.device_selector.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 10))
 
-        self.root.bind("<Configure>", self._on_window_resize)
-        self.root.bind("<Command-n>", lambda _e: [self.on_new_chat(), self.prompt_entry.focus()])
-        self.root.bind("<Command-r>", lambda _e: self.on_rename_chat())
-        self.root.bind("<Command-BackSpace>", self._on_global_backspace_hotkey)
-        self.root.bind("<Command-k>", lambda _e: self.search_entry.focus())
-        self.root.bind("<Command-f>", lambda _e: self.search_entry.focus())
-        self._is_compact_mode = False
+        buttons = ctk.CTkFrame(card, fg_color="transparent")
+        buttons.grid(row=3, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 8))
+        buttons.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        ctk.CTkButton(buttons, text="Scan", command=self.on_scan_devices).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(buttons, text="Connect Selected", command=self.on_connect_selected).grid(
+            row=0, column=1, sticky="ew", padx=6
+        )
+        ctk.CTkButton(buttons, text="Connect Last", command=self.on_connect_last).grid(
+            row=0, column=2, sticky="ew", padx=6
+        )
+        ctk.CTkButton(buttons, text="Disconnect", fg_color="#3B1212", hover_color="#5A1B1B", command=self.on_disconnect).grid(
+            row=0, column=3, sticky="ew", padx=(6, 0)
+        )
 
-    def _on_global_backspace_hotkey(self, event) -> str | None:
-        if event.widget == self.prompt_entry._textbox:
-            self._on_clear_composer_hotkey(event)
-            return "break"
-        # If we're not inside the textbox, attempt to delete the active chat
-        self.on_delete_chat()
-        return "break"
+        toggles = ctk.CTkFrame(card, fg_color="transparent")
+        toggles.grid(row=4, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 12))
+        toggles.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkSwitch(
+            toggles,
+            text="Auto-connect on start",
+            variable=self.auto_connect_var,
+            command=self.on_settings_changed,
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkSwitch(
+            toggles,
+            text="Auto-retry known phone",
+            variable=self.auto_retry_var,
+            command=self.on_auto_retry_changed,
+        ).grid(row=0, column=1, sticky="w")
+
+    def _build_prompt_card(self, parent: ctk.CTkScrollableFrame, row: int) -> None:
+        card = ctk.CTkFrame(parent, corner_radius=18)
+        card.grid(row=row, column=0, sticky="ew", padx=6, pady=(0, 12))
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(card, text="Prompting", font=("SF Pro Display", 18, "bold")).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 8)
+        )
+        ctk.CTkLabel(card, text="Model", font=("SF Pro Text", 13, "bold")).grid(
+            row=1, column=0, sticky="w", padx=16
+        )
+        self.model_combo = ctk.CTkComboBox(card, values=MODEL_PRESETS, variable=self.model_var)
+        self.model_combo.grid(row=2, column=0, sticky="ew", padx=16, pady=(6, 12))
+        self.model_combo.bind("<FocusOut>", lambda _event: self.on_settings_changed())
+
+        ctk.CTkLabel(card, text="System Instruction", font=("SF Pro Text", 13, "bold")).grid(
+            row=3, column=0, sticky="w", padx=16
+        )
+        self.system_instruction_text = ctk.CTkTextbox(
+            card,
+            height=140,
+            wrap="word",
+            border_width=1,
+            border_color="#2A3444",
+            fg_color="#0F172A",
+        )
+        self.system_instruction_text.grid(row=4, column=0, sticky="ew", padx=16, pady=(6, 14))
+        system_text = str(self._settings.get("system_instruction", "")).strip()
+        if system_text:
+            self.system_instruction_text.insert("1.0", system_text)
+        self.system_instruction_text.bind("<FocusOut>", lambda _event: self.on_settings_changed())
+
+    def _build_overlay_card(self, parent: ctk.CTkScrollableFrame, row: int) -> None:
+        card = ctk.CTkFrame(parent, corner_radius=18)
+        card.grid(row=row, column=0, sticky="ew", padx=6, pady=(0, 12))
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(card, text="Overlay", font=("SF Pro Display", 18, "bold")).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 8)
+        )
+
+        ctk.CTkLabel(card, text="Position", font=("SF Pro Text", 13, "bold")).grid(
+            row=1, column=0, sticky="w", padx=16
+        )
+        self.position_menu = ctk.CTkOptionMenu(
+            card,
+            variable=self.overlay_position_var,
+            values=list(OVERLAY_POSITIONS.keys()),
+            command=lambda _value: self.on_settings_changed(),
+        )
+        self.position_menu.grid(row=2, column=0, sticky="ew", padx=16, pady=(6, 12))
+
+        color_row = ctk.CTkFrame(card, fg_color="transparent")
+        color_row.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 12))
+        color_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(color_row, text="Text Color", font=("SF Pro Text", 13, "bold")).grid(row=0, column=0, sticky="w")
+        self.color_preview = ctk.CTkLabel(
+            color_row,
+            text=self.overlay_text_color_var.get(),
+            text_color=self.overlay_text_color_var.get(),
+            font=("SF Pro Text", 13, "bold"),
+        )
+        self.color_preview.grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ctk.CTkButton(color_row, text="Choose", width=90, command=self.on_pick_overlay_color).grid(
+            row=0, column=2, sticky="e"
+        )
+
+        self._build_slider_row(card, 4, "Opacity", self.overlay_opacity_var, 0.25, 1.0, 0.01, formatter=lambda value: f"{value:.2f}")
+        self._build_slider_row(card, 5, "Text Size", self.overlay_text_size_var, 14, 38, 1, formatter=lambda value: f"{int(round(value))} px")
+        self._build_slider_row(card, 6, "Hide After", self.overlay_timeout_var, 4, 40, 1, formatter=lambda value: f"{int(round(value))} s")
+
+        actions = ctk.CTkFrame(card, fg_color="transparent")
+        actions.grid(row=7, column=0, sticky="ew", padx=16, pady=(6, 14))
+        actions.grid_columnconfigure((0, 1, 2), weight=1)
+        ctk.CTkButton(actions, text="Preview Text", command=self.on_preview_overlay).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(actions, text="Ask Clipboard", command=self.on_hotkey_clipboard_triggered).grid(
+            row=0, column=1, sticky="ew", padx=6
+        )
+        ctk.CTkButton(actions, text="Hide Overlay", fg_color="#1F2937", hover_color="#334155", command=self.hide_overlay).grid(
+            row=0, column=2, sticky="ew", padx=(6, 0)
+        )
+
+    def _build_slider_row(
+        self,
+        parent: ctk.CTkFrame,
+        row: int,
+        label: str,
+        variable: tk.DoubleVar | tk.IntVar,
+        minimum: float,
+        maximum: float,
+        step: float,
+        formatter: Any,
+    ) -> None:
+        wrapper = ctk.CTkFrame(parent, fg_color="transparent")
+        wrapper.grid(row=row, column=0, sticky="ew", padx=16, pady=(0, 10))
+        wrapper.grid_columnconfigure(0, weight=1)
+        wrapper.grid_columnconfigure(1, weight=0)
+        value_var = tk.StringVar(value=formatter(variable.get()))
+        setattr(self, f"_{label.lower().replace(' ', '_')}_display_var", value_var)
+        ctk.CTkLabel(wrapper, text=label, font=("SF Pro Text", 13, "bold")).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(wrapper, textvariable=value_var, text_color="#93C5FD").grid(row=0, column=1, sticky="e")
+
+        def on_change(value: float) -> None:
+            if isinstance(variable, tk.IntVar):
+                variable.set(int(round(value)))
+            else:
+                variable.set(round(value, 2))
+            value_var.set(formatter(variable.get()))
+            self.on_settings_changed()
+
+        slider = ctk.CTkSlider(
+            wrapper,
+            from_=minimum,
+            to=maximum,
+            number_of_steps=max(1, int(round((maximum - minimum) / step))),
+            command=on_change,
+        )
+        slider.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        slider.set(variable.get())
+
+    def _build_shortcut_card(self, parent: ctk.CTkScrollableFrame, row: int) -> None:
+        card = ctk.CTkFrame(parent, corner_radius=18)
+        card.grid(row=row, column=0, sticky="ew", padx=6, pady=(0, 12))
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(card, text="Shortcuts", font=("SF Pro Display", 18, "bold")).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 8)
+        )
+
+        shortcuts = self._shortcut_lines()
+        for idx, line in enumerate(shortcuts, start=1):
+            ctk.CTkLabel(card, text=line, text_color="#CBD5E1", anchor="w", justify="left").grid(
+                row=idx, column=0, sticky="ew", padx=16, pady=(0, 6)
+            )
+
+        if self._is_macos:
+            ctk.CTkButton(card, text="Install macOS Quick Action", command=lambda: self.on_install_quick_action(False)).grid(
+                row=len(shortcuts) + 1, column=0, sticky="w", padx=16, pady=(4, 14)
+            )
+
+    def _build_activity_card(self, parent: ctk.CTkScrollableFrame, row: int) -> None:
+        card = ctk.CTkFrame(parent, corner_radius=18)
+        card.grid(row=row, column=0, sticky="ew", padx=6, pady=(0, 12))
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(card, text="Recent Activity", font=("SF Pro Display", 18, "bold")).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(14, 8)
+        )
+        self.activity_box = ctk.CTkTextbox(
+            card,
+            height=170,
+            wrap="word",
+            state="disabled",
+            border_width=1,
+            border_color="#273449",
+            fg_color="#0B1120",
+        )
+        self.activity_box.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 14))
+
+    def _build_footer(self, parent: ctk.CTkScrollableFrame, row: int) -> None:
+        footer = ctk.CTkFrame(parent, fg_color="transparent")
+        footer.grid(row=row, column=0, sticky="ew", padx=6, pady=(0, 10))
+        footer.grid_columnconfigure((0, 1, 2), weight=1)
+        ctk.CTkButton(footer, text="Save Settings", command=self.save_settings).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(footer, text="Hide to Background", command=self.hide_window).grid(row=0, column=1, sticky="ew", padx=6)
+        ctk.CTkButton(footer, text="Quit", fg_color="#3B1212", hover_color="#5A1B1B", command=self.quit_app).grid(
+            row=0, column=2, sticky="ew", padx=(6, 0)
+        )
+
+    def _shortcut_lines(self) -> list[str]:
+        if self._is_macos:
+            return [
+                "Shot+Ask: Apple Shortcut -> ~/.gemini_ble/ask_gemini_ble_shot.sh",
+                "Clipboard Ask: Apple Shortcut -> ~/.gemini_ble/ask_gemini_ble_clipboard.sh",
+                "Hide Overlay: Apple Shortcut -> ~/.gemini_ble/hide_gemini_ble_overlay.sh",
+                "Toggle Settings Window: Apple Shortcut -> ~/.gemini_ble/toggle_gemini_ble.sh",
+            ]
+        return [
+            "Shot+Ask: Ctrl+Shift+G",
+            "Clipboard Ask: Ctrl+Shift+C",
+            "Hide Overlay: Ctrl+Shift+H",
+        ]
 
     def _load_settings(self) -> dict[str, Any]:
-        if not self._settings_path.exists():
-            return {}
-        try:
-            with self._settings_path.open("r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        data: dict[str, Any] = {}
+        if self._settings_path.exists():
+            try:
+                raw = json.loads(self._settings_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    data = raw
+            except Exception:
+                data = {}
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update(data)
+        merged["overlay_text_color"] = self._normalize_hex_color(merged.get("overlay_text_color"), "#F8FAFC")
+        merged["overlay_position"] = str(merged.get("overlay_position", "bottom-right")).strip().lower()
+        if merged["overlay_position"] not in OVERLAY_POSITIONS:
+            merged["overlay_position"] = "bottom-right"
+        merged["overlay_text_size"] = int(max(14, min(38, int(merged.get("overlay_text_size", 22)))))
+        merged["overlay_timeout_seconds"] = int(max(4, min(40, int(merged.get("overlay_timeout_seconds", 15)))))
+        opacity = float(merged.get("overlay_opacity", 0.72))
+        merged["overlay_opacity"] = max(0.25, min(1.0, opacity))
+        return merged
 
-    def _parse_int_setting(self, raw: Any, default: int, low: int, high: int) -> int:
-        try:
-            value = int(raw)
-        except Exception:
-            value = default
-        return max(low, min(high, value))
+    def save_settings(self) -> None:
+        model = self.model_var.get().strip() or "phone-default"
+        payload = self._load_settings()
+        payload.update(
+            {
+                "system_instruction": self.system_instruction_text.get("1.0", "end-1c").strip(),
+                "model": model,
+                "overlay_position": self.overlay_position_var.get().strip().lower(),
+                "overlay_text_color": self.overlay_text_color_var.get().strip(),
+                "overlay_opacity": round(float(self.overlay_opacity_var.get()), 2),
+                "overlay_text_size": int(self.overlay_text_size_var.get()),
+                "overlay_timeout_seconds": int(self.overlay_timeout_var.get()),
+                "auto_connect_on_start": bool(self.auto_connect_var.get()),
+                "auto_retry_known_device": bool(self.auto_retry_var.get()),
+                "last_connected_address": self._last_connected_address or "",
+                "last_connected_bridge_id": self._last_connected_bridge_id or "",
+                "last_selected_device": self.device_selection_var.get().strip(),
+            }
+        )
+        self._settings_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._settings = payload
+        self.client.set_auto_reconnect(self.auto_retry_var.get())
+        self._apply_macos_activation_policy()
+        self._refresh_menu_bar_icon()
+        self._append_log("System", "Settings saved")
 
-    def _normalize_hex_color(self, raw: Any, fallback: str) -> str:
-        if not isinstance(raw, str):
-            return fallback
-        value = raw.strip()
-        if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
-            return value
+    def on_settings_changed(self) -> None:
+        self._update_color_preview()
+        self._apply_overlay_preferences()
+
+    def on_auto_retry_changed(self) -> None:
+        self.client.set_auto_reconnect(self.auto_retry_var.get())
+        self.on_settings_changed()
+
+    def on_pick_overlay_color(self) -> None:
+        chosen = colorchooser.askcolor(color=self.overlay_text_color_var.get(), parent=self.root)
+        if not chosen or not chosen[1]:
+            return
+        self.overlay_text_color_var.set(self._normalize_hex_color(chosen[1], "#F8FAFC"))
+        self._update_color_preview()
+        self._apply_overlay_preferences()
+
+    def on_preview_overlay(self) -> None:
+        self._show_overlay_message("Questo e' un test dell'overlay Gemini BLE.", ttl_ms=int(self.overlay_timeout_var.get()) * 1000)
+
+    def _update_color_preview(self) -> None:
+        if hasattr(self, "color_preview"):
+            color = self._normalize_hex_color(self.overlay_text_color_var.get(), "#F8FAFC")
+            self.overlay_text_color_var.set(color)
+            self.color_preview.configure(text=color, text_color=color)
+
+    def _menu_bar_mode_enabled(self) -> bool:
+        enabled = bool(self._settings.get("menu_bar_mode_enabled", True))
+        if self._is_macos:
+            return enabled
+        return bool(pystray is not None and PILImage is not None and enabled)
+
+    def _hide_dock_icon_enabled(self) -> bool:
+        if not self._is_macos:
+            return False
+        return bool(self._settings.get("hide_dock_icon_enabled", True))
+
+    def _append_log(self, source: str, text: str) -> None:
+        line = f"{source}: {text}".strip()
+        if not line:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        rendered = f"[{timestamp}] {line}"
+        self._activity_lines.append(rendered)
+        self._activity_lines = self._activity_lines[-80:]
+        try:
+            self.activity_box.configure(state="normal")
+            self.activity_box.delete("1.0", tk.END)
+            self.activity_box.insert("1.0", "\n".join(self._activity_lines))
+            self.activity_box.configure(state="disabled")
+            self.activity_box.see(tk.END)
+        except Exception:
+            pass
+
+    def _format_device_label(self, device: dict[str, str]) -> str:
+        name = str(device.get("name", "Gemini Bridge")).strip() or "Gemini Bridge"
+        bridge_id = self._normalize_bridge_id(device.get("bridge_id"))
+        suffix = bridge_id or str(device.get("address", "")).strip()
+        if suffix:
+            return f"{name} • {suffix}"
+        return name
+
+    def _refresh_device_selector(self) -> None:
+        labels = [self._format_device_label(device) for device in self.devices]
+        self._device_label_map = {label: device for label, device in zip(labels, self.devices)}
+        if not labels:
+            labels = ["No scanned device"]
+            self._device_label_map.clear()
+        self.device_selector.configure(values=labels)
+
+        current = self.device_selection_var.get().strip()
+        if current in self._device_label_map:
+            return
+
+        preferred = str(self._settings.get("last_selected_device", "")).strip()
+        if preferred in self._device_label_map:
+            self.device_selection_var.set(preferred)
+            return
+
+        match = self._find_best_label_for_last_device()
+        if match:
+            self.device_selection_var.set(match)
+            return
+
+        self.device_selection_var.set(labels[0])
+
+    def _find_best_label_for_last_device(self) -> str | None:
+        for label, device in self._device_label_map.items():
+            address = str(device.get("address", "")).strip()
+            bridge_id = self._normalize_bridge_id(device.get("bridge_id"))
+            if self._last_connected_bridge_id and bridge_id == self._last_connected_bridge_id:
+                return label
+            if self._last_connected_address and address == self._last_connected_address:
+                return label
+        return None
+
+    def _selected_device(self) -> dict[str, str] | None:
+        label = self.device_selection_var.get().strip()
+        return self._device_label_map.get(label)
+
+    def on_scan_devices(self) -> None:
+        self._append_log("System", "Scanning BLE devices...")
+        self.client.scan_devices()
+
+    def on_connect_selected(self) -> None:
+        device = self._selected_device()
+        if device is None:
+            self._append_log("System", "No scanned device selected")
+            return
+        address = str(device.get("address", "")).strip()
+        bridge_id = self._normalize_bridge_id(device.get("bridge_id"))
+        self._connect_with_hint(address, bridge_id)
+
+    def on_connect_last(self) -> None:
+        if self._last_connected_address or self._last_connected_bridge_id:
+            self._connect_with_hint(self._last_connected_address, self._last_connected_bridge_id)
+            return
+        self.on_connect_selected()
+
+    def on_disconnect(self) -> None:
+        self.client.disconnect()
+
+    def _connect_with_hint(self, address: str | None, bridge_id: str | None) -> None:
+        normalized_bridge = self._normalize_bridge_id(bridge_id)
+        target = str(address or "").strip()
+        if not target and not normalized_bridge:
+            self._append_log("System", "No known device to connect")
+            return
+        self.status_var.set("Connecting...")
+        self.link_var.set("Link: probing...")
+        self.client.connect(target, bridge_id=normalized_bridge)
+
+    def _maybe_auto_connect_on_start(self) -> None:
+        if not self.auto_connect_var.get():
+            return
+        if not (self._last_connected_address or self._last_connected_bridge_id):
+            return
+        self._append_log("System", "Auto-connect enabled: trying last phone")
+        self.on_connect_last()
+
+    def _compose_prompt_parts(self, base_prompt: str, extra_text: str | None = None) -> tuple[str, list[dict[str, Any]] | None]:
+        prompt = base_prompt.strip()
+        context_blocks: list[dict[str, Any]] = []
+        system_instruction = self.system_instruction_text.get("1.0", "end-1c").strip()
+        if system_instruction:
+            context_blocks.append({"type": "text", "text": f"System instruction:\n{system_instruction}"})
+        if extra_text:
+            prompt = f"{prompt}\n\n{extra_text.strip()}"
+        return prompt, context_blocks or None
+
+    def _model_override(self) -> str | None:
+        model = self.model_var.get().strip()
+        if not model or model == "phone-default":
+            return None
+        return model
+
+    def _queue_pending_action(self, action: dict[str, Any]) -> bool:
+        if self.connected:
+            return False
+        if not (self._last_connected_address or self._last_connected_bridge_id):
+            return False
+        self._pending_quick_action = action
+        self._show_overlay_message("Bridge disconnesso. Mi ricollego al telefono...", ttl_ms=5000)
+        self.on_connect_last()
+        return True
+
+    def on_hotkey_overlay_triggered(self, prompt_override: str | None = None) -> None:
+        prompt_text = (prompt_override or "").strip()
+        if not self.connected and self._queue_pending_action({"type": "shot", "prompt": prompt_text}):
+            return
+        if not self.connected:
+            self._show_overlay_message("Bridge non connesso", ttl_ms=3200)
+            return
+
+        screenshot_path = self._capture_area_screenshot_path(log_errors=False)
+        if screenshot_path is None:
+            self._show_overlay_message("Screenshot annullato", ttl_ms=2500)
+            return
+
+        base_prompt = prompt_text or DEFAULT_SCREENSHOT_PROMPT
+        self._send_overlay_request(
+            prompt=base_prompt,
+            source="Shot+Ask",
+            status_text="Analisi screenshot...",
+            image_path=screenshot_path,
+            image_target_bytes=FAST_SCREENSHOT_TARGET_BYTES,
+            image_max_dimension=FAST_SCREENSHOT_MAX_DIMENSION,
+            fail_text="Invio screenshot fallito",
+        )
+
+    def on_hotkey_clipboard_triggered(self, prompt_override: str | None = None) -> None:
+        prompt_text = (prompt_override or "").strip()
+        if not self.connected and self._queue_pending_action({"type": "clipboard", "prompt": prompt_text}):
+            return
+        if not self.connected:
+            self._show_overlay_message("Bridge non connesso", ttl_ms=3200)
+            return
+
+        clipboard_text = self._get_clipboard_text()
+        if clipboard_text:
+            extra = f"Contenuto degli appunti:\n{clipboard_text}"
+            self._send_overlay_request(
+                prompt=prompt_text or DEFAULT_CLIPBOARD_PROMPT,
+                source="Clipboard",
+                status_text="Analisi clipboard...",
+                image_path=None,
+                fail_text="Invio clipboard fallito",
+                extra_text=extra,
+            )
+            return
+
+        clipboard_image = self._capture_clipboard_image_path(log_errors=False)
+        if clipboard_image is None:
+            self._show_overlay_message("Clipboard vuota o formato non supportato", ttl_ms=3200)
+            return
+
+        self._send_overlay_request(
+            prompt=prompt_text or DEFAULT_CLIPBOARD_PROMPT,
+            source="Clipboard",
+            status_text="Analisi clipboard...",
+            image_path=clipboard_image,
+            image_target_bytes=FAST_CLIPBOARD_TARGET_BYTES,
+            image_max_dimension=FAST_CLIPBOARD_MAX_DIMENSION,
+            fail_text="Invio clipboard fallito",
+        )
+
+    def _send_text_overlay_request(self, text: str, prompt_override: str | None = None) -> None:
+        cleaned = text.strip()
+        if not cleaned:
+            return
+        if not self.connected and self._queue_pending_action({"type": "text", "prompt": prompt_override or "", "text": cleaned}):
+            return
+        if not self.connected:
+            self._show_overlay_message("Bridge non connesso", ttl_ms=3200)
+            return
+        self._send_overlay_request(
+            prompt=(prompt_override or DEFAULT_QUICK_TEXT_PROMPT),
+            source="Quick Ask",
+            status_text="Analisi testo...",
+            image_path=None,
+            fail_text="Invio testo fallito",
+            extra_text=f"Testo:\n{cleaned}",
+        )
+
+    def _send_overlay_request(
+        self,
+        prompt: str,
+        source: str,
+        status_text: str,
+        image_path: str | None,
+        fail_text: str,
+        image_target_bytes: int | None = None,
+        image_max_dimension: int | None = None,
+        extra_text: str | None = None,
+    ) -> None:
+        model_override = self._model_override()
+        full_prompt, context_blocks = self._compose_prompt_parts(prompt, extra_text=extra_text)
+        try:
+            request_id = self.client.send_prompt(
+                full_prompt,
+                model=model_override,
+                image_path=image_path,
+                image_target_bytes=image_target_bytes,
+                image_max_dimension=image_max_dimension,
+                context_blocks=context_blocks,
+            )
+        except Exception as exc:
+            if image_path:
+                try:
+                    Path(image_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self._show_overlay_message(f"{fail_text}: {exc}", ttl_ms=7000)
+            self._append_log("Error", f"{source}: {exc}")
+            return
+
+        self._overlay_request_ids.add(request_id)
+        self._overlay_primary_request_id = request_id
+        self._overlay_started_at[request_id] = time.monotonic()
+        self._overlay_last_update_at[request_id] = time.monotonic()
+        if image_path:
+            self._overlay_image_paths_by_request[request_id] = image_path
+        self._show_overlay_message(status_text, ttl_ms=0)
+        self._append_log("System", f"{source}: request queued ({request_id})")
+
+    def _get_clipboard_text(self) -> str:
+        try:
+            return self.root.clipboard_get().strip()
+        except Exception:
+            return ""
+
+    def _capture_area_screenshot_path(self, log_errors: bool = True) -> str | None:
+        if self._is_macos:
+            return self._capture_macos_screenshot_path(log_errors=log_errors)
+        if self._is_windows:
+            return self._capture_windows_screenshot_path(log_errors=log_errors)
+        return self._capture_linux_screenshot_path(log_errors=log_errors)
+
+    def _capture_macos_screenshot_path(self, log_errors: bool = True) -> str | None:
+        tmp = tempfile.NamedTemporaryFile(prefix="gemini-shot-", suffix=".png", delete=False)
+        path = tmp.name
+        tmp.close()
+        try:
+            Path(path).unlink(missing_ok=True)
+            result = subprocess.run(
+                ["screencapture", "-i", "-x", path],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            stderr = (result.stderr or "").strip().lower()
+            if result.returncode != 0 or not Path(path).exists():
+                Path(path).unlink(missing_ok=True)
+                if log_errors:
+                    if "cancel" in stderr:
+                        self._append_log("System", "Screenshot canceled")
+                    else:
+                        self._append_log("Error", f"Screenshot failed: {result.stderr or result.returncode}")
+                return None
+            return path
+        except Exception as exc:
+            Path(path).unlink(missing_ok=True)
+            if log_errors:
+                self._append_log("Error", f"Screenshot failed: {exc}")
+            return None
+
+    def _capture_windows_screenshot_path(self, log_errors: bool = True) -> str | None:
+        if ImageGrab is None:
+            if log_errors:
+                self._append_log("Error", "Screenshot requires Pillow on Windows")
+            return None
+
+        baseline = self._clipboard_image_signature()
+        try:
+            subprocess.run(["explorer.exe", "ms-screenclip:"], check=False, capture_output=True)
+        except Exception as exc:
+            if log_errors:
+                self._append_log("Error", f"Cannot open Windows snipping overlay: {exc}")
+            return None
+
+        deadline = time.monotonic() + 24.0
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            image = self._grab_clipboard_image()
+            if image is None:
+                continue
+            signature = self._image_signature(image)
+            if signature == baseline:
+                continue
+            return self._save_pil_image(image, prefix="gemini-shot-")
+
+        if log_errors:
+            self._append_log("System", "Screenshot canceled or timed out")
+        return None
+
+    def _capture_linux_screenshot_path(self, log_errors: bool = True) -> str | None:
+        tmp = tempfile.NamedTemporaryFile(prefix="gemini-shot-", suffix=".png", delete=False)
+        path = tmp.name
+        tmp.close()
+        commands = [
+            ["bash", "-lc", f'command -v grim >/dev/null && command -v slurp >/dev/null && grim -g "$(slurp)" {shlex.quote(path)}'],
+            ["gnome-screenshot", "-a", "-f", path],
+            ["spectacle", "-brno", path],
+            ["import", path],
+        ]
+        for command in commands:
+            try:
+                Path(path).unlink(missing_ok=True)
+                result = subprocess.run(command, check=False, capture_output=True, text=True)
+                if result.returncode == 0 and Path(path).exists():
+                    return path
+            except Exception:
+                continue
+        Path(path).unlink(missing_ok=True)
+        if log_errors:
+            self._append_log("Error", "Interactive screenshot is unavailable on this Linux setup")
+        return None
+
+    def _capture_clipboard_image_path(self, log_errors: bool = True) -> str | None:
+        image = self._grab_clipboard_image()
+        if image is None:
+            return None
+        return self._save_pil_image(image, prefix="gemini-clipboard-")
+
+    def _grab_clipboard_image(self) -> Any | None:
+        if ImageGrab is None:
+            return None
+        try:
+            grabbed = ImageGrab.grabclipboard()
+        except Exception:
+            return None
+        if grabbed is None:
+            return None
+        if isinstance(grabbed, list):
+            for item in grabbed:
+                item_path = Path(str(item))
+                if item_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"} and item_path.exists():
+                    try:
+                        return PILImage.open(item_path)
+                    except Exception:
+                        continue
+            return None
+        return grabbed
+
+    def _save_pil_image(self, image: Any, prefix: str) -> str | None:
+        if PILImage is None:
+            return None
+        tmp = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".png", delete=False)
+        path = tmp.name
+        tmp.close()
+        try:
+            image.save(path, format="PNG")
+            return path
+        except Exception:
+            Path(path).unlink(missing_ok=True)
+            return None
+
+    def _clipboard_image_signature(self) -> str | None:
+        image = self._grab_clipboard_image()
+        if image is None:
+            return None
+        return self._image_signature(image)
+
+    def _image_signature(self, image: Any) -> str | None:
+        if image is None:
+            return None
+        try:
+            resized = image.copy()
+            resized.thumbnail((64, 64))
+            return str(hash(resized.tobytes()))
+        except Exception:
+            return None
+
+    def _show_overlay_message(self, text: str, ttl_ms: int = 0) -> None:
+        clean = text.strip()
+        if not clean:
+            return
+        self._overlay_pending_text = clean[:2200]
+        self._overlay_pending_ttl_ms = max(0, ttl_ms)
+        if self._overlay_pending_render_id is not None:
+            return
+        self._overlay_pending_render_id = self.root.after(35, self._flush_overlay_message)
+
+    def _flush_overlay_message(self) -> None:
+        self._overlay_pending_render_id = None
+        text = self._overlay_pending_text
+        ttl_ms = self._overlay_pending_ttl_ms
+        if not text:
+            return
+        if self._overlay_window is None or not self._overlay_window.winfo_exists():
+            self._create_overlay_window()
+        if self._overlay_window is None or self._overlay_canvas is None or self._overlay_text_id is None:
+            return
+
+        self._apply_overlay_preferences()
+        canvas = self._overlay_canvas
+        screen_width = self.root.winfo_screenwidth()
+        wrap_width = min(max(int(screen_width * 0.34), 260), 760)
+        font = self._overlay_font()
+        canvas.itemconfigure(
+            self._overlay_text_id,
+            text=text,
+            fill=self._normalize_hex_color(self.overlay_text_color_var.get(), "#F8FAFC"),
+            font=font,
+            width=wrap_width,
+        )
+        canvas.update_idletasks()
+        bbox = canvas.bbox(self._overlay_text_id)
+        if bbox is None:
+            return
+        margin = 10
+        width = max(120, (bbox[2] - bbox[0]) + margin * 2)
+        height = max(60, (bbox[3] - bbox[1]) + margin * 2)
+        canvas.configure(width=width, height=height)
+        canvas.coords(self._overlay_text_id, margin, margin)
+        x, y = self._overlay_geometry(width, height)
+        self._overlay_window.geometry(f"{width}x{height}+{x}+{y}")
+        self._overlay_window.deiconify()
+        self._overlay_window.lift()
+        self._overlay_visible = True
+        self._overlay_window.update_idletasks()
+        if self._overlay_hide_after_id is not None:
+            try:
+                self.root.after_cancel(self._overlay_hide_after_id)
+            except Exception:
+                pass
+            self._overlay_hide_after_id = None
+        if ttl_ms > 0:
+            self._overlay_hide_after_id = self.root.after(ttl_ms, self.hide_overlay)
+
+    def _create_overlay_window(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.withdraw()
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        background = "#020617"
+        transparent_applied = False
+        if self._is_macos:
+            try:
+                window.configure(bg="systemTransparent")
+                window.attributes("-transparent", True)
+                transparent_applied = True
+            except Exception:
+                transparent_applied = False
+        elif self._is_windows:
+            try:
+                window.configure(bg=background)
+                window.wm_attributes("-transparentcolor", background)
+                transparent_applied = True
+            except Exception:
+                transparent_applied = False
+        if not transparent_applied:
+            window.configure(bg=background)
+
+        canvas = tk.Canvas(window, highlightthickness=0, bd=0, bg=window.cget("bg"))
+        canvas.pack(fill=tk.BOTH, expand=True)
+        text_id = canvas.create_text(
+            12,
+            12,
+            anchor="nw",
+            justify="left",
+            text="",
+            fill=self.overlay_text_color_var.get(),
+            font=self._overlay_font(),
+        )
+
+        self._overlay_window = window
+        self._overlay_canvas = canvas
+        self._overlay_text_id = text_id
+        self._apply_overlay_preferences()
+
+    def _overlay_font(self) -> tuple[str, int, str]:
+        family = "SF Pro Display" if self._is_macos else "Segoe UI"
+        return (family, int(self.overlay_text_size_var.get()), "bold")
+
+    def _overlay_geometry(self, width: int, height: int) -> tuple[int, int]:
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        margin_x = 28
+        margin_y = 58 if self._is_macos else 24
+        position = self.overlay_position_var.get().strip().lower()
+        right = screen_width - width - margin_x
+        left = margin_x
+        top = margin_y
+        bottom = screen_height - height - margin_y
+        if position == "top-left":
+            return left, top
+        if position == "top-right":
+            return max(left, right), top
+        if position == "bottom-left":
+            return left, max(top, bottom)
+        return max(left, right), max(top, bottom)
+
+    def _apply_overlay_preferences(self) -> None:
+        window = self._overlay_window
+        if window is None or not window.winfo_exists():
+            return
+        try:
+            window.attributes("-alpha", max(0.25, min(1.0, float(self.overlay_opacity_var.get()))))
+        except Exception:
+            pass
+        if self._overlay_canvas is not None and self._overlay_text_id is not None:
+            self._overlay_canvas.itemconfigure(
+                self._overlay_text_id,
+                fill=self._normalize_hex_color(self.overlay_text_color_var.get(), "#F8FAFC"),
+                font=self._overlay_font(),
+            )
+
+    def hide_overlay(self) -> None:
+        if self._overlay_hide_after_id is not None:
+            try:
+                self.root.after_cancel(self._overlay_hide_after_id)
+            except Exception:
+                pass
+            self._overlay_hide_after_id = None
+        if self._overlay_pending_render_id is not None:
+            try:
+                self.root.after_cancel(self._overlay_pending_render_id)
+            except Exception:
+                pass
+            self._overlay_pending_render_id = None
+        self._overlay_pending_text = ""
+        window = self._overlay_window
+        if window is not None and window.winfo_exists():
+            try:
+                window.withdraw()
+            except Exception:
+                pass
+        self._overlay_visible = False
+
+    def _cleanup_overlay_request(self, request_id: str) -> None:
+        self._overlay_request_ids.discard(request_id)
+        self._overlay_started_at.pop(request_id, None)
+        self._overlay_last_update_at.pop(request_id, None)
+        image_path = self._overlay_image_paths_by_request.pop(request_id, None)
+        if image_path:
+            try:
+                Path(image_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        if self._overlay_primary_request_id == request_id:
+            self._overlay_primary_request_id = next(iter(self._overlay_request_ids), None)
+
+    def _cleanup_all_overlay_requests(self) -> None:
+        for request_id in list(self._overlay_request_ids):
+            self._cleanup_overlay_request(request_id)
+
+    def _check_overlay_request_timeouts(self) -> None:
+        now = time.monotonic()
+        timed_out: list[str] = []
+        for request_id in list(self._overlay_request_ids):
+            started_at = self._overlay_started_at.get(request_id, now)
+            last_update = self._overlay_last_update_at.get(request_id, started_at)
+            total_elapsed = now - started_at
+            idle_elapsed = now - last_update
+            if total_elapsed >= OVERLAY_HARD_TIMEOUT_SECONDS or idle_elapsed >= OVERLAY_IDLE_TIMEOUT_SECONDS:
+                timed_out.append(request_id)
+        for request_id in timed_out:
+            if request_id == self._overlay_primary_request_id:
+                self._show_overlay_message("Timeout: nessuna risposta dal bridge. Riprova.", ttl_ms=7000)
+            self._cleanup_overlay_request(request_id)
+
+    def _consume_quick_inbox(self) -> None:
+        if not self._quick_inbox_path.exists():
+            self._quick_inbox_offset = 0
+            return
+
+        try:
+            size = self._quick_inbox_path.stat().st_size
+            if size < self._quick_inbox_offset:
+                self._quick_inbox_offset = 0
+        except OSError:
+            return
+
+        try:
+            with self._quick_inbox_path.open("r", encoding="utf-8") as handle:
+                handle.seek(self._quick_inbox_offset)
+                lines = handle.readlines()
+                self._quick_inbox_offset = handle.tell()
+        except OSError:
+            return
+
+        for line in lines:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            event_type = str(payload.get("type", "")).strip().lower()
+            if event_type == "quick_overlay":
+                self.events.put({"type": "quick_overlay", "prompt": str(payload.get("prompt", "")).strip()})
+            elif event_type in {"quick_clipboard_overlay", "quick_clipboard"}:
+                self.events.put({"type": "quick_clipboard_overlay", "prompt": str(payload.get("prompt", "")).strip()})
+            elif event_type == "quick_send":
+                self.events.put({"type": "quick_send", "text": str(payload.get("text", "")).strip()})
+            elif event_type == "toggle_visibility":
+                self.events.put({"type": "toggle_visibility"})
+            elif event_type == "hide_overlay":
+                self.events.put({"type": "hide_overlay"})
+
+    def _consume_toggle_flag(self) -> None:
+        if not self._toggle_flag_path.exists():
+            return
+        try:
+            mtime = self._toggle_flag_path.stat().st_mtime
+            if self._toggle_flag_mtime == 0.0:
+                self._toggle_flag_mtime = mtime
+                return
+            if mtime > self._toggle_flag_mtime:
+                self._toggle_flag_mtime = mtime
+                self.events.put({"type": "toggle_visibility"})
+        except OSError:
+            pass
+
+    def _consume_clipboard_flag(self) -> None:
+        if not self._clipboard_flag_path.exists():
+            return
+        try:
+            mtime = self._clipboard_flag_path.stat().st_mtime
+            if self._clipboard_flag_mtime == 0.0:
+                self._clipboard_flag_mtime = mtime
+                return
+            if mtime > self._clipboard_flag_mtime:
+                self._clipboard_flag_mtime = mtime
+                self.events.put({"type": "quick_clipboard_overlay", "prompt": ""})
+        except OSError:
+            pass
+
+    def _poll_events(self) -> None:
+        if self._closing_app:
+            return
+        self._consume_quick_inbox()
+        self._consume_toggle_flag()
+        self._consume_clipboard_flag()
+        self._check_overlay_request_timeouts()
+
+        while True:
+            try:
+                event = self.events.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_event(event)
+
+        self.root.after(POLL_INTERVAL_MS, self._poll_events)
+
+    def _handle_event(self, event: dict[str, Any]) -> None:
+        event_type = str(event.get("type", "")).strip()
+
+        if event_type == "toggle_visibility":
+            self.toggle_window_visibility()
+            return
+
+        if event_type == "hide_overlay":
+            self.hide_overlay()
+            return
+
+        if event_type == "quick_overlay":
+            self.on_hotkey_overlay_triggered(str(event.get("prompt", "")))
+            return
+
+        if event_type == "quick_clipboard_overlay":
+            self.on_hotkey_clipboard_triggered(str(event.get("prompt", "")))
+            return
+
+        if event_type == "quick_send":
+            text = str(event.get("text", "")).strip()
+            if text:
+                self._send_text_overlay_request(text)
+            return
+
+        if event_type == "status":
+            text = str(event.get("text", "")).strip()
+            if text:
+                self.status_var.set(text)
+                self._append_log("System", text)
+            return
+
+        if event_type == "error":
+            message = str(event.get("text", "Unknown error")).strip()
+            if message:
+                self._append_log("Error", message)
+                if self._overlay_primary_request_id:
+                    self._show_overlay_message(f"Errore bridge: {message}", ttl_ms=8000)
+                    self._cleanup_all_overlay_requests()
+            return
+
+        if event_type == "scan_result":
+            devices = event.get("devices", [])
+            self.devices = [device for device in devices if isinstance(device, dict)]
+            self._refresh_device_selector()
+            self._refresh_menu_bar_icon()
+            if self.devices:
+                self._append_log("System", f"Found {len(self.devices)} Gemini bridge device(s)")
+            else:
+                self._append_log("System", "No Gemini bridge found")
+            return
+
+        if event_type == "connected":
+            self.connected = True
+            address = str(event.get("address", "")).strip()
+            bridge_id = self._normalize_bridge_id(event.get("bridge_id"))
+            if address:
+                self._last_connected_address = address
+            if bridge_id:
+                self._last_connected_bridge_id = bridge_id
+            self.status_var.set(f"Connected: {str(event.get('device', 'phone')).strip()}")
+            self.link_var.set("Link: healthy")
+            self._last_link_state = "healthy"
+            packet = event.get("max_packet_size", "?")
+            self._append_log("System", f"Connected, packet size: {packet}")
+            self.save_settings()
+            self._refresh_menu_bar_icon()
+            if self._pending_quick_action is not None:
+                action = self._pending_quick_action
+                self._pending_quick_action = None
+                self.root.after(320, lambda action=action: self._run_pending_action(action))
+            return
+
+        if event_type == "disconnected":
+            if self.connected:
+                self._append_log("System", "Disconnected")
+            self.connected = False
+            self.status_var.set("Disconnected")
+            self.link_var.set("Link: offline")
+            self._last_link_state = "offline"
+            self._current_link_rtt = None
+            self._refresh_menu_bar_icon()
+            if self._overlay_primary_request_id:
+                self._show_overlay_message("Bridge disconnesso durante la richiesta", ttl_ms=7000)
+                self._cleanup_all_overlay_requests()
+            return
+
+        if event_type == "link_quality":
+            rtt = event.get("rtt_ms")
+            if isinstance(rtt, int):
+                self._current_link_rtt = rtt
+                self.link_var.set(f"Link RTT: {rtt} ms")
+            return
+
+        if event_type == "link_status":
+            state = str(event.get("state", "unknown")).strip()
+            if state != self._last_link_state:
+                self._last_link_state = state
+                text = str(event.get("text", "")).strip()
+                if text:
+                    self._append_log("System", text)
+            return
+
+        if event_type == "transfer_progress":
+            request_id = str(event.get("request_id", "")).strip()
+            percent = event.get("percent")
+            current = event.get("current_packets")
+            total = event.get("total_packets")
+            if request_id:
+                self._overlay_last_update_at[request_id] = time.monotonic()
+            if (
+                request_id
+                and request_id == self._overlay_primary_request_id
+                and isinstance(percent, int)
+                and isinstance(current, int)
+                and isinstance(total, int)
+            ):
+                self._show_overlay_message(f"Invio... {percent}% ({current}/{total})", ttl_ms=0)
+            return
+
+        if event_type == "sent":
+            request_id = str(event.get("request_id", "")).strip()
+            if request_id:
+                self._overlay_last_update_at[request_id] = time.monotonic()
+            if request_id and request_id == self._overlay_primary_request_id:
+                self._show_overlay_message("Upload completato, attendo risposta...", ttl_ms=0)
+            return
+
+        if event_type == "incoming":
+            message = event.get("message", {})
+            if not isinstance(message, dict):
+                return
+            message_type = str(message.get("type", "")).strip().lower()
+            message_id = str(message.get("messageId", "")).strip()
+            if not message_id and len(self._overlay_request_ids) == 1:
+                message_id = next(iter(self._overlay_request_ids))
+
+            if message_id and message_id in self._overlay_request_ids:
+                self._overlay_last_update_at[message_id] = time.monotonic()
+
+            if message_type == "status":
+                state = str(message.get("state", "processing")).strip()
+                if state and message_id == self._overlay_primary_request_id:
+                    self._show_overlay_message(state, ttl_ms=0)
+                if state.lower().startswith("canceled") and message_id:
+                    self._cleanup_overlay_request(message_id)
+                return
+
+            if message_type == "partial":
+                if message_id != self._overlay_primary_request_id:
+                    return
+                channel = str(message.get("channel", "answer")).strip().lower()
+                if channel == "thought":
+                    return
+                partial_text = str(message.get("text", "")).strip()
+                if partial_text:
+                    self._show_overlay_message(partial_text + "\n▌", ttl_ms=0)
+                return
+
+            if message_type == "result":
+                response_text = str(message.get("text", "")).strip()
+                if message_id == self._overlay_primary_request_id and response_text:
+                    ttl_ms = int(self.overlay_timeout_var.get()) * 1000
+                    self._show_overlay_message(response_text, ttl_ms=ttl_ms)
+                if response_text:
+                    self._append_log("Gemini", response_text.splitlines()[0][:160])
+                if message_id:
+                    self._cleanup_overlay_request(message_id)
+                return
+
+            if message_type == "error":
+                error_text = str(message.get("error", "Unknown error")).strip()
+                if message_id == self._overlay_primary_request_id:
+                    self._show_overlay_message(f"Errore: {error_text}", ttl_ms=9000)
+                self._append_log("Phone", error_text)
+                if message_id:
+                    self._cleanup_overlay_request(message_id)
+                return
+
+    def _run_pending_action(self, action: dict[str, Any]) -> None:
+        action_type = str(action.get("type", "")).strip().lower()
+        prompt = str(action.get("prompt", "")).strip()
+        if action_type == "shot":
+            self.on_hotkey_overlay_triggered(prompt)
+        elif action_type == "clipboard":
+            self.on_hotkey_clipboard_triggered(prompt)
+        elif action_type == "text":
+            self._send_text_overlay_request(str(action.get("text", "")), prompt_override=prompt)
+
+    def _normalize_hex_color(self, value: Any, fallback: str) -> str:
+        text = str(value or "").strip()
+        if len(text) == 7 and text.startswith("#"):
+            try:
+                int(text[1:], 16)
+                return text.upper()
+            except ValueError:
+                return fallback
         return fallback
 
-    def _normalize_bridge_id(self, raw: Any) -> str | None:
-        if not isinstance(raw, str):
+    def _normalize_bridge_id(self, value: Any) -> str | None:
+        if value is None:
             return None
-        clean = "".join(ch for ch in raw.strip().upper() if ch in "0123456789ABCDEF")
+        clean = "".join(ch for ch in str(value).strip().upper() if ch in "0123456789ABCDEF")
         if len(clean) < 6:
             return None
         return clean[:12]
 
-    def _format_device_label(self, device: dict[str, Any]) -> str:
-        name = str(device.get("name", "Gemini Bridge")).strip() or "Gemini Bridge"
-        address = str(device.get("address", "")).strip()
-        bridge_id = self._normalize_bridge_id(device.get("bridge_id"))
-        if bridge_id:
-            short = bridge_id[-6:]
-            return f"{name}  #{short}  ({address})"
-        return f"{name} ({address})"
+    def show_window(self) -> None:
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+        self._window_visible = True
+        if self._is_macos and NSApplication is not None:
+            try:
+                NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            except Exception:
+                pass
 
-    def _connect_with_hint(self, address: str | None, bridge_id: str | None) -> None:
-        normalized_bridge = self._normalize_bridge_id(bridge_id)
-        safe_address = str(address or "").strip()
-        self.client.connect(safe_address, bridge_id=normalized_bridge)
+    def hide_window(self) -> None:
+        if not self._menu_bar_mode_enabled():
+            self.root.iconify()
+            self._window_visible = False
+            return
+        self.root.withdraw()
+        self._window_visible = False
 
-    def _save_settings(self, data: dict[str, Any]) -> None:
+    def toggle_window_visibility(self) -> None:
+        if self.root.state() == "withdrawn" or self.root.state() == "iconic" or not self._window_visible:
+            self.show_window()
+        else:
+            self.hide_window()
+
+    def _apply_macos_activation_policy(self) -> None:
+        if not self._is_macos or NSApplication is None:
+            return
         try:
-            with self._settings_path.open("w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            app = NSApplication.sharedApplication()
+            if self._menu_bar_mode_enabled() and self._hide_dock_icon_enabled():
+                app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+            else:
+                app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
         except Exception:
             pass
 
-    def _update_settings(self, patch: dict[str, Any]) -> None:
-        current = self._load_settings()
-        current.update(patch)
-        self._save_settings(current)
-
-    def _open_macos_privacy_pane(self, pane_suffix: str) -> None:
-        if not self._is_macos:
+    def _start_menu_bar_icon_if_needed(self) -> None:
+        if not self._menu_bar_mode_enabled():
             return
-        url = f"x-apple.systempreferences:com.apple.preference.security?{pane_suffix}"
-        try:
-            subprocess.Popen(["open", url])
-        except Exception as exc:
-            self._append_log("Error", f"Cannot open macOS privacy settings: {exc}")
-
-    def _has_screen_recording_permission(self) -> bool | None:
-        if not self._is_macos:
-            return True
-        if CGPreflightScreenCaptureAccess is None:
-            return None
-        try:
-            return bool(CGPreflightScreenCaptureAccess())
-        except Exception:
-            return None
-
-    def _request_screen_recording_permission(self) -> bool | None:
-        if not self._is_macos:
-            return True
-        if CGRequestScreenCaptureAccess is None:
-            return None
-        try:
-            return bool(CGRequestScreenCaptureAccess())
-        except Exception:
-            return None
-
-    def _has_accessibility_permission(self) -> bool | None:
-        if not self._is_macos:
-            return True
-        if AXIsProcessTrusted is None:
-            return None
-        try:
-            return bool(AXIsProcessTrusted())
-        except Exception:
-            return None
-
-    def _request_accessibility_permission(self) -> bool | None:
-        if not self._is_macos:
-            return True
-        if AXIsProcessTrustedWithOptions is None:
-            return None
-        try:
-            options: dict[Any, Any]
-            if kAXTrustedCheckOptionPrompt is not None:
-                options = {kAXTrustedCheckOptionPrompt: True}
-            else:
-                options = {"AXTrustedCheckOptionPrompt": True}
-            return bool(AXIsProcessTrustedWithOptions(options))
-        except Exception:
-            return None
-
-    def _bluetooth_authorization_state(self) -> str | None:
-        if not self._is_macos:
-            return "granted"
-        if CBCentralManager is None:
-            return None
-        try:
-            auth_value = int(CBCentralManager.authorization())
-            if auth_value == 3:
-                return "granted"
-            if auth_value == 2:
-                return "denied"
-            if auth_value == 1:
-                return "restricted"
-            if auth_value == 0:
-                return "not_determined"
-            return f"unknown({auth_value})"
-        except Exception:
-            return None
-
-    def _request_bluetooth_permission(self) -> None:
-        if not self._is_macos:
-            return
-        # Instantiate a central manager once to trigger the OS prompt on first run.
-        if CBCentralManager is not None and self._bluetooth_probe_manager is None:
-            try:
-                self._bluetooth_probe_manager = CBCentralManager.alloc().init()
-            except Exception:
-                self._bluetooth_probe_manager = None
-        try:
-            self.client.scan_devices()
-        except Exception:
-            pass
-
-    def _format_permission_state(self, state: bool | None, label: str) -> str:
-        if state is True:
-            return f"{label}: OK"
-        if state is False:
-            return f"{label}: Missing"
-        return f"{label}: Unknown"
-
-    def _maybe_show_permissions_onboarding(self) -> None:
-        if not self._is_macos:
-            return
-        settings = self._load_settings()
-        if bool(settings.get("permissions_onboarding_done", False)):
-            return
-        self._show_permissions_onboarding(force=False)
-
-    def _show_permissions_onboarding(self, force: bool = False) -> None:
-        if not self._is_macos:
-            return
-        if self._permissions_dialog is not None and self._permissions_dialog.winfo_exists():
-            self._permissions_dialog.lift()
-            return
-        if not force:
-            settings = self._load_settings()
-            if bool(settings.get("permissions_onboarding_done", False)):
-                return
-
-        from tkinter import messagebox
-
-        dialog = ctk.CTkToplevel(self.root)
-        dialog.title("Setup permessi macOS")
-        dialog.geometry("680x560")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        self._permissions_dialog = dialog
-
-        ctk.CTkLabel(
-            dialog,
-            text="Primo avvio: abilita i permessi richiesti",
-            font=("Avenir", 18, "bold"),
-        ).pack(anchor=tk.W, padx=16, pady=(14, 6))
-        ctk.CTkLabel(
-            dialog,
-            text=(
-                "L'app usa Bluetooth (bridge), Screen Recording (Shot+Ask) e "
-                "Accessibility (shortcut globali/overlay)."
-            ),
-            justify=tk.LEFT,
-            wraplength=640,
-            text_color="#b0b0b0",
-        ).pack(anchor=tk.W, padx=16, pady=(0, 12))
-
-        screen_state_var = tk.StringVar()
-        access_state_var = tk.StringVar()
-        bt_state_var = tk.StringVar()
-        bt_manual_confirm = tk.BooleanVar(value=False)
-
-        panel = ctk.CTkFrame(dialog, fg_color="#151515", border_width=1, border_color="#2a2a2a")
-        panel.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 10))
-
-        def section_row(
-            title: str,
-            subtitle: str,
-            status_var: tk.StringVar,
-            request_cmd: Any,
-            open_cmd: Any,
-        ) -> None:
-            row = ctk.CTkFrame(panel, fg_color="transparent")
-            row.pack(fill=tk.X, padx=12, pady=(12, 2))
-            ctk.CTkLabel(row, text=title, font=("Avenir", 14, "bold")).pack(anchor=tk.W)
-            ctk.CTkLabel(
-                row,
-                text=subtitle,
-                justify=tk.LEFT,
-                wraplength=620,
-                text_color="#b0b0b0",
-            ).pack(anchor=tk.W, pady=(0, 4))
-            ctk.CTkLabel(row, textvariable=status_var, font=("Avenir", 12)).pack(anchor=tk.W, pady=(0, 4))
-            btn_row = ctk.CTkFrame(row, fg_color="transparent")
-            btn_row.pack(anchor=tk.W, pady=(0, 2))
-            ctk.CTkButton(btn_row, text="Richiedi", width=96, command=request_cmd).pack(side=tk.LEFT, padx=(0, 8))
-            ctk.CTkButton(
-                btn_row,
-                text="Apri Impostazioni",
-                width=156,
-                command=open_cmd,
-                fg_color="transparent",
-                border_width=1,
-                hover_color="#2a2a2a",
-            ).pack(side=tk.LEFT)
-
-        def refresh_states() -> tuple[bool, bool, bool]:
-            screen_state = self._has_screen_recording_permission()
-            access_state = self._has_accessibility_permission()
-            bt_state = self._bluetooth_authorization_state()
-            bt_ok = bt_state == "granted" or bt_manual_confirm.get()
-
-            screen_state_var.set(self._format_permission_state(screen_state, "Screen Recording"))
-            access_state_var.set(self._format_permission_state(access_state, "Accessibility"))
-
-            if bt_state == "granted":
-                bt_manual_confirm.set(True)
-                bt_state_var.set("Bluetooth: OK")
-            elif bt_state in {"denied", "restricted"}:
-                bt_state_var.set(f"Bluetooth: {bt_state}")
-            elif bt_state == "not_determined":
-                bt_state_var.set("Bluetooth: in attesa autorizzazione")
-            else:
-                bt_state_var.set("Bluetooth: verifica manuale (premi Richiedi)")
-
-            return (screen_state is True, access_state is True, bt_ok)
-
-        section_row(
-            "1) Screen Recording",
-            "Necessario per Shot+Ask e screenshot area su macOS.",
-            screen_state_var,
-            lambda: (self._request_screen_recording_permission(), refresh_states()),
-            lambda: self._open_macos_privacy_pane("Privacy_ScreenCapture"),
-        )
-        section_row(
-            "2) Accessibility",
-            "Necessario per integrazione shortcut globali e overlay affidabile.",
-            access_state_var,
-            lambda: (self._request_accessibility_permission(), refresh_states()),
-            lambda: self._open_macos_privacy_pane("Privacy_Accessibility"),
-        )
-        section_row(
-            "3) Bluetooth",
-            "Necessario per scan e connessione BLE col telefono.",
-            bt_state_var,
-            lambda: (self._request_bluetooth_permission(), refresh_states()),
-            lambda: self._open_macos_privacy_pane("Privacy_Bluetooth"),
-        )
-        ctk.CTkCheckBox(
-            panel,
-            text="Ho autorizzato il Bluetooth (se lo stato non è rilevabile automaticamente)",
-            variable=bt_manual_confirm,
-            command=refresh_states,
-        ).pack(anchor=tk.W, padx=12, pady=(2, 12))
-
-        footer = ctk.CTkFrame(dialog, fg_color="transparent")
-        footer.pack(fill=tk.X, padx=16, pady=(0, 14))
-
-        def finish_setup() -> None:
-            screen_ok, access_ok, bt_ok = refresh_states()
-            if not (screen_ok and access_ok and bt_ok):
-                proceed = messagebox.askyesno(
-                    "Permessi incompleti",
-                    (
-                        "Alcuni permessi risultano mancanti.\n"
-                        "Se continui ora alcune funzioni (scan BLE/screenshot/shortcut) possono fallire.\n\n"
-                        "Vuoi comunque chiudere il setup?"
-                    ),
-                    parent=dialog,
-                )
-                if not proceed:
-                    return
-            self._update_settings(
-                {
-                    "permissions_onboarding_done": True,
-                    "permissions_screen_recording_ok": screen_ok,
-                    "permissions_accessibility_ok": access_ok,
-                    "permissions_bluetooth_ok": bt_ok,
-                }
-            )
-            self._append_log("System", "Setup permessi macOS completato")
-            dialog.destroy()
-            self._permissions_dialog = None
-
-        def remind_later() -> None:
-            self._append_log("System", "Setup permessi rimandato")
-            dialog.destroy()
-            self._permissions_dialog = None
-
-        ctk.CTkButton(
-            footer,
-            text="Ricarica stato",
-            width=120,
-            command=refresh_states,
-            fg_color="transparent",
-            border_width=1,
-            hover_color="#2a2a2a",
-        ).pack(side=tk.LEFT)
-        ctk.CTkButton(
-            footer,
-            text="Ricorda dopo",
-            width=120,
-            command=remind_later,
-            fg_color="transparent",
-            border_width=1,
-            hover_color="#2a2a2a",
-        ).pack(side=tk.RIGHT, padx=(8, 0))
-        ctk.CTkButton(footer, text="Completa setup", width=140, command=finish_setup).pack(side=tk.RIGHT, padx=(0, 8))
-
-        dialog.protocol("WM_DELETE_WINDOW", remind_later)
-        refresh_states()
-
-    def _parse_version_tuple(self, value: str) -> tuple[int, ...]:
-        clean = value.strip().lower()
-        if clean.startswith("v"):
-            clean = clean[1:]
-        parts: list[int] = []
-        for chunk in re.findall(r"\d+", clean):
-            try:
-                parts.append(int(chunk))
-            except Exception:
-                parts.append(0)
-        return tuple(parts or [0])
-
-    def _is_version_newer(self, candidate: str, current: str) -> bool:
-        return self._parse_version_tuple(candidate) > self._parse_version_tuple(current)
-
-    def _release_asset_for_platform(self, assets: list[dict[str, Any]]) -> dict[str, Any] | None:
-        names = []
         if self._is_macos:
-            names = ["BluetoothGeminiChat-macos.dmg", "BluetoothGeminiChat-macos.zip"]
-        elif platform.system().lower().startswith("windows"):
-            names = ["BluetoothGeminiChat-windows.zip"]
-        elif platform.system().lower().startswith("linux"):
-            names = ["BluetoothGeminiChat-linux.tar.gz", "BluetoothGeminiChat-linux.zip"]
-        for wanted in names:
-            for asset in assets:
-                if str(asset.get("name", "")) == wanted:
-                    return asset
-        return None
-
-    def _open_url(self, url: str, timeout: int = 30) -> Any:
-        req = urlrequest.Request(
-            url,
-            headers={
-                "User-Agent": f"BluetoothGeminiChat/{APP_VERSION}",
-                "Accept": "application/vnd.github+json",
-            },
-        )
-        try:
-            return urlrequest.urlopen(req, timeout=timeout)
-        except ssl.SSLCertVerificationError:
-            if certifi is None:
-                raise
-            ctx = ssl.create_default_context(cafile=certifi.where())
-            return urlrequest.urlopen(req, timeout=timeout, context=ctx)
-        except urlerror.URLError as exc:
-            reason = getattr(exc, "reason", None)
-            if isinstance(reason, ssl.SSLCertVerificationError) and certifi is not None:
-                ctx = ssl.create_default_context(cafile=certifi.where())
-                return urlrequest.urlopen(req, timeout=timeout, context=ctx)
-            raise
-
-    def _download_update_asset(self, url: str, filename: str) -> Path:
-        download_dir = Path.home() / "Downloads" / "GeminiBLEUpdates"
-        download_dir.mkdir(parents=True, exist_ok=True)
-        target = download_dir / filename
-        with self._open_url(url, timeout=30) as response:
-            target.write_bytes(response.read())
-        return target
-
-    def on_check_updates(self, background: bool = True) -> None:
-        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-        try:
-            with self._open_url(api_url, timeout=15) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except (urlerror.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            if not background:
-                self._append_log("Error", f"Update check failed: {exc}")
+            self._start_macos_menu_bar_item()
             return
+        self._start_windows_tray_icon()
 
-        latest_tag = str(payload.get("tag_name", "")).strip() or "unknown"
-        release_url = str(payload.get("html_url", "")).strip()
-        assets = payload.get("assets", [])
-        if not isinstance(assets, list):
-            assets = []
-        if not self._is_version_newer(latest_tag, APP_VERSION):
-            if not background:
-                self._append_log("System", f"Already up to date ({APP_VERSION})")
+    def _refresh_menu_bar_icon(self) -> None:
+        if not self._menu_bar_mode_enabled():
             return
-
-        self._append_log("System", f"Update available: {latest_tag} (current {APP_VERSION})")
-        asset = self._release_asset_for_platform(assets)
-        if asset is None:
-            if release_url:
-                self._append_log("System", f"Open release page: {release_url}")
+        if self._is_macos:
+            self._start_macos_menu_bar_item(rebuild=True)
             return
-
-        asset_name = str(asset.get("name", "update.bin")).strip() or "update.bin"
-        asset_url = str(asset.get("browser_download_url", "")).strip()
-        if not asset_url:
-            if release_url:
-                self._append_log("System", f"Open release page: {release_url}")
-            return
-
-        if background:
-            return
-
-        from tkinter import messagebox
-        do_download = messagebox.askyesno(
-            "Update disponibile",
-            f"Nuova versione {latest_tag} disponibile.\nVuoi scaricare {asset_name} adesso?",
-            parent=self.root,
-        )
-        if not do_download:
-            return
-
-        try:
-            local_path = self._download_update_asset(asset_url, asset_name)
-        except Exception as exc:
-            self._append_log("Error", f"Download update failed: {exc}")
-            return
-
-        self._append_log("System", f"Update downloaded: {local_path}")
-        try:
-            if self._is_macos and local_path.suffix.lower() == ".dmg":
-                subprocess.Popen(["open", str(local_path)])
-            elif platform.system().lower().startswith("windows"):
-                os.startfile(str(local_path))  # type: ignore[attr-defined]
-            else:
-                webbrowser.open(local_path.as_uri(), new=2)
-        except Exception as exc:
-            self._append_log("System", f"Open update file manually: {local_path} ({exc})")
-
-    def _track_pending_request(self, request_id: str, session_id: str) -> None:
-        self._pending_request_session[request_id] = session_id
-        self._pending_request_order = [rid for rid in self._pending_request_order if rid != request_id]
-        self._pending_request_order.append(request_id)
-        self._refresh_stop_button()
-
-    def _clear_pending_request(self, request_id: str) -> None:
-        self._pending_request_session.pop(request_id, None)
-        if request_id in self._pending_request_order:
-            self._pending_request_order = [rid for rid in self._pending_request_order if rid != request_id]
-        self._refresh_stop_button()
-
-    def _latest_pending_request_for_session(self, session_id: str) -> str | None:
-        for request_id in reversed(self._pending_request_order):
-            if self._pending_request_session.get(request_id) == session_id:
-                return request_id
-        return None
-
-    def _refresh_stop_button(self) -> None:
-        try:
-            can_stop = self._latest_pending_request_for_session(self.active_session_id) is not None
-            self.stop_btn.configure(state=("normal" if can_stop else "disabled"))
-        except Exception:
-            pass
-
-    def _clear_all_pending_requests(self) -> None:
-        for request_id in list(self._pending_request_order):
-            self._clear_pending_request(request_id)
-
-    def _maybe_auto_connect_on_start(self) -> None:
-        if not self._auto_connect_on_start:
-            return
-        if self.connected:
-            return
-        if not self._last_connected_address and not self._last_connected_bridge_id:
-            return
-        target = self._last_connected_bridge_id or self._last_connected_address or "known bridge"
-        self._append_log("System", f"Auto-connect to known bridge: {target}")
-        self._connect_with_hint(self._last_connected_address, self._last_connected_bridge_id)
+        self._refresh_windows_tray_menu()
 
     def _create_menu_bar_icon_image(self) -> Any | None:
         if PILImage is None or ImageDraw is None:
             return None
-        try:
-            size = 64
-            icon = PILImage.new("RGBA", (size, size), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(icon)
-            draw.rounded_rectangle((8, 8, size - 8, size - 8), radius=14, fill=(28, 28, 30, 255))
-            draw.ellipse((18, 22, 34, 38), fill=(71, 160, 255, 255))
-            draw.rectangle((32, 27, 46, 33), fill=(213, 213, 214, 255))
-            return icon
-        except Exception:
-            return None
+        image = PILImage.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        circle = "#0EA5E9" if self.connected else "#334155"
+        draw.ellipse((8, 8, 56, 56), fill=circle)
+        draw.rounded_rectangle((20, 20, 44, 44), radius=9, fill="#F8FAFC")
+        draw.rounded_rectangle((24, 24, 40, 40), radius=5, fill=circle)
+        return image
 
-    def _start_menu_bar_icon_if_needed(self) -> None:
-        if not self._menu_bar_mode_enabled:
-            return
-        if not self._menu_bar_available:
-            if self._is_macos:
-                self._append_log("System", "Menu bar mode unavailable: missing AppKit bridge")
-            return
+    def _build_pystray_model_menu(self) -> Any:
+        items = []
+        for model in MODEL_PRESETS:
+            label = model
 
-        if self._is_macos:
-            self._start_macos_menu_bar_item()
-            return
+            def on_click(_icon: Any, _item: Any, model_name: str = model) -> None:
+                self.root.after(0, lambda model_name=model_name: self._set_model_from_menu(model_name))
 
+            items.append(
+                pystray.MenuItem(
+                    label,
+                    on_click,
+                    checked=lambda _item, model_name=model: self.model_var.get().strip() == model_name,
+                    radio=True,
+                )
+            )
+        return pystray.Menu(*items)
+
+    def _build_pystray_connect_menu(self) -> Any:
+        if not self.devices:
+            return pystray.Menu(pystray.MenuItem("No scanned device", None, enabled=False))
+        items = []
+        for device in self.devices[:8]:
+            label = self._format_device_label(device)
+
+            def on_click(_icon: Any, _item: Any, device=device) -> None:
+                address = str(device.get("address", "")).strip()
+                bridge_id = self._normalize_bridge_id(device.get("bridge_id"))
+                self.root.after(0, lambda: self._connect_with_hint(address, bridge_id))
+
+            items.append(pystray.MenuItem(label, on_click))
+        return pystray.Menu(*items)
+
+    def _build_pystray_menu(self) -> Any:
+        status_label = self.status_var.get().strip() or "Disconnected"
+        return pystray.Menu(
+            pystray.MenuItem(status_label, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Show Settings", lambda _icon, _item: self.root.after(0, self.show_window)),
+            pystray.MenuItem("Scan Devices", lambda _icon, _item: self.root.after(0, self.on_scan_devices)),
+            pystray.MenuItem("Connect Last", lambda _icon, _item: self.root.after(0, self.on_connect_last)),
+            pystray.MenuItem("Connect Scanned", self._build_pystray_connect_menu()),
+            pystray.MenuItem("Disconnect", lambda _icon, _item: self.root.after(0, self.on_disconnect), enabled=lambda _item: self.connected),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Shot+Ask", lambda _icon, _item: self.root.after(0, self.on_hotkey_overlay_triggered)),
+            pystray.MenuItem("Clipboard Ask", lambda _icon, _item: self.root.after(0, self.on_hotkey_clipboard_triggered)),
+            pystray.MenuItem("Hide Overlay", lambda _icon, _item: self.root.after(0, self.hide_overlay)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Models", self._build_pystray_model_menu()),
+            pystray.MenuItem("Quit", lambda _icon, _item: self.root.after(0, self.quit_app)),
+        )
+
+    def _start_windows_tray_icon(self) -> None:
+        if pystray is None or PILImage is None:
+            return
         if self._tray_icon is not None:
             return
-
         image = self._create_menu_bar_icon_image()
         if image is None:
             return
-
-        def on_toggle(_icon: Any, _item: Any) -> None:
-            self.root.after(0, self._toggle_app_visibility)
-
-        def on_shot(_icon: Any, _item: Any) -> None:
-            self.root.after(0, self.on_hotkey_overlay_triggered)
-
-        def on_clip(_icon: Any, _item: Any) -> None:
-            self.root.after(0, self.on_hotkey_clipboard_triggered)
-
-        def on_reconnect(_icon: Any, _item: Any) -> None:
-            self.root.after(0, self._reconnect_last_or_selected)
-
-        def on_quit(_icon: Any, _item: Any) -> None:
-            self.root.after(0, self.on_close)
-
-        menu = pystray.Menu(
-            pystray.MenuItem("Show/Hide Window", on_toggle),
-            pystray.MenuItem("Shot+Ask", on_shot),
-            pystray.MenuItem("Clipboard+Ask", on_clip),
-            pystray.MenuItem("Reconnect", on_reconnect),
-            pystray.MenuItem("Quit", on_quit),
-        )
-        icon = pystray.Icon("gemini_ble_chat", image, "Gemini BLE Chat", menu)
+        icon = pystray.Icon("gemini_ble_overlay", image, "Gemini BLE Overlay", self._build_pystray_menu())
         self._tray_icon = icon
 
         def run_icon() -> None:
@@ -1134,56 +1617,119 @@ class DesktopChatApp:
             except Exception:
                 pass
 
-        self._tray_thread = threading.Thread(target=run_icon, daemon=True)
+        self._tray_thread = threading.Thread(target=run_icon, name="GeminiBleTray", daemon=True)
         self._tray_thread.start()
 
-    def _start_macos_menu_bar_item(self) -> None:
+    def _refresh_windows_tray_menu(self) -> None:
+        if self._tray_icon is None:
+            self._start_windows_tray_icon()
+            return
+        image = self._create_menu_bar_icon_image()
+        if image is not None:
+            self._tray_icon.icon = image
+        self._tray_icon.menu = self._build_pystray_menu()
+        try:
+            self._tray_icon.update_menu()
+        except Exception:
+            pass
+
+    def _mac_status_title(self) -> str:
+        return "GBE" if self.connected else "GB"
+
+    def _start_macos_menu_bar_item(self, rebuild: bool = False) -> None:
         if not self._is_macos:
             return
-        if self._mac_status_item is not None:
-            return
         if NSStatusBar is None or NSMenu is None or NSMenuItem is None or _MacMenuActionTarget is None:
-            self._append_log("System", "Menu bar mode unavailable on this build")
+            return
+        if rebuild:
+            self._stop_macos_menu_bar_item()
+        if self._mac_status_item is not None:
             return
 
         status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
         if status_item is None:
-            self._append_log("System", "Cannot create macOS status item")
             return
-
         button = status_item.button()
         if button is not None:
-            if NSImage is not None:
-                try:
-                    image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-                        "bubble.left.and.bubble.right.fill",
-                        "Gemini BLE Chat",
-                    )
-                    if image is not None:
-                        button.setImage_(image)
-                    else:
-                        button.setTitle_("G")
-                except Exception:
-                    button.setTitle_("G")
-            else:
-                button.setTitle_("G")
+            try:
+                image_name = "sparkles" if self.connected else "bolt.horizontal.circle"
+                image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(image_name, "Gemini BLE Overlay")
+                if image is not None:
+                    button.setImage_(image)
+                else:
+                    button.setTitle_(self._mac_status_title())
+            except Exception:
+                button.setTitle_(self._mac_status_title())
 
         menu = NSMenu.alloc().init()
         targets: list[Any] = []
 
-        def add_item(title: str, callback: Any) -> None:
+        def add_item(title: str, callback: Any, enabled: bool = True) -> Any:
             target = _MacMenuActionTarget.alloc().initWithCallback_(callback)
             item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, "onAction:", "")
             item.setTarget_(target)
+            item.setEnabled_(enabled)
             menu.addItem_(item)
             targets.append(target)
+            return item
 
-        add_item("Show/Hide Window", lambda: self.root.after(0, self._toggle_app_visibility))
-        add_item("Shot+Ask", lambda: self.root.after(0, self.on_hotkey_overlay_triggered))
-        add_item("Clipboard+Ask", lambda: self.root.after(0, self.on_hotkey_clipboard_triggered))
-        add_item("Reconnect", lambda: self.root.after(0, self._reconnect_last_or_selected))
+        status_line = add_item(self.status_var.get().strip() or "Disconnected", lambda: None, enabled=False)
+        status_line.setToolTip_(self.link_var.get().strip())
         menu.addItem_(NSMenuItem.separatorItem())
-        add_item("Quit", lambda: self.root.after(0, self.on_close))
+        add_item("Show Settings", lambda: self.root.after(0, self.show_window))
+        add_item("Scan Devices", lambda: self.root.after(0, self.on_scan_devices))
+        add_item("Connect Last", lambda: self.root.after(0, self.on_connect_last))
+
+        connect_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Connect Scanned", None, "")
+        connect_submenu = NSMenu.alloc().init()
+        if self.devices:
+            for device in self.devices[:8]:
+                label = self._format_device_label(device)
+                address = str(device.get("address", "")).strip()
+                bridge_id = self._normalize_bridge_id(device.get("bridge_id"))
+                target = _MacMenuActionTarget.alloc().initWithCallback_(
+                    lambda address=address, bridge_id=bridge_id: self.root.after(
+                        0, lambda address=address, bridge_id=bridge_id: self._connect_with_hint(address, bridge_id)
+                    )
+                )
+                sub_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(label, "onAction:", "")
+                sub_item.setTarget_(target)
+                connect_submenu.addItem_(sub_item)
+                targets.append(target)
+        else:
+            sub_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("No scanned device", None, "")
+            sub_item.setEnabled_(False)
+            connect_submenu.addItem_(sub_item)
+        connect_item.setSubmenu_(connect_submenu)
+        menu.addItem_(connect_item)
+
+        add_item("Disconnect", lambda: self.root.after(0, self.on_disconnect), enabled=self.connected)
+        menu.addItem_(NSMenuItem.separatorItem())
+        add_item("Shot+Ask", lambda: self.root.after(0, self.on_hotkey_overlay_triggered))
+        add_item("Clipboard Ask", lambda: self.root.after(0, self.on_hotkey_clipboard_triggered))
+        add_item("Hide Overlay", lambda: self.root.after(0, self.hide_overlay))
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        models_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Model", None, "")
+        models_menu = NSMenu.alloc().init()
+        for model in MODEL_PRESETS:
+            target = _MacMenuActionTarget.alloc().initWithCallback_(
+                lambda model_name=model: self.root.after(0, lambda model_name=model_name: self._set_model_from_menu(model_name))
+            )
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(model, "onAction:", "")
+            item.setTarget_(target)
+            if self.model_var.get().strip() == model:
+                try:
+                    item.setState_(1)
+                except Exception:
+                    pass
+            models_menu.addItem_(item)
+            targets.append(target)
+        models_item.setSubmenu_(models_menu)
+        menu.addItem_(models_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+        add_item("Quit", lambda: self.root.after(0, self.quit_app))
 
         status_item.setMenu_(menu)
         self._mac_status_item = status_item
@@ -1215,2445 +1761,74 @@ class DesktopChatApp:
         except Exception:
             pass
 
-    def _apply_macos_activation_policy(self) -> None:
-        if not self._is_macos:
-            return
-        if NSApplication is None:
-            if not self._macos_policy_applied:
-                self._append_log("System", "Dock policy control unavailable (missing AppKit bridge)")
-            self._macos_policy_applied = True
-            return
-        try:
-            app = NSApplication.sharedApplication()
-            if self._hide_dock_icon_enabled:
-                app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
-            else:
-                app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
-            self._macos_policy_applied = True
-        except Exception as exc:
-            if not self._macos_policy_applied:
-                self._append_log("System", f"Dock policy update failed: {exc}")
-            self._macos_policy_applied = True
-
-    def _reconnect_last_or_selected(self) -> None:
-        if self.connected:
-            self.client.disconnect()
-        selected = self.devices_list.curselection()
-        if selected:
-            idx = selected[0]
-            if 0 <= idx < len(self.devices):
-                device = self.devices[idx]
-                self._connect_with_hint(
-                    str(device.get("address", "")).strip(),
-                    self._normalize_bridge_id(device.get("bridge_id")),
-                )
-                return
-        if self._last_connected_address or self._last_connected_bridge_id:
-            self._connect_with_hint(self._last_connected_address, self._last_connected_bridge_id)
-
-    def on_open_settings(self) -> None:
-        dialog = ctk.CTkToplevel(self.root)
-        dialog.title("Settings")
-        dialog.geometry("760x700")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        outer = ctk.CTkFrame(dialog, fg_color="transparent")
-        outer.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        scroll = ctk.CTkScrollableFrame(outer)
-        scroll.pack(fill=tk.BOTH, expand=True)
-
-        ctk.CTkLabel(scroll, text="System Prompt", font=("Avenir", 15, "bold")).pack(anchor=tk.W, padx=8, pady=(8, 4))
-        ctk.CTkLabel(scroll, text="Aggiunto a ogni richiesta.", text_color="#8ea0b8").pack(anchor=tk.W, padx=8)
-        textbox = ctk.CTkTextbox(scroll, height=130, font=("Avenir", 13))
-        textbox.pack(fill=tk.X, padx=8, pady=(6, 12))
-        textbox.insert("1.0", self.system_instructions_var.get())
-
-        ctk.CTkLabel(scroll, text="Pinned PDFs", font=("Avenir", 15, "bold")).pack(anchor=tk.W, padx=8, pady=(0, 4))
-        pinned_list_var = tk.Variable(value=list(self.pinned_pdf_paths))
-        pdf_listbox = tk.Listbox(
-            scroll,
-            listvariable=pinned_list_var,
-            height=6,
-            bg="#121720",
-            fg="#d8e0eb",
-            selectbackground="#1f538d",
-            borderwidth=1,
-            relief=tk.SOLID,
-            highlightthickness=0,
-            font=("Avenir", 12),
-        )
-        pdf_listbox.pack(fill=tk.X, padx=8, pady=(2, 6))
-
-        def add_pdf() -> None:
-            paths = filedialog.askopenfilenames(
-                parent=dialog,
-                title="Seleziona PDF",
-                filetypes=[("PDF", "*.pdf"), ("All Files", "*")],
-            )
-            current = list(pinned_list_var.get())
-            for p in paths:
-                if p not in current:
-                    current.append(p)
-            pinned_list_var.set(current)
-
-        def remove_pdf() -> None:
-            idxs = pdf_listbox.curselection()
-            current = list(pinned_list_var.get())
-            for i in reversed(idxs):
-                del current[i]
-            pinned_list_var.set(current)
-
-        pdf_btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
-        pdf_btn_row.pack(fill=tk.X, padx=8, pady=(0, 12))
-        ctk.CTkButton(pdf_btn_row, text="Browse PDF", width=104, command=add_pdf).pack(side=tk.LEFT, padx=(0, 6))
-        ctk.CTkButton(pdf_btn_row, text="Remove", width=90, command=remove_pdf).pack(side=tk.LEFT)
-
-        ctk.CTkLabel(scroll, text="Shot+Ask Overlay", font=("Avenir", 15, "bold")).pack(anchor=tk.W, padx=8, pady=(0, 4))
-        overlay_bg_var = tk.StringVar(value=self._overlay_bg_color)
-        overlay_width_var = tk.StringVar(value=str(self._overlay_width))
-        overlay_height_var = tk.StringVar(value=str(self._overlay_height))
-        overlay_resizable_var = tk.BooleanVar(value=self._overlay_resizable)
-        overlay_timeout_var = tk.StringVar(value=str(int(self._overlay_timeout_seconds)))
-
-        overlay_row1 = ctk.CTkFrame(scroll, fg_color="transparent")
-        overlay_row1.pack(fill=tk.X, padx=8, pady=(0, 6))
-        ctk.CTkLabel(overlay_row1, text="Background", width=100).pack(side=tk.LEFT)
-        ctk.CTkEntry(overlay_row1, textvariable=overlay_bg_var, width=110).pack(side=tk.LEFT, padx=(0, 8))
-        color_swatch = tk.Frame(overlay_row1, width=24, height=24, bg=self._overlay_bg_color, highlightthickness=1, highlightbackground="#555555")
-        color_swatch.pack(side=tk.LEFT, padx=(0, 8))
-        color_swatch.pack_propagate(False)
-
-        def choose_overlay_bg() -> None:
-            _, picked = colorchooser.askcolor(color=overlay_bg_var.get().strip(), parent=dialog, title="Sfondo overlay")
-            if picked:
-                overlay_bg_var.set(picked)
-                color_swatch.configure(bg=picked)
-
-        ctk.CTkButton(overlay_row1, text="Pick", width=70, command=choose_overlay_bg).pack(side=tk.LEFT)
-
-        def on_overlay_bg_changed(*_: Any) -> None:
-            value = self._normalize_hex_color(overlay_bg_var.get(), "")
-            if value:
-                color_swatch.configure(bg=value)
-
-        overlay_bg_var.trace_add("write", on_overlay_bg_changed)
-
-        overlay_row2 = ctk.CTkFrame(scroll, fg_color="transparent")
-        overlay_row2.pack(fill=tk.X, padx=8, pady=(0, 10))
-        ctk.CTkLabel(overlay_row2, text="Width", width=100).pack(side=tk.LEFT)
-        ctk.CTkEntry(overlay_row2, textvariable=overlay_width_var, width=72).pack(side=tk.LEFT, padx=(0, 12))
-        ctk.CTkLabel(overlay_row2, text="Height", width=60).pack(side=tk.LEFT)
-        ctk.CTkEntry(overlay_row2, textvariable=overlay_height_var, width=72).pack(side=tk.LEFT, padx=(0, 12))
-        ctk.CTkLabel(overlay_row2, text="Timeout(s)", width=86).pack(side=tk.LEFT)
-        ctk.CTkEntry(overlay_row2, textvariable=overlay_timeout_var, width=64).pack(side=tk.LEFT)
-        ctk.CTkCheckBox(scroll, text="Resizable overlay window", variable=overlay_resizable_var).pack(anchor=tk.W, padx=8, pady=(0, 12))
-
-        ctk.CTkLabel(scroll, text="Connection", font=("Avenir", 15, "bold")).pack(anchor=tk.W, padx=8, pady=(0, 4))
-        auto_connect_var = tk.BooleanVar(value=self._auto_connect_on_start)
-        auto_retry_var = tk.BooleanVar(value=self._auto_retry_known_device)
-        auto_updates_var = tk.BooleanVar(value=self._auto_check_updates)
-        ctk.CTkCheckBox(scroll, text="Auto-connect at startup", variable=auto_connect_var).pack(anchor=tk.W, padx=8, pady=(0, 4))
-        ctk.CTkCheckBox(scroll, text="Auto-retry after disconnect", variable=auto_retry_var).pack(anchor=tk.W, padx=8, pady=(0, 4))
-        ctk.CTkCheckBox(scroll, text="Auto-check updates", variable=auto_updates_var).pack(anchor=tk.W, padx=8, pady=(0, 10))
-
-        menu_bar_mode_var = tk.BooleanVar(value=self._menu_bar_mode_enabled)
-        hide_dock_var = tk.BooleanVar(value=self._hide_dock_icon_enabled)
-
-        if self._is_macos:
-            ctk.CTkLabel(scroll, text="macOS", font=("Avenir", 15, "bold")).pack(anchor=tk.W, padx=8, pady=(0, 4))
-            ctk.CTkCheckBox(scroll, text="Enable menu bar mode", variable=menu_bar_mode_var).pack(anchor=tk.W, padx=8, pady=(0, 4))
-            ctk.CTkCheckBox(scroll, text="Hide Dock icon", variable=hide_dock_var).pack(anchor=tk.W, padx=8, pady=(0, 4))
-            perm_row = ctk.CTkFrame(scroll, fg_color="transparent")
-            perm_row.pack(fill=tk.X, padx=8, pady=(0, 10))
-            ctk.CTkButton(perm_row, text="Screen Perm", width=106, command=self._request_screen_recording_permission).pack(side=tk.LEFT, padx=(0, 6))
-            ctk.CTkButton(perm_row, text="Accessibility", width=110, command=self._request_accessibility_permission).pack(side=tk.LEFT, padx=(0, 6))
-            ctk.CTkButton(perm_row, text="Bluetooth", width=98, command=self._request_bluetooth_permission).pack(side=tk.LEFT)
-        elif self._platform_name.startswith("windows"):
-            ctk.CTkLabel(scroll, text="Windows", font=("Avenir", 15, "bold")).pack(anchor=tk.W, padx=8, pady=(0, 4))
-            ctk.CTkLabel(
-                scroll,
-                text="Hotkeys globali: Ctrl+Shift+G (Shot+Ask), Ctrl+Shift+H (Clipboard+Ask).",
-                text_color="#8ea0b8",
-            ).pack(anchor=tk.W, padx=8, pady=(0, 10))
-        else:
-            ctk.CTkLabel(scroll, text="Linux", font=("Avenir", 15, "bold")).pack(anchor=tk.W, padx=8, pady=(0, 4))
-            ctk.CTkLabel(
-                scroll,
-                text="Per screenshot: grim+slurp (Wayland) o gnome-screenshot/maim/scrot (X11).",
-                text_color="#8ea0b8",
-            ).pack(anchor=tk.W, padx=8, pady=(0, 2))
-            ctk.CTkLabel(
-                scroll,
-                text="Per clipboard immagini: wl-clipboard o xclip.",
-                text_color="#8ea0b8",
-            ).pack(anchor=tk.W, padx=8, pady=(0, 10))
-
-        footer = ctk.CTkFrame(dialog, fg_color="transparent")
-        footer.pack(fill=tk.X, padx=12, pady=(8, 10))
-
-        def save() -> None:
-            text = textbox.get("1.0", tk.END).strip()
-            self.system_instructions_var.set(text)
-            self.pinned_pdf_paths = list(pinned_list_var.get())
-            self._overlay_bg_color = self._normalize_hex_color(overlay_bg_var.get(), self._overlay_bg_color)
-            self._overlay_width = self._parse_int_setting(overlay_width_var.get(), self._overlay_width, 320, 1280)
-            self._overlay_height = self._parse_int_setting(overlay_height_var.get(), self._overlay_height, 160, 900)
-            self._overlay_resizable = bool(overlay_resizable_var.get())
-            self._overlay_timeout_seconds = float(self._parse_int_setting(overlay_timeout_var.get(), int(self._overlay_timeout_seconds), 30, 240))
-            self._auto_connect_on_start = bool(auto_connect_var.get())
-            self._auto_retry_known_device = bool(auto_retry_var.get())
-            self._auto_check_updates = bool(auto_updates_var.get())
-            self._menu_bar_mode_enabled = bool(menu_bar_mode_var.get()) if self._is_macos else False
-            self._hide_dock_icon_enabled = bool(hide_dock_var.get()) if self._is_macos else False
-            self.client.set_auto_reconnect(self._auto_retry_known_device)
-
-            old_settings = self._load_settings()
-            old_settings["system_instructions"] = text
-            old_settings["pinned_pdf_paths"] = self.pinned_pdf_paths
-            old_settings["overlay_bg_color"] = self._overlay_bg_color
-            old_settings["overlay_width"] = self._overlay_width
-            old_settings["overlay_height"] = self._overlay_height
-            old_settings["overlay_resizable"] = self._overlay_resizable
-            old_settings["overlay_timeout_seconds"] = int(self._overlay_timeout_seconds)
-            old_settings["auto_connect_on_start"] = self._auto_connect_on_start
-            old_settings["auto_retry_known_device"] = self._auto_retry_known_device
-            old_settings["auto_check_updates"] = self._auto_check_updates
-            old_settings["menu_bar_mode_enabled"] = self._menu_bar_mode_enabled
-            old_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
-            old_settings["last_connected_address"] = self._last_connected_address
-            old_settings["last_connected_bridge_id"] = self._last_connected_bridge_id
-            self._save_settings(old_settings)
-
-            self._apply_overlay_window_preferences()
-            if self._is_macos:
-                if self._menu_bar_mode_enabled:
-                    self._start_menu_bar_icon_if_needed()
-                else:
-                    self._stop_menu_bar_icon()
-                self._apply_macos_activation_policy()
-            self._refresh_context_preview()
-            dialog.destroy()
-            self._append_log(
-                "System",
-                f"Settings saved. Pinned PDFs: {len(self.pinned_pdf_paths)} | Overlay: {self._overlay_width}x{self._overlay_height}",
-            )
-
-        ctk.CTkButton(footer, text="BROWSE", width=100, command=add_pdf).pack(side=tk.LEFT, padx=(0, 8))
-        ctk.CTkButton(footer, text="UPDATE", width=100, command=lambda: self.on_check_updates(background=False)).pack(side=tk.LEFT, padx=(0, 8))
-        ctk.CTkButton(footer, text="SALVA", width=110, fg_color="#1f538d", command=save).pack(side=tk.RIGHT)
-
-    # ── Knowledge Base Container handlers ─────────────────────────────────────
-
-    def _refresh_container_list(self) -> None:
-        self.container_list.delete(0, tk.END)
-        containers = self._context_store.all()
-        for c in containers:
-            active_mark = "✓ " if c.id == self._active_container_id else "   "
-            label = f"{active_mark}{c.name}  ({c.total_chunks()} chunk)"
-            self.container_list.insert(tk.END, label)
-
-        # Restore the highlighted selection
-        if self._selected_container_idx is not None and self._selected_container_idx < len(containers):
-            self.container_list.selection_set(self._selected_container_idx)
-            self.container_list.see(self._selected_container_idx)
-
-        # Update the active indicator label
-        active = next((c for c in containers if c.id == self._active_container_id), None)
-        if active:
-            self._kb_active_label.configure(
-                text=f"● {active.name} attivo", text_color="#4caf50"
-            )
-        else:
-            remote_active = next(
-                (c for c in self._remote_containers if str(c.get("id", "")) == str(self._active_container_id)),
-                None,
-            )
-            if remote_active is not None:
-                self._kb_active_label.configure(
-                    text=f"● [Remote] {remote_active.get('name', 'container')} attivo",
-                    text_color="#4caf50",
-                )
-            else:
-                self._kb_active_label.configure(text="nessun container attivo", text_color="#555555")
-
-    def _active_container_name(self) -> str | None:
-        if not self._active_container_id:
-            return None
-        local = self._context_store.get(self._active_container_id)
-        if local is not None:
-            return local.name
-        remote = next(
-            (c for c in self._remote_containers if str(c.get("id", "")) == str(self._active_container_id)),
-            None,
-        )
-        if remote is not None:
-            name = str(remote.get("name", "")).strip()
-            if name:
-                return name
-        return None
-
-    def _selected_container_id(self) -> str | None:
-        """Return the ID of the currently highlighted container (survives refresh)."""
-        # Prefer the tracked index (survives _refresh_container_list)
-        idx = self._selected_container_idx
-        if idx is None:
-            sel = self.container_list.curselection()
-            if sel:
-                idx = sel[0]
-        if idx is None:
-            return None
-        containers = self._context_store.all()
-        if idx >= len(containers):
-            return None
-        return containers[idx].id
-
-    def _on_create_container(self) -> None:
-        name = simpledialog.askstring("Nuovo Container", "Nome della libreria:", parent=self.root)
-        if not name or not name.strip():
-            return
-        c = self._context_store.create(name.strip())
-        self._append_log("System", f"Container creato: '{c.name}' (id: {c.id[:8]})")
-        self._refresh_container_list()
-
-    def _on_container_list_click(self, _event=None) -> None:
-        """User clicked a container row — update the highlighted index."""
-        sel = self.container_list.curselection()
-        if not sel:
-            return
-        self._selected_container_idx = sel[0]
-        # Don't set active yet — user uses the ✓ toggle via double-click or separate activate button.
-        # Just refresh labels so the selection is visible.
-        self._refresh_container_list()
-
-    def _on_activate_container(self, _event=None) -> None:
-        """Double-click on container row → activate/deactivate it."""
-        cid = self._selected_container_id()
-        if cid is None:
-            return
-        if self._active_container_id == cid:
-            self._active_container_id = None
-            self._append_log("System", "Container deattivato — contesto PDF disabilitato")
-        else:
-            self._active_container_id = cid
-            c = self._context_store.get(cid)
-            if c:
-                self._append_log("System", f"Container attivo: '{c.name}' ({c.total_chunks()} chunk)")
-        self._refresh_container_list()
-
-    def _on_add_pdf_to_container(self) -> None:
-        cid = self._selected_container_id()
-        if cid is None:
-            self._append_log("System", "Seleziona prima un container dalla lista 📚")
-            return
-        paths = filedialog.askopenfilenames(
-            parent=self.root, title="Aggiungi PDF al container",
-            filetypes=[("PDF", "*.pdf"), ("All Files", "*")],
-        )
-        if not paths:
-            return
-        c = self._context_store.get(cid)
-        for p in paths:
-            try:
-                n = self._context_store.add_pdf(cid, p)
-                self._append_log("System", f"PDF aggiunto: {Path(p).name} → {n} chunk estratti")
-            except ValueError as exc:
-                self._append_log("Error", str(exc))
-        self._refresh_container_list()
-
-    def _on_delete_container(self) -> None:
-        from tkinter import messagebox
-        cid = self._selected_container_id()
-        if cid is None:
-            return
-        c = self._context_store.get(cid)
-        if not messagebox.askyesno("Elimina Container", f"Eliminare '{c.name if c else cid}'?", parent=self.root):
-            return
-        self._context_store.delete(cid)
-        if self._active_container_id == cid:
-            self._active_container_id = None
-        self._refresh_container_list()
-        self._append_log("System", "Container eliminato")
-
-    def _on_upload_container(self) -> None:
-        cid = self._selected_container_id()
-        if cid is None:
-            self._append_log("System", "Seleziona un container da caricare sul telefono")
-            return
-        if not self.connected:
-            self._append_log("System", "Non connesso — connetti il bridge Android prima di caricare")
-            return
-        c = self._context_store.get(cid)
-        if c is None or c.total_chunks() == 0:
-            self._append_log("System", "Container vuoto — aggiungi prima dei PDF")
-            return
-        try:
-            container_dict = self._context_store.export_for_transfer(cid)
-            payload_bytes = len(str(container_dict).encode("utf-8"))
-            size_kb = payload_bytes // 1024
-            self._append_log("System", f"Avvio trasferimento container '{c.name}' (~{size_kb}KB, {c.total_chunks()} chunk)...")
-            request_id = self.client.send_container(container_dict)
-            self._container_transfer_request_id = request_id
-            self._container_transfer_container_id_by_request[request_id] = cid
-            self._open_transfer_dialog(c.name, size_kb)
-        except ValueError as exc:
-            self._append_log("Error", str(exc))
-
-    def _on_sync_remote_containers(self) -> None:
-        if not self.connected:
-            self._append_log("System", "Non connesso — connetti il bridge Android prima di sincronizzare")
-            return
-        if not self._remote_list_feature_supported:
-            self._append_log(
-                "System",
-                "Listing container remoti non supportato da questa versione Android. Aggiorna l'app sul telefono.",
-            )
-            return
-
-        self._request_remote_container_list(legacy=False)
-
-    def _request_remote_container_list(self, legacy: bool) -> None:
-        request_type = "container_list" if legacy else "list_containers"
-        mode = "legacy" if legacy else "default"
-        try:
-            request_id = self.client.request_container_list(request_type=request_type)
-            self._pending_remote_container_requests.add(request_id)
-            self._append_log("System", f"Richiesta lista container remoti ({mode}, {request_id})")
-        except Exception as exc:
-            self._append_log("Error", f"Sync container remoti fallita: {exc}")
-
-    def _handle_remote_container_error(self, message_id: str, error_text: str) -> bool:
-        lowered = error_text.strip().lower()
-        if message_id:
-            if message_id not in self._pending_remote_container_requests:
-                return False
-            self._pending_remote_container_requests.discard(message_id)
-        elif not (self._pending_remote_container_requests and "unsupported request type" in lowered):
-            return False
-        else:
-            self._pending_remote_container_requests.clear()
-
-        unsupported = "unsupported request type" in lowered
-        if unsupported and "list_containers" in lowered and not self._remote_list_legacy_attempted:
-            self._remote_list_legacy_attempted = True
-            self._append_log("System", "Bridge Android legacy rilevato: provo fallback compatibile...")
-            self._request_remote_container_list(legacy=True)
-            return True
-
-        if unsupported and ("list_containers" in lowered or "container_list" in lowered):
-            self._remote_list_feature_supported = False
-            self._append_log(
-                "System",
-                "Container remoti non supportati da questa versione Android. Aggiorna l'app bridge.",
-            )
-            return True
-
-        self._append_log("Error", f"Sync container remoti fallita: {error_text}")
-        return True
-
-    def _open_remote_container_picker(self) -> None:
-        if not self._remote_containers:
-            self._append_log("System", "Nessun container remoto disponibile")
-            return
-
-        dialog = ctk.CTkToplevel(self.root)
-        dialog.title("Container remoti")
-        dialog.geometry("460x340")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        ctk.CTkLabel(dialog, text="Container disponibili sul telefono", font=("Avenir", 14, "bold")).pack(
-            anchor=tk.W, padx=12, pady=(10, 8)
-        )
-        lb = tk.Listbox(
-            dialog,
-            bg="#1e1e1e",
-            fg="#e0e0e0",
-            selectbackground="#1f538d",
-            activestyle=tk.NONE,
-            borderwidth=1,
-            relief=tk.SOLID,
-            highlightthickness=0,
-        )
-        lb.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
-        for c in self._remote_containers:
-            name = str(c.get("name", "container")).strip() or "container"
-            chunks = int(c.get("chunkCount", 0) or 0)
-            lb.insert(tk.END, f"{name} ({chunks} chunk)")
-
-        if self._active_container_id:
-            for idx, c in enumerate(self._remote_containers):
-                if str(c.get("id", "")) == self._active_container_id:
-                    lb.selection_set(idx)
-                    lb.see(idx)
-                    break
-
-        def activate_selected() -> None:
-            sel = lb.curselection()
-            if not sel:
-                return
-            chosen = self._remote_containers[sel[0]]
-            cid = str(chosen.get("id", "")).strip()
-            if not cid:
-                return
-            self._active_container_id = cid
-            self._refresh_container_list()
-            self._refresh_context_preview()
-            self._append_log(
-                "System",
-                f"Container remoto attivo: {chosen.get('name', 'container')} ({int(chosen.get('chunkCount', 0) or 0)} chunk)",
-            )
-            dialog.destroy()
-
-        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
-        btn_row.pack(fill=tk.X, padx=12, pady=(0, 12))
-        ctk.CTkButton(btn_row, text="Attiva", command=activate_selected, width=100).pack(side=tk.LEFT)
-        ctk.CTkButton(btn_row, text="Chiudi", command=dialog.destroy, width=100, fg_color="transparent", border_width=1).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
-
-    # ── Transfer progress dialog ──────────────────────────────────────────────
-
-    def _open_transfer_dialog(self, container_name: str, size_kb: int) -> None:
-        import time as _time
-        self._transfer_started_time = _time.monotonic()
-
-        d = ctk.CTkToplevel(self.root)
-        d.title("Trasferimento BLE")
-        d.geometry("400x180")
-        d.resizable(False, False)
-        d.grab_set()
-        d.attributes("-topmost", True)
-        self._transfer_dialog = d
-
-        ctk.CTkLabel(d, text=f"📡 Caricamento libreria sul telefono", font=("Avenir", 14, "bold")).pack(pady=(18, 4))
-        ctk.CTkLabel(d, text=container_name, font=("Avenir", 12), text_color="#888888").pack()
-
-        self._transfer_progress_var = tk.DoubleVar(value=0.0)
-        bar = ctk.CTkProgressBar(d, variable=self._transfer_progress_var, width=340, height=14)
-        bar.pack(pady=(14, 6))
-
-        self._transfer_label_var = tk.StringVar(value=f"0%  —  0 / ? pacchetti  (~{size_kb} KB)")
-        ctk.CTkLabel(d, textvariable=self._transfer_label_var, font=("Avenir", 11), text_color="#aaaaaa").pack()
-
-    def _update_transfer_dialog(self, percent: int, current: int, total: int) -> None:
-        import time as _time
-        if self._transfer_progress_var is None or self._transfer_label_var is None:
-            return
-        self._transfer_progress_var.set(percent / 100.0)
-        elapsed = _time.monotonic() - self._transfer_started_time
-        if current > 0:
-            eta_sec = (elapsed / current) * (total - current)
-            eta_str = f"  —  ETA {eta_sec:.0f}s" if eta_sec > 1 else ""
-        else:
-            eta_str = ""
-        self._transfer_label_var.set(f"{percent}%  —  {current}/{total} pacchetti{eta_str}")
-        if percent >= 100:
-            self._transfer_label_var.set("100%  —  pacchetti inviati, attendo conferma telefono…")
-
-    def _close_transfer_dialog(self, success: bool = True) -> None:
-        d = self._transfer_dialog
-        request_id = self._container_transfer_request_id
-        if d is None:
-            return
-        self._transfer_dialog = None
-        self._container_transfer_request_id = None
-        try:
-            d.grab_release()
-            d.destroy()
-        except Exception:
-            pass
-        if success:
-            self._append_log("System", "➜ Pacchetti inviati. In attesa di conferma di salvataggio dal telefono...")
-            # Auto-activate the container that was just uploaded.
-            cid = self._container_transfer_container_id_by_request.pop(request_id or "", None) or self._selected_container_id()
-            if cid:
-                self._active_container_id = cid
-                c = self._context_store.get(cid)
-                self._append_log("System", f"Container auto-attivato: {c.name if c else cid}")
-                self._refresh_container_list()
-                self._refresh_context_preview()
-        else:
-            if request_id:
-                self._container_transfer_container_id_by_request.pop(request_id, None)
-
-
-    def _toggle_pip(self) -> None:
-
-        if self.pip_enabled.get():
-            self._pip_mode_active = True
-            self._pre_pip_geometry = self.root.geometry()
-            self.root.attributes('-topmost', True)
-            self.root.geometry("400x500")
-        else:
-            self._pip_mode_active = False
-            self.root.attributes('-topmost', False)
-            if self._pre_pip_geometry:
-                self.root.geometry(self._pre_pip_geometry)
-
-    def _on_window_resize(self, event) -> None:
-        if event.widget != self.root:
-            return
-        # Compact mode disabled: keep a stable tri-pane layout across platforms.
-        self._is_compact_mode = False
-
-    def _set_phone_default_model(self) -> None:
-        self.model_var.set(MODEL_PRESETS[0])
-        self._refresh_context_preview()
-
-    def _build_button_grid(
-        self,
-        parent: tk.Widget,
-        entries: list[tuple[str, Any]],
-        columns: int = 2,
-        pady: tuple[int, int] = (6, 6),
-    ) -> ctk.CTkFrame:
-        frame = ctk.CTkFrame(parent)
-        frame.pack(fill=tk.X, pady=pady)
-        for col in range(columns):
-            frame.columnconfigure(col, weight=1, uniform=f"btn-{id(frame)}")
-
-        for idx, (label, command) in enumerate(entries):
-            row = idx // columns
-            col = idx % columns
-            pad_right = 6 if col < (columns - 1) else 0
-            pad_bottom = 6 if idx < (len(entries) - columns) else 0
-            ctk.CTkButton(frame, text=label, command=command, fg_color="transparent", border_width=1, hover_color="#333333", text_color="#e0e0e0").grid(
-                row=row,
-                column=col,
-                sticky="ew",
-                padx=(0, pad_right),
-                pady=(0, pad_bottom),
-            )
-
-        return frame
-
-    def _bind_listbox_mousewheel(self, widget: tk.Listbox) -> None:
-        def on_mousewheel(event: tk.Event[Any]) -> str:
-            delta = getattr(event, "delta", 0)
-            if delta:
-                widget.yview_scroll(int(-delta / 120), "units")
-                return "break"
-            return ""
-
-        widget.bind("<MouseWheel>", on_mousewheel)
-        widget.bind("<Button-4>", lambda _e: (widget.yview_scroll(-1, "units"), "break")[1])
-        widget.bind("<Button-5>", lambda _e: (widget.yview_scroll(1, "units"), "break")[1])
-
-    def _configure_chat_tags(self) -> None:
-        self.chat_log._textbox.tag_configure("role_you", foreground="#6ba5ff", font=("Avenir", 10, "bold"), spacing1=10)
-        self.chat_log._textbox.tag_configure(
-            "msg_you",
-            foreground="#e0e0e0",
-            background="#1a2b42",
-            lmargin1=200,
-            lmargin2=200,
-            rmargin=14,
-            spacing3=8,
-        )
-
-        self.chat_log._textbox.tag_configure("role_gemini", foreground="#4de68d", font=("Avenir", 10, "bold"), spacing1=10)
-        self.chat_log._textbox.tag_configure(
-            "msg_gemini",
-            foreground="#e0e0e0",
-            background="#14261d",
-            lmargin1=14,
-            lmargin2=14,
-            rmargin=210,
-            spacing3=8,
-        )
-
-        self.chat_log._textbox.tag_configure("role_thought", foreground="#e5b229", font=("Avenir", 10, "bold"), spacing1=8)
-        self.chat_log._textbox.tag_configure(
-            "msg_thought",
-            foreground="#d1a634",
-            background="#2b220d",
-            lmargin1=14,
-            lmargin2=14,
-            rmargin=210,
-            spacing3=8,
-        )
-
-        self.chat_log._textbox.tag_configure("role_phone", foreground="#9e8dff", font=("Avenir", 10, "bold"), spacing1=8)
-        self.chat_log._textbox.tag_configure("msg_phone", foreground="#a1a1a1", lmargin1=14, lmargin2=14, rmargin=160)
-
-        self.chat_log._textbox.tag_configure("role_system", foreground="#a9b9cf", font=("Avenir", 10, "bold"), spacing1=8)
-        self.chat_log._textbox.tag_configure("msg_system", foreground="#a9b9cf", lmargin1=14, lmargin2=14, rmargin=100)
-
-        self.chat_log._textbox.tag_configure("role_error", foreground="#ff6b6b", font=("Avenir", 10, "bold"), spacing1=8)
-        self.chat_log._textbox.tag_configure("msg_error", foreground="#ff6b6b", lmargin1=14, lmargin2=14, rmargin=100)
-        self.chat_log._textbox.tag_configure("md_h1", font=("Avenir", 14, "bold"), spacing1=10)
-        self.chat_log._textbox.tag_configure("md_h2", font=("Avenir", 13, "bold"), spacing1=8)
-        self.chat_log._textbox.tag_configure("md_h3", font=("Avenir", 12, "bold"), spacing1=6)
-        self.chat_log._textbox.tag_configure("md_bold", font=("Avenir", 11, "bold"))
-        self.chat_log._textbox.tag_configure("md_inline_code", font=("Menlo", 10), background="#2a2a2a", foreground="#a6c8ff")
-        self.chat_log._textbox.tag_configure("md_code_block", font=("Menlo", 10), background="#f7f9fc", foreground="#e0e0e0")
-        self.chat_log._textbox.tag_configure("md_link", foreground="#5c9dff", underline=True)
-
-    def _on_prompt_return(self, event: tk.Event[tk.Text]) -> str | None:
-        # Shift+Enter inserts newline; Enter sends.
-        if event.state & 0x0001:
-            return None
-        self.on_send()
-        return "break"
-
-    def _on_clear_composer_hotkey(self, _: tk.Event[tk.Text]) -> str:
-        self.prompt_entry.delete("1.0", tk.END)
-        return "break"
+    def _set_model_from_menu(self, model_name: str) -> None:
+        self.model_var.set(model_name)
+        self.save_settings()
+        self._append_log("System", f"Model set to {model_name}")
 
     def _start_overlay_hotkey_listener(self) -> None:
-        if self._is_macos:
-            self._append_log(
-                "System",
-                "Overlay trigger su macOS via Apple Shortcuts: ~/.gemini_ble/ask_gemini_ble_shot.sh",
-            )
+        if self._is_macos or pynput_keyboard is None:
             return
-
-        if pynput_keyboard is None:
-            self._append_log("System", "Global hotkey disabled: install 'pynput' to enable overlay shortcut")
-            return
-
-        combo = "<ctrl>+<shift>+g"
         try:
             listener = pynput_keyboard.GlobalHotKeys(
                 {
-                    combo: lambda: self.events.put({"type": "hotkey_overlay"}),
+                    "<ctrl>+<shift>+g": lambda: self.root.after(0, self.on_hotkey_overlay_triggered),
+                    "<ctrl>+<shift>+c": lambda: self.root.after(0, self.on_hotkey_clipboard_triggered),
+                    "<ctrl>+<shift>+h": lambda: self.root.after(0, self.hide_overlay),
                 }
             )
             listener.start()
-            self._overlay_listener = listener
-            self._append_log("System", f"Global hotkey ready: {self._overlay_hotkey}")
+            self._overlay_hotkey_listener = listener
         except Exception as exc:
-            self._append_log("Error", f"Global hotkey unavailable: {exc}")
-
-    def _apply_overlay_window_preferences(self) -> None:
-        win = self._overlay_window
-        if win is None or not win.winfo_exists():
-            return
-        try:
-            win.configure(bg=self._overlay_bg_color)
-            win.resizable(self._overlay_resizable, self._overlay_resizable)
-            win.geometry(f"{self._overlay_width}x{self._overlay_height}")
-        except Exception:
-            pass
-        if self._overlay_message_widget is not None:
-            try:
-                self._overlay_message_widget.configure(bg=self._overlay_bg_color, width=max(140, self._overlay_width - 30))
-            except Exception:
-                pass
-
-    def _present_overlay_window(self, force: bool = False) -> None:
-        win = self._overlay_window
-        if win is None or not win.winfo_exists():
-            return
-        now = time.monotonic()
-        if not force and (now - self._overlay_last_present_at) < 0.7:
-            return
-        self._overlay_last_present_at = now
-        try:
-            win.deiconify()
-        except Exception:
-            pass
-        try:
-            win.attributes("-topmost", True)
-        except Exception:
-            pass
-        if self._is_macos:
-            try:
-                self.root.tk.call("::tk::unsupported::MacWindowStyle", "style", win._w, "floating", "none")
-            except Exception:
-                pass
-        try:
-            win.lift()
-        except Exception:
-            pass
-
-    def _on_overlay_window_configure(self, event: tk.Event[Any]) -> None:
-        if self._overlay_window is None or event.widget is not self._overlay_window:
-            return
-        width = max(320, int(getattr(event, "width", self._overlay_width)))
-        height = max(160, int(getattr(event, "height", self._overlay_height)))
-        self._overlay_width = width
-        self._overlay_height = height
-        if self._overlay_message_widget is not None:
-            try:
-                self._overlay_message_widget.configure(width=max(140, width - 30))
-            except Exception:
-                pass
-
-    def _show_overlay_message(self, text: str, ttl_ms: int = 12000) -> None:
-        clean = text.strip()
-        if not clean:
-            return
-
-        if self._overlay_window is None or not self._overlay_window.winfo_exists():
-            win = tk.Toplevel(self.root)
-            win.attributes("-topmost", True)
-            try:
-                win.attributes("-alpha", 0.5)
-            except Exception:
-                pass
-            win.title("Gemini Quick Reply")
-            win.configure(bg=self._overlay_bg_color)
-            win.resizable(self._overlay_resizable, self._overlay_resizable)
-
-            width, height = self._overlay_width, self._overlay_height
-            x = max(12, win.winfo_screenwidth() - width - 18)
-            y = max(12, win.winfo_screenheight() - height - 40)
-            win.geometry(f"{width}x{height}+{x}+{y}")
-            win.bind("<Configure>", self._on_overlay_window_configure)
-
-            frame = tk.Frame(win, bg=self._overlay_bg_color, padx=12, pady=10)
-            frame.pack(fill=tk.BOTH, expand=True)
-            tk.Label(
-                frame,
-                text="Gemini Quick Reply",
-                bg=self._overlay_bg_color,
-                fg="#dbeafe",
-                font=("Avenir", 11, "bold"),
-                anchor="w",
-            ).pack(fill=tk.X)
-            message_widget = tk.Message(
-                frame,
-                textvariable=self._overlay_text_var,
-                bg=self._overlay_bg_color,
-                fg="#f8fafc",
-                font=("Avenir", 11),
-                width=max(140, width - 30),
-                anchor="w",
-                justify=tk.LEFT,
-            )
-            message_widget.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-
-            self._overlay_window = win
-            self._overlay_message_widget = message_widget
-        else:
-            self._apply_overlay_window_preferences()
-
-        self._overlay_text_var.set(clean[:1800])
-        self._present_overlay_window(force=True)
-        if self._overlay_hide_after_id is not None:
-            self.root.after_cancel(self._overlay_hide_after_id)
-            self._overlay_hide_after_id = None
-        if ttl_ms > 0:
-            self._overlay_hide_after_id = self.root.after(ttl_ms, self._hide_overlay_window)
-
-    def _hide_overlay_window(self) -> None:
-        if self._overlay_hide_after_id is not None:
-            try:
-                self.root.after_cancel(self._overlay_hide_after_id)
-            except Exception:
-                pass
-            self._overlay_hide_after_id = None
-        win = self._overlay_window
-        self._overlay_window = None
-        self._overlay_message_widget = None
-        if win is not None and win.winfo_exists():
-            win.destroy()
-
-    def _cleanup_overlay_request(self, request_id: str) -> None:
-        self._overlay_request_ids.discard(request_id)
-        self._overlay_started_at.pop(request_id, None)
-        self._overlay_last_update_at.pop(request_id, None)
-        self._clear_pending_request(request_id)
-        path = self._overlay_image_paths_by_request.pop(request_id, None)
-        if path:
-            try:
-                Path(path).unlink(missing_ok=True)
-            except OSError:
-                pass
-
-    def _cleanup_all_overlay_requests(self) -> None:
-        for request_id in list(self._overlay_request_ids):
-            self._cleanup_overlay_request(request_id)
-
-    def _check_overlay_request_timeouts(self) -> None:
-        if not self._overlay_request_ids:
-            return
-        now = time.monotonic()
-        timed_out: list[str] = []
-        for request_id in list(self._overlay_request_ids):
-            started_at = self._overlay_started_at.get(request_id, now)
-            last_update = self._overlay_last_update_at.get(request_id, started_at)
-            total_elapsed = now - started_at
-            idle_elapsed = now - last_update
-            if total_elapsed >= self._overlay_timeout_seconds or idle_elapsed >= self._overlay_idle_timeout_seconds:
-                timed_out.append(request_id)
-        for request_id in timed_out:
-            self._show_overlay_message(
-                "Timeout Shot+Ask: upload completato ma nessuna risposta dal bridge. Riprova.",
-                ttl_ms=9000,
-            )
-            self._cleanup_overlay_request(request_id)
-
-    def _select_area_rect(self) -> tuple[int, int, int, int] | None:
-        selector = tk.Toplevel(self.root)
-        selector.overrideredirect(True)
-        selector.attributes("-topmost", True)
-        try:
-            selector.attributes("-alpha", 0.18)
-        except Exception:
-            pass
-        width = selector.winfo_screenwidth()
-        height = selector.winfo_screenheight()
-        selector.geometry(f"{width}x{height}+0+0")
-        selector.configure(bg="black")
-
-        canvas = tk.Canvas(selector, bg="black", highlightthickness=0, cursor="crosshair")
-        canvas.pack(fill=tk.BOTH, expand=True)
-
-        state: dict[str, Any] = {"start": None, "rect_id": None, "bbox": None}
-
-        def on_press(event: tk.Event[Any]) -> None:
-            state["start"] = (event.x, event.y)
-            if state["rect_id"] is not None:
-                canvas.delete(state["rect_id"])
-            state["rect_id"] = canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="#60a5fa", width=2)
-
-        def on_drag(event: tk.Event[Any]) -> None:
-            start = state.get("start")
-            rect_id = state.get("rect_id")
-            if start is None or rect_id is None:
-                return
-            canvas.coords(rect_id, start[0], start[1], event.x, event.y)
-
-        def on_release(event: tk.Event[Any]) -> None:
-            start = state.get("start")
-            if start is None:
-                selector.destroy()
-                return
-            x1, y1 = start
-            x2, y2 = event.x, event.y
-            left, right = sorted((int(x1), int(x2)))
-            top, bottom = sorted((int(y1), int(y2)))
-            if (right - left) >= 8 and (bottom - top) >= 8:
-                state["bbox"] = (left, top, right, bottom)
-            selector.destroy()
-
-        canvas.bind("<ButtonPress-1>", on_press)
-        canvas.bind("<B1-Motion>", on_drag)
-        canvas.bind("<ButtonRelease-1>", on_release)
-        selector.bind("<Escape>", lambda _e: selector.destroy())
-        selector.focus_force()
-        selector.grab_set()
-        self.root.wait_window(selector)
-        return state.get("bbox")
-
-    def _capture_area_screenshot_path(self, log_errors: bool = True) -> str | None:
-        system_name = platform.system().lower()
-        if system_name == "darwin":
-            tmp = tempfile.NamedTemporaryFile(prefix="gemini-shot-", suffix=".png", delete=False)
-            path = tmp.name
-            tmp.close()
-            try:
-                Path(path).unlink(missing_ok=True)
-                result = subprocess.run(
-                    ["screencapture", "-i", "-x", path],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                )
-                stderr = (result.stderr or "").strip()
-                if result.returncode != 0:
-                    lowered = stderr.lower()
-                    if log_errors:
-                        if "cancel" in lowered:
-                            self._append_log("System", "Screenshot canceled")
-                        elif "not authorized" in lowered or "permission" in lowered:
-                            self._append_log(
-                                "Error",
-                                "Screenshot blocked: abilita Screen Recording per BluetoothGeminiChat in macOS Settings.",
-                            )
-                        else:
-                            detail = stderr if stderr else f"exit code {result.returncode}"
-                            self._append_log("Error", f"Screenshot failed: {detail}")
-                    Path(path).unlink(missing_ok=True)
-                    return None
-                if not Path(path).exists() or Path(path).stat().st_size <= 0:
-                    if log_errors:
-                        self._append_log("Error", "Screenshot non disponibile: nessun file creato.")
-                    Path(path).unlink(missing_ok=True)
-                    return None
-                return path
-            except Exception as exc:
-                if log_errors:
-                    self._append_log("Error", f"Screenshot failed: {exc}")
-                try:
-                    Path(path).unlink(missing_ok=True)
-                except OSError:
-                    pass
-                return None
-        if system_name.startswith("windows"):
-            return self._capture_area_screenshot_path_windows(log_errors=log_errors)
-        if system_name == "linux":
-            return self._capture_area_screenshot_path_linux(log_errors=log_errors)
-
-        if ImageGrab is None:
-            if log_errors:
-                self._append_log("Error", "Area screenshot requires Pillow ImageGrab")
-            return None
-
-        try:
-            full = ImageGrab.grab(all_screens=True)  # type: ignore[union-attr]
-            bbox = self._select_area_rect()
-            if bbox is None:
-                if log_errors:
-                    self._append_log("System", "Screenshot canceled")
-                return None
-            cropped = full.crop(bbox)
-            fd, path = tempfile.mkstemp(prefix="gemini-shot-", suffix=".png")
-            os.close(fd)
-            cropped.save(path, format="PNG")
-            return path
-        except Exception as exc:
-            if log_errors:
-                self._append_log("Error", f"Screenshot failed: {exc}")
-            return None
-
-    def _clipboard_image_signature(self) -> str | None:
-        if ImageGrab is None:
-            return None
-        try:
-            clip = ImageGrab.grabclipboard()  # type: ignore[union-attr]
-        except Exception:
-            return None
-        if clip is None or not hasattr(clip, "copy"):
-            return None
-        try:
-            sample = clip.copy()
-            sample.thumbnail((32, 32))
-            payload = sample.tobytes()
-            digest = hashlib.sha1(payload).hexdigest()
-            return f"{sample.size[0]}x{sample.size[1]}:{digest}"
-        except Exception:
-            return None
-
-    def _capture_area_screenshot_path_windows(self, log_errors: bool = True) -> str | None:
-        if ImageGrab is None:
-            if log_errors:
-                self._append_log("Error", "Area screenshot requires Pillow ImageGrab")
-            return None
-
-        baseline_sig = self._clipboard_image_signature()
-        try:
-            subprocess.Popen(
-                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", "Start-Process 'ms-screenclip:'"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            try:
-                subprocess.Popen(["explorer.exe", "ms-screenclip:"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception as exc:
-                if log_errors:
-                    self._append_log("Error", f"Screenshot failed: {exc}")
-                return None
-
-        deadline = time.monotonic() + 24.0
-        while time.monotonic() < deadline:
-            time.sleep(0.18)
-            try:
-                clip = ImageGrab.grabclipboard()  # type: ignore[union-attr]
-            except Exception:
-                continue
-            if clip is None or not hasattr(clip, "save"):
-                continue
-            current_sig = self._clipboard_image_signature()
-            if baseline_sig is not None and current_sig == baseline_sig:
-                continue
-            try:
-                fd, path = tempfile.mkstemp(prefix="gemini-shot-", suffix=".png")
-                os.close(fd)
-                clip.save(path, format="PNG")
-                if Path(path).exists() and Path(path).stat().st_size > 0:
-                    return path
-                Path(path).unlink(missing_ok=True)
-            except Exception as exc:
-                if log_errors:
-                    self._append_log("Error", f"Screenshot save failed: {exc}")
-                return None
-
-        if log_errors:
-            self._append_log("System", "Screenshot canceled")
-        return None
-
-    def _capture_area_screenshot_path_linux(self, log_errors: bool = True) -> str | None:
-        fd, path = tempfile.mkstemp(prefix="gemini-shot-", suffix=".png")
-        os.close(fd)
-        Path(path).unlink(missing_ok=True)
-        quoted = shlex.quote(path)
-
-        commands: list[tuple[str, list[str]]] = []
-        if shutil.which("grim") and shutil.which("slurp"):
-            commands.append(("grim/slurp", ["sh", "-lc", f'grim -g "$(slurp)" {quoted}']))
-        if shutil.which("gnome-screenshot"):
-            commands.append(("gnome-screenshot", ["gnome-screenshot", "-a", "-f", path]))
-        if shutil.which("maim"):
-            commands.append(("maim", ["maim", "-s", path]))
-        if shutil.which("scrot"):
-            commands.append(("scrot", ["scrot", "-s", path]))
-
-        if not commands:
-            if log_errors:
-                self._append_log(
-                    "Error",
-                    "Screenshot Linux non configurato: installa grim+slurp (Wayland) o gnome-screenshot/maim/scrot (X11).",
-                )
-            Path(path).unlink(missing_ok=True)
-            return None
-
-        for label, cmd in commands:
-            try:
-                Path(path).unlink(missing_ok=True)
-                result = subprocess.run(cmd, check=False, capture_output=True, text=True)
-                stderr = str(result.stderr or "").strip().lower()
-                if result.returncode == 0 and Path(path).exists() and Path(path).stat().st_size > 0:
-                    return path
-                if any(token in stderr for token in ("cancel", "annull", "aborted")):
-                    Path(path).unlink(missing_ok=True)
-                    if log_errors:
-                        self._append_log("System", "Screenshot canceled")
-                    return None
-            except Exception:
-                continue
-
-        if log_errors:
-            tried = ", ".join(label for label, _ in commands)
-            self._append_log("Error", f"Screenshot Linux failed (tried: {tried})")
-        Path(path).unlink(missing_ok=True)
-        return None
-
-    def _append_log(self, role: str, text: str) -> None:
-        clean = str(text).strip()
-        if not clean:
-            return
-
-        role_key = role.strip().lower()
-        if role_key == "you":
-            role_tag, msg_tag = "role_you", "msg_you"
-        elif role_key == "gemini":
-            role_tag, msg_tag = "role_gemini", "msg_gemini"
-        elif role_key == "thought":
-            role_tag, msg_tag = "role_thought", "msg_thought"
-        elif role_key.startswith("phone"):
-            role_tag, msg_tag = "role_phone", "msg_phone"
-        elif role_key in {"error", "phone error"}:
-            role_tag, msg_tag = "role_error", "msg_error"
-        else:
-            role_tag, msg_tag = "role_system", "msg_system"
-
-        self.chat_log.configure(state='normal')
-        
-        if role_key == "thought":
-            is_streaming = clean.endswith("▌")
-            word_count = len(clean.split())
-            btn_text = f"[-] Thinking... ({word_count} w)" if is_streaming else f"[+] Mostra Ragionamento ({word_count} parole)"
-            
-            tag_name = f"thought_block_{self._md_link_seq}"
-            btn_tag = f"thought_btn_{self._md_link_seq}"
-            self._md_link_seq += 1
-            
-            self.chat_log.insert(tk.END, f"{btn_text}\n", (role_tag, btn_tag))
-            
-            # Config block element initially hidden if not streaming
-            self.chat_log._textbox.tag_configure(tag_name, elide=not is_streaming)
-            self.chat_log.insert(tk.END, f"{clean}\n\n", (msg_tag, tag_name))
-            
-            # Click bound to button
-            def toggle_thought(e, t=tag_name):
-                # get direct tag conf from actual text widget
-                state = self.chat_log._textbox.tag_cget(t, "elide")
-                new_state = False if str(state) == "1" else True
-                self.chat_log._textbox.tag_configure(t, elide=new_state)
-
-            self.chat_log._textbox.tag_bind(btn_tag, "<Button-1>", toggle_thought)
-            self.chat_log._textbox.tag_bind(btn_tag, "<Enter>", lambda _e: self.chat_log.configure(cursor="hand2"))
-            self.chat_log._textbox.tag_bind(btn_tag, "<Leave>", lambda _e: self.chat_log.configure(cursor="xterm"))
-        else:
-            self.chat_log.insert(tk.END, f"{role}\n", role_tag)
-            if role_key in {"gemini", "assistant"}:
-                self._insert_markdown_message(clean, msg_tag)
-                self.chat_log.insert(tk.END, "\n", msg_tag)
-            else:
-                self.chat_log.insert(tk.END, f"{clean}\n\n", msg_tag)
-
-        self.chat_log.see(tk.END)
-        self.chat_log.configure(state='disabled')
-
-    def _insert_markdown_message(self, text: str, base_tag: str) -> None:
-        inline_pattern = re.compile(
-            r"(\[([^\]]+)\]\((https?://[^)\s]+)\)|\*\*([^*]+)\*\*|`([^`]+)`)"
-        )
-        lines = text.splitlines()
-        in_code = False
-        for raw_line in lines:
-            line = raw_line.rstrip("\n")
-            stripped = line.strip()
-
-            if stripped.startswith("```"):
-                in_code = not in_code
-                continue
-
-            if in_code:
-                self.chat_log.insert(tk.END, f"{line}\n", (base_tag, "md_code_block"))
-                continue
-
-            if stripped.startswith("# "):
-                self.chat_log.insert(tk.END, stripped[2:] + "\n", (base_tag, "md_h1"))
-                continue
-            if stripped.startswith("## "):
-                self.chat_log.insert(tk.END, stripped[3:] + "\n", (base_tag, "md_h2"))
-                continue
-            if stripped.startswith("### "):
-                self.chat_log.insert(tk.END, stripped[4:] + "\n", (base_tag, "md_h3"))
-                continue
-
-            if stripped.startswith("- ") or stripped.startswith("* "):
-                line = "• " + stripped[2:]
-            elif re.match(r"^\d+\.\s+", stripped):
-                line = stripped
-            elif stripped.startswith("> "):
-                line = "▎" + stripped[2:]
-
-            cursor = 0
-            for match in inline_pattern.finditer(line):
-                start, end = match.span()
-                if start > cursor:
-                    self.chat_log.insert(tk.END, line[cursor:start], base_tag)
-
-                link_label = match.group(2)
-                link_url = match.group(3)
-                bold_text = match.group(4)
-                code_text = match.group(5)
-
-                if link_label and link_url:
-                    self._insert_link(link_label, link_url, base_tag)
-                elif bold_text:
-                    self.chat_log.insert(tk.END, bold_text, (base_tag, "md_bold"))
-                elif code_text:
-                    self.chat_log.insert(tk.END, code_text, (base_tag, "md_inline_code"))
-
-                cursor = end
-
-            if cursor < len(line):
-                self.chat_log.insert(tk.END, line[cursor:], base_tag)
-            self.chat_log.insert(tk.END, "\n", base_tag)
-
-        self.chat_log.insert(tk.END, "\n", base_tag)
-
-    def _insert_link(self, label: str, url: str, base_tag: str) -> None:
-        tag_name = f"md_link_{self._md_link_seq}"
-        self._md_link_seq += 1
-        self._md_link_urls[tag_name] = url
-        self.chat_log.insert(tk.END, label, (base_tag, "md_link", tag_name))
-        self.chat_log._textbox.tag_bind(tag_name, "<Button-1>", lambda _e, t=tag_name: self._open_md_link(t))
-        self.chat_log._textbox.tag_bind(tag_name, "<Enter>", lambda _e: self.chat_log.configure(cursor="hand2"))
-        self.chat_log._textbox.tag_bind(tag_name, "<Leave>", lambda _e: self.chat_log.configure(cursor="xterm"))
-
-    def _open_md_link(self, tag_name: str) -> None:
-        url = self._md_link_urls.get(tag_name)
-        if not url:
-            return
-        try:
-            webbrowser.open(url, new=2)
-        except Exception:
-            self._append_log("System", f"Open link manually: {url}")
-
-    def _clear_chat_widget(self) -> None:
-        self.chat_log.configure(state='normal')
-        self.chat_log.delete("1.0", tk.END)
-        self.chat_log.configure(state='disabled')
-
-    def _render_active_chat(self) -> None:
-        self._clear_chat_widget()
-        messages = self.sessions_store.get_messages(self.active_session_id)
-        for msg in messages:
-            role = msg.get("role", "")
-            text = msg.get("text", "")
-            if role == "user":
-                self._append_log("You", text)
-            elif role == "assistant":
-                self._append_log("Gemini", text)
-            elif role == "thought":
-                self._append_log("Thought", text)
-            elif role == "phone":
-                self._append_log("Phone", text)
-            elif role == "error":
-                self._append_log("Error", text)
-            else:
-                self._append_log("System", text)
-
-        preview = self._streaming_preview_by_session.get(self.active_session_id, "").strip()
-        if preview:
-            self._append_log("Gemini", f"{preview}\n▌")
-        thought_preview = self._streaming_thought_by_session.get(self.active_session_id, "").strip()
-        if thought_preview and self.show_thoughts_var.get():
-            self._append_log("Thought", f"{thought_preview}\n▌")
-        self._refresh_stop_button()
-
-    def on_scan(self) -> None:
-        self.devices_list.delete(0, tk.END)
-        self.devices = []
-        self.client.scan_devices()
-
-    def on_connect(self) -> None:
-        selected = self.devices_list.curselection()
-        if not selected:
-            if self._last_connected_address or self._last_connected_bridge_id:
-                target = self._last_connected_bridge_id or self._last_connected_address or "known bridge"
-                self._append_log("System", f"Connecting to last known bridge: {target}")
-                self._connect_with_hint(self._last_connected_address, self._last_connected_bridge_id)
-                return
-            self._append_log("System", "Select a device first")
-            return
-
-        idx = selected[0]
-        device = self.devices[idx]
-        self._connect_with_hint(
-            str(device.get("address", "")).strip(),
-            self._normalize_bridge_id(device.get("bridge_id")),
-        )
-
-    def on_disconnect(self) -> None:
-        self.client.disconnect()
-
-    def _ensure_active_session(self, source: str = "action") -> str:
-        current_id = str(getattr(self, "active_session_id", "") or "").strip()
-        sessions = self.sessions_store.list_sessions()
-        known_ids = {str(s.get("id", "")) for s in sessions}
-        if current_id and current_id in known_ids:
-            return current_id
-
-        if sessions:
-            recovered_id = str(sessions[0]["id"])
-            self.active_session_id = recovered_id
-            self.sessions_store.set_active_session(recovered_id)
-            self._refresh_sessions_list(recovered_id)
-            self._render_active_chat()
-            self._refresh_memory_label()
-            self._append_log("System", f"Recovered active chat for {source}")
-            return recovered_id
-
-        session_id = self.sessions_store.create_session("Nuova chat")
-        self.active_session_id = session_id
-        self._refresh_sessions_list(session_id)
-        self._render_active_chat()
-        self._refresh_memory_label()
-        self._append_log("System", f"Auto-created chat for {source}")
-        return session_id
-
-    def on_new_chat(self) -> None:
-        session_id = self.sessions_store.create_session("Nuova chat")
-        self.active_session_id = session_id
-        self._refresh_sessions_list(session_id)
-        self._render_active_chat()
-        self._refresh_memory_label()
-        self._append_log("System", "New chat created")
-
-    def on_rename_chat(self) -> None:
-        sessions = self.sessions_store.list_sessions()
-        current = next((s for s in sessions if s["id"] == self.active_session_id), None)
-        default_title = str(current["title"]) if current else "Nuova chat"
-        title = simpledialog.askstring("Rename chat", "Nuovo titolo:", initialvalue=default_title, parent=self.root)
-        if title is None:
-            return
-        self.sessions_store.rename_session(self.active_session_id, title)
-        self._refresh_sessions_list(self.active_session_id)
-
-    def on_delete_chat(self) -> None:
-        from tkinter import messagebox
-        if not messagebox.askyesno("Delete Chat", "Are you sure you want to delete this conversation?", parent=self.root):
-            return
-            
-        removed = self.sessions_store.delete_session(self.active_session_id)
-        if not removed:
-            return
-        self.active_session_id = self.sessions_store.active_session_id
-        self._refresh_sessions_list(self.active_session_id)
-        self._render_active_chat()
-        self._refresh_memory_label()
-        self._append_log("System", "Chat deleted")
-
-    def _refresh_sessions_list(self, selected_session_id: str | None = None) -> None:
-        sessions = self.sessions_store.list_sessions()
-        self.chats_list.delete(0, tk.END)
-        self._session_ids_in_view = []
-        selected_idx: int | None = None
-        target = selected_session_id or self.active_session_id
-        
-        try:
-            query = self.search_var.get().lower().strip()
-        except AttributeError:
-            query = ""
-            
-        for idx, session in enumerate(sessions):
-            title = str(session["title"])
-            count = int(session["messageCount"])
-            
-            if query and query not in title.lower():
-                continue
-                
-            self.chats_list.insert(tk.END, f"{title} ({count})")
-            self._session_ids_in_view.append(session["id"])
-            if session["id"] == target:
-                selected_idx = len(self._session_ids_in_view) - 1
-                
-        if selected_idx is not None:
-            self.chats_list.selection_clear(0, tk.END)
-            self.chats_list.selection_set(selected_idx)
-
-    def _on_session_selected(self, _: tk.Event[Any]) -> None:
-        selected = self.chats_list.curselection()
-        if not selected:
-            return
-        idx = selected[0]
-        if idx < 0 or idx >= len(self._session_ids_in_view):
-            return
-        session_id = self._session_ids_in_view[idx]
-        if session_id == self.active_session_id:
-            return
-        self.active_session_id = session_id
-        self.sessions_store.set_active_session(session_id)
-        self._render_active_chat()
-        self._refresh_memory_label()
-
-    def on_attach_image(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select an image",
-            filetypes=[
-                ("Image files", "*.png *.jpg *.jpeg *.webp *.gif *.bmp"),
-                ("All files", "*.*"),
-            ],
-        )
-        if not path:
-            return
-        self._set_selected_image(path)
-
-    def _set_selected_image(self, path: str) -> None:
-        self.selected_image_path = path
-        try:
-            size_kb = os.path.getsize(path) / 1024.0
-            self.image_var.set(f"Image: {os.path.basename(path)} ({size_kb:.1f} KB)")
-        except OSError:
-            self.image_var.set(f"Image: {os.path.basename(path)}")
-        self._refresh_context_preview()
-        self._append_log("System", f"Selected image: {os.path.basename(path)}")
-
-    def on_quick_screenshot(self) -> None:
-        path = self._capture_area_screenshot_path(log_errors=True)
-        if path is None:
-            return
-        self._set_selected_image(path)
-
-    def _send_overlay_request(
-        self,
-        prompt: str,
-        source: str,
-        status_text: str,
-        image_path: str | None = None,
-        fail_text: str = "Invio richiesta fallito",
-    ) -> bool:
-        if not self.connected:
-            self._show_overlay_message("Bridge non connesso", ttl_ms=3500)
-            if image_path:
-                try:
-                    Path(image_path).unlink(missing_ok=True)
-                except OSError:
-                    pass
-            return False
-
-        session_id = self._ensure_active_session(source)
-        selected_model = self.model_var.get().strip() if hasattr(self, "model_var") else MODEL_PRESETS[0]
-        model_override = selected_model if selected_model and selected_model != MODEL_PRESETS[0] else None
-        thinking_budget = self._get_thinking_budget()
-        thinking_enabled = self.thinking_enabled.get()
-        include_thoughts = thinking_enabled and self.show_thoughts_var.get()
-
-        try:
-            request_id = self.client.send_prompt(
-                prompt,
-                model=model_override,
-                image_path=image_path,
-                image_target_bytes=38 * 1024,
-                image_max_dimension=640,
-                enable_web_search=self.web_search_enabled.get(),
-                thinking_enabled=thinking_enabled,
-                thinking_budget=thinking_budget,
-                include_thoughts=include_thoughts,
-            )
-        except Exception as exc:
-            self._show_overlay_message(f"{fail_text}: {exc}", ttl_ms=5000)
-            if image_path:
-                try:
-                    Path(image_path).unlink(missing_ok=True)
-                except OSError:
-                    pass
-            return False
-
-        self._overlay_request_ids.add(request_id)
-        now = time.monotonic()
-        self._overlay_started_at[request_id] = now
-        self._overlay_last_update_at[request_id] = now
-        if image_path:
-            self._overlay_image_paths_by_request[request_id] = image_path
-        self._track_pending_request(request_id, session_id)
-        self._show_overlay_message(status_text, ttl_ms=0)
-        return True
-
-    def _capture_clipboard_image_path(self, log_errors: bool = True) -> str | None:
-        if platform.system().lower() == "linux":
-            linux_path = self._capture_clipboard_image_path_linux(log_errors=log_errors)
-            if linux_path:
-                return linux_path
-
-        if ImageGrab is None:
-            if log_errors:
-                self._append_log("System", "Clipboard image unavailable: install Pillow")
-            return None
-
-        try:
-            image = ImageGrab.grabclipboard()  # type: ignore[union-attr]
-            if image is None or not hasattr(image, "save"):
-                return None
-            fd, path = tempfile.mkstemp(prefix="gemini-clip-", suffix=".png")
-            os.close(fd)
-            image.save(path, format="PNG")
-            return path
-        except Exception as exc:
-            if log_errors:
-                self._append_log("Error", f"Clipboard import failed: {exc}")
-            return None
-
-    def _capture_clipboard_image_path_linux(self, log_errors: bool = True) -> str | None:
-        fd, path = tempfile.mkstemp(prefix="gemini-clip-", suffix=".png")
-        os.close(fd)
-        Path(path).unlink(missing_ok=True)
-        quoted = shlex.quote(path)
-
-        commands: list[tuple[str, list[str]]] = []
-        if shutil.which("wl-paste"):
-            commands.append(("wl-paste", ["sh", "-lc", f"wl-paste --type image/png > {quoted}"]))
-        if shutil.which("xclip"):
-            commands.append(("xclip", ["sh", "-lc", f"xclip -selection clipboard -t image/png -o > {quoted}"]))
-
-        for _label, cmd in commands:
-            try:
-                Path(path).unlink(missing_ok=True)
-                result = subprocess.run(cmd, check=False, capture_output=True, text=True)
-                if result.returncode == 0 and Path(path).exists() and Path(path).stat().st_size > 0:
-                    return path
-            except Exception:
-                continue
-
-        if log_errors:
-            self._append_log(
-                "System",
-                "Clipboard immagine non disponibile su Linux (installa wl-clipboard o xclip).",
-            )
-        Path(path).unlink(missing_ok=True)
-        return None
-
-    def on_hotkey_overlay_triggered(self, prompt_override: str | None = None) -> None:
-        if not self.connected:
-            self._show_overlay_message("Bridge non connesso", ttl_ms=3500)
-            return
-
-        path = self._capture_area_screenshot_path(log_errors=False)
-        if path is None:
-            self._show_overlay_message("Screenshot annullato", ttl_ms=2500)
-            return
-
-        prompt = (
-            prompt_override.strip()
-            if prompt_override and prompt_override.strip()
-            else "Analizza rapidamente questo screenshot. Rispondi in italiano con massimo 5 righe."
-        )
-        self._send_overlay_request(
-            prompt=prompt,
-            source="Shot+Ask",
-            status_text="Analisi screenshot in corso...",
-            image_path=path,
-            fail_text="Invio screenshot fallito",
-        )
-
-    def on_hotkey_clipboard_triggered(self, prompt_override: str | None = None) -> None:
-        if not self.connected:
-            self._show_overlay_message("Bridge non connesso", ttl_ms=3500)
-            return
-
-        override = prompt_override.strip() if prompt_override else ""
-        clip_text = ""
-        try:
-            clip_text = self.root.clipboard_get().strip()
-        except tk.TclError:
-            clip_text = ""
-
-        if clip_text:
-            if override:
-                prompt = f"{override}\n\nClipboard:\n{clip_text}"
-            else:
-                prompt = (
-                    "Analizza rapidamente questo testo copiato negli appunti. "
-                    "Rispondi in italiano con massimo 5 righe.\n\n"
-                    f"{clip_text}"
-                )
-            self._send_overlay_request(
-                prompt=prompt,
-                source="Clip+Ask",
-                status_text="Analisi clipboard in corso...",
-                image_path=None,
-                fail_text="Invio clipboard fallito",
-            )
-            return
-
-        path = self._capture_clipboard_image_path(log_errors=False)
-        if path is None:
-            self._show_overlay_message("Clipboard vuota o formato non supportato", ttl_ms=3200)
-            return
-
-        prompt = (
-            override
-            if override
-            else "Analizza rapidamente questa immagine dagli appunti. Rispondi in italiano con massimo 5 righe."
-        )
-        self._send_overlay_request(
-            prompt=prompt,
-            source="Clip+Ask",
-            status_text="Analisi clipboard in corso...",
-            image_path=path,
-            fail_text="Invio clipboard fallito",
-        )
-
-    def on_clipboard_send(self) -> None:
-        text = ""
-        try:
-            text = self.root.clipboard_get().strip()
-        except tk.TclError:
-            text = ""
-
-        if text:
-            self.prompt_entry.delete("1.0", tk.END)
-            self.prompt_entry.insert("1.0", text)
-            self.on_send()
-            return
-
-        path = self._capture_clipboard_image_path(log_errors=True)
-        if path is None:
-            self._append_log("System", "Clipboard empty or unsupported format")
-            return
-        self._set_selected_image(path)
-        self.prompt_entry.delete("1.0", tk.END)
-        self.prompt_entry.insert("1.0", "Descrivi questo screenshot.")
-        self.on_send()
+            self._append_log("System", f"Global hotkeys unavailable: {exc}")
 
     def _auto_install_quick_action(self) -> None:
-        if platform.system().lower() != "darwin":
+        if not self._is_macos:
             return
         self.on_install_quick_action(silent=True)
 
     def on_install_quick_action(self, silent: bool = False) -> None:
-        if platform.system().lower() != "darwin":
-            if not silent:
-                self._append_log("System", "Quick Action auto-install is only available on macOS")
-            return
-
         installer = Path(__file__).with_name("install_macos_quick_action.py")
         if not installer.exists():
             if not silent:
                 self._append_log("Error", "Quick Action installer script not found")
             return
-
-        cmd = ["python3", str(installer), "--quiet"]
         try:
-            result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            result = subprocess.run(
+                ["python3", str(installer), "--quiet"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
             if result.returncode == 0:
                 if not silent:
-                    self._append_log("System", "Right-click Quick Action installed/updated")
+                    self._append_log("System", "macOS Quick Action installed/updated")
                 return
-
-            stderr = (result.stderr or "").strip()
             if not silent:
-                if stderr:
-                    self._append_log("Error", f"Quick Action install failed: {stderr}")
-                else:
-                    self._append_log("Error", "Quick Action install failed")
+                stderr = (result.stderr or "").strip() or "unknown error"
+                self._append_log("Error", f"Quick Action install failed: {stderr}")
         except Exception as exc:
             if not silent:
                 self._append_log("Error", f"Quick Action install failed: {exc}")
 
-    def _consume_quick_inbox(self) -> None:
-        path = self._quick_inbox_path
-        if not path.exists():
-            self._quick_inbox_offset = 0
-            return
-
-        try:
-            size = path.stat().st_size
-            if size < self._quick_inbox_offset:
-                self._quick_inbox_offset = 0
-        except OSError:
-            return
-
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                handle.seek(self._quick_inbox_offset)
-                lines = handle.readlines()
-                self._quick_inbox_offset = handle.tell()
-        except OSError:
-            return
-
-        for line in lines:
-            raw = line.strip()
-            if not raw:
-                continue
-            try:
-                payload = json.loads(raw)
-            except Exception:
-                continue
-            if not isinstance(payload, dict):
-                continue
-            payload_type = str(payload.get("type", "quick_send")).strip().lower()
-            if payload_type == "quick_send":
-                text = str(payload.get("text", "")).strip()
-                if not text:
-                    continue
-                self.events.put({"type": "quick_send", "text": text})
-                continue
-            if payload_type in {"quick_overlay", "quick_shot_ask", "hotkey_overlay"}:
-                prompt = str(payload.get("prompt", "")).strip()
-                self.events.put({"type": "quick_overlay", "prompt": prompt})
-                continue
-            if payload_type in {"quick_clipboard_overlay", "quick_clipboard", "quick_clip_ask"}:
-                prompt = str(payload.get("prompt", "")).strip()
-                self.events.put({"type": "quick_clipboard_overlay", "prompt": prompt})
-                continue
-            if payload_type == "toggle_visibility":
-                self.events.put({"type": "toggle_visibility"})
-
-    def on_clear_image(self) -> None:
-        self.selected_image_path = None
-        self.image_var.set("Image: none")
-        self._refresh_context_preview()
-
-    def on_add_pdf(self) -> None:
-        paths = filedialog.askopenfilenames(
-            title="Select PDF documents",
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
-        )
-        if not paths:
-            return
-
-        added = 0
-        for path in paths:
-            if path not in self.selected_pdf_paths:
-                self.selected_pdf_paths.append(path)
-                added += 1
-
-        if added:
-            self._append_log("System", f"Added {added} PDF(s) to context")
-        self._refresh_pdf_label()
-        self._refresh_context_preview()
-
-    def on_clear_pdfs(self) -> None:
-        self.selected_pdf_paths = []
-        self._refresh_pdf_label()
-        self._refresh_context_preview()
-        self._append_log("System", "PDF context cleared")
-
-    # Backward-compatible alias (older callbacks referenced singular name).
-    def on_clear_pdf(self) -> None:
-        self.on_clear_pdfs()
-
-    def _on_file_drop(self, event) -> None:
-        data = getattr(event, 'data', "")
-        if not data:
-            return
-        
-        paths = []
-        if "{" in data:
-            matches = re.findall(r'\{([^}]+)\}', data)
-            if matches:
-                 paths = matches
-            else:
-                 paths = data.split()
-        else:
-            import shlex
-            try:
-                paths = shlex.split(data)
-            except ValueError:
-                paths = [data]
-                
-        added_pdfs = 0
-        for path in paths:
-            path = path.strip()
-            if not os.path.isfile(path):
-                continue
-            
-            ext = path.lower().split('.')[-1]
-            if ext == "pdf":
-                if path not in self.selected_pdf_paths:
-                    self.selected_pdf_paths.append(path)
-                    added_pdfs += 1
-            elif ext in ["png", "jpg", "jpeg", "webp", "gif", "bmp"]:
-                self._set_selected_image(path)
-                
-        if added_pdfs > 0:
-            self._append_log("System", f"Added {added_pdfs} PDF(s) to context via drag & drop")
-            self._refresh_pdf_label()
-            self._refresh_context_preview()
-
-    def _refresh_pdf_label(self) -> None:
-        if not self.selected_pdf_paths:
-            self.pdf_var.set("PDF: none")
-            return
-
-        names = [os.path.basename(path) for path in self.selected_pdf_paths]
-        if len(names) == 1:
-            self.pdf_var.set(f"PDF: {names[0]}")
-        else:
-            self.pdf_var.set(f"PDF: {len(names)} selected ({names[0]} + others)")
-
-    def _refresh_context_preview(self) -> None:
-        parts: list[str] = []
-        selected_model = self.model_var.get().strip() if hasattr(self, "model_var") else MODEL_PRESETS[0]
-        if selected_model and selected_model != MODEL_PRESETS[0]:
-            parts.append(f"model: {selected_model}")
-        if self.selected_image_path:
-            parts.append(f"image: {os.path.basename(self.selected_image_path)}")
-        if self.selected_pdf_paths:
-            parts.append(f"pdfs: {len(self.selected_pdf_paths)}")
-        active_container_name = self._active_container_name()
-        if self._active_container_id and active_container_name:
-            parts.append(f"container: {active_container_name}")
-        elif self._active_container_id:
-            parts.append("container: remote")
-        if self.web_search_enabled.get():
-            parts.append("web search: on")
-        if self.thinking_enabled.get():
-            budget = self._get_thinking_budget()
-            if budget is None:
-                parts.append("thinking: auto")
-            else:
-                parts.append(f"thinking: {budget}")
-            if self.show_thoughts_var.get():
-                parts.append("thought trace: on")
-
-        if parts:
-            self.context_preview_var.set("Active context -> " + ", ".join(parts))
-        else:
-            self.context_preview_var.set("No active attachments")
-
-    def _get_thinking_budget(self) -> int | None:
-        if not self.thinking_enabled.get():
-            return None
-        if self.thinking_auto_var.get():
-            return -1
-        try:
-            value = int(self.thinking_budget_var.get().strip())
-        except Exception:
-            value = 1024
-        value = max(0, min(24576, value))
-        self.thinking_budget_var.set(str(value))
-        return value
-
-    def _refresh_memory_label(self) -> None:
-        count = len(self.sessions_store.recent_turns(self.active_session_id, max_items=10000, max_chars=10_000_000))
-        if count == 0:
-            self.memory_var.set("Memory: empty")
-            return
-        self.memory_var.set(f"Memory: {count} turn(s)")
-
-    def _estimate_input_tokens(
-        self,
-        prompt: str,
-        memory_turns: list[dict[str, str]],
-        context_blocks: list[dict[str, Any]],
-    ) -> tuple[int, int, int]:
-        text_chars = len(prompt)
-        for turn in memory_turns:
-            text_chars += len(str(turn.get("text", "")))
-        for block in context_blocks:
-            text_chars += len(str(block.get("text", "")))
-
-        text_tokens = max(1, int(round(text_chars / 4.0)))
-
-        image_tokens = 0
-        if self.selected_image_path:
-            try:
-                size_bytes = Path(self.selected_image_path).stat().st_size
-                image_tokens = max(256, int(size_bytes / 1200))
-            except OSError:
-                image_tokens = 512
-
-        total = text_tokens + image_tokens
-        return total, text_tokens, image_tokens
-
-    def on_clear_memory(self) -> None:
-        self.sessions_store.clear_messages(self.active_session_id)
-        self._render_active_chat()
-        self._refresh_memory_label()
-        self._refresh_sessions_list(self.active_session_id)
-        self._append_log("System", "Current chat memory cleared")
-
-    def on_send(self) -> None:
-        prompt = self.prompt_entry.get("1.0", tk.END).strip()
-        if not prompt and self.selected_image_path is not None:
-            prompt = "Describe this image."
-
-        if not prompt:
-            return
-        if not self.connected:
-            self._append_log("System", "Not connected")
-            return
-
-        session_id = self._ensure_active_session("send")
-        memory_turns = self.sessions_store.recent_turns(session_id, max_items=10, max_chars=2600)
-        context_blocks = []
-
-        # --- Active container takes priority over per-session PDFs ---
-        use_container = self._active_container_id is not None
-
-        if not use_container:
-            # Legacy: system instructions + pinned PDFs + session PDFs
-            sys_instr = self.system_instructions_var.get().strip()
-            if sys_instr:
-                context_blocks.append({"type": "text", "text": f"System Instructions:\n{sys_instr}"})
-
-            all_pdf_paths = list(self.pinned_pdf_paths)
-            for p in self.selected_pdf_paths:
-                if p not in all_pdf_paths:
-                    all_pdf_paths.append(p)
-
-            if all_pdf_paths:
-                try:
-                    blocks = self.pdf_context_engine.build_context(prompt, all_pdf_paths)
-                    context_blocks.extend(blocks)
-                except ValueError as exc:
-                    self._append_log("Error", str(exc))
-                    return
-        else:
-            # Container mode: inject system instructions only; Android does retrieval
-            sys_instr = self.system_instructions_var.get().strip()
-            if sys_instr:
-                context_blocks.append({"type": "text", "text": f"System Instructions:\n{sys_instr}"})
-
-        est_total, est_text, est_image = self._estimate_input_tokens(prompt, memory_turns, context_blocks)
-        if est_image > 0:
-            self._append_log(
-                "System",
-                f"Estimated input tokens: ~{est_total} (text ~{est_text}, image ~{est_image})",
-            )
-        else:
-            self._append_log("System", f"Estimated input tokens: ~{est_total}")
-
-        if est_total > 14_000:
-            self._append_log(
-                "System",
-                "Large request detected: higher timeout risk. Consider shorter prompt or fewer PDF blocks.",
-            )
-
-        thinking_budget = self._get_thinking_budget()
-        thinking_enabled = self.thinking_enabled.get()
-        include_thoughts = thinking_enabled and self.show_thoughts_var.get()
-        selected_model = self.model_var.get().strip()
-        model_override = selected_model if selected_model and selected_model != 'phone-default' else None
-
-        try:
-            request_id = self.client.send_prompt(
-                prompt,
-                model=model_override,
-                image_path=self.selected_image_path,
-                context_blocks=context_blocks or None,
-                memory_turns=memory_turns or None,
-                enable_web_search=self.web_search_enabled.get(),
-                thinking_enabled=thinking_enabled,
-                thinking_budget=thinking_budget,
-                include_thoughts=include_thoughts,
-                active_container_id=self._active_container_id,
-                active_container_name=self._active_container_name(),
-            )
-        except ValueError as exc:
-            self._append_log("Error", str(exc))
-            from tkinter import messagebox
-            messagebox.showerror("Errore di Invio", str(exc), parent=self.root)
-            return
-
-        self._streaming_preview_by_session.pop(session_id, None)
-        self._streaming_thought_by_session.pop(session_id, None)
-        self.sessions_store.add_message(session_id, "user", prompt)
-        self._refresh_sessions_list(session_id)
-        if session_id == self.active_session_id:
-            self._render_active_chat()
-            if self.selected_image_path is not None:
-                self._append_log("System", f"Image attached: {os.path.basename(self.selected_image_path)}")
-            if context_blocks:
-                self._append_log("System", f"PDF context blocks sent: {len(context_blocks)}")
-            if memory_turns:
-                self._append_log("System", f"Memory turns sent: {len(memory_turns)}")
-            if self.web_search_enabled.get():
-                self._append_log("System", "Web search tool enabled")
-            if model_override is not None:
-                self._append_log("System", f"Model override: {model_override}")
-            if thinking_enabled:
-                if thinking_budget is None or thinking_budget < 0:
-                    self._append_log("System", "Thinking mode enabled (auto budget)")
-                else:
-                    self._append_log("System", f"Thinking mode enabled (budget {thinking_budget})")
-                if include_thoughts:
-                    self._append_log("System", "Thought trace enabled")
-            self._append_log("System", f"Request queued ({request_id})")
-
-        self._track_pending_request(request_id, session_id)
-        self._refresh_memory_label()
-
-        self.prompt_entry.delete("1.0", tk.END)
-        self.on_clear_image()
-
-    def on_stop_active_request(self) -> None:
-        request_id = self._latest_pending_request_for_session(self.active_session_id)
-        if request_id is None:
-            self._append_log("System", "Nessuna richiesta attiva da fermare")
-            self._refresh_stop_button()
-            return
-        if not self.connected:
-            self._append_log("System", "Bridge non connesso")
-            return
-        try:
-            self.client.cancel_request(request_id)
-            self._append_log("System", f"Stop requested ({request_id})")
-        except Exception as exc:
-            self._append_log("Error", f"Stop request failed: {exc}")
-
-    def _consume_toggle_flag(self) -> None:
-        if not self._toggle_flag_path.exists():
-            return
-        try:
-            mtime = self._toggle_flag_path.stat().st_mtime
-            if self._toggle_flag_mtime == 0.0:
-                self._toggle_flag_mtime = mtime
-                return
-            if mtime > self._toggle_flag_mtime:
-                self._toggle_flag_mtime = mtime
-                self.events.put({"type": "toggle_visibility"})
-        except OSError:
-            pass
-    def _consume_clipboard_flag(self) -> None:
-        if not self._clipboard_flag_path.exists():
-            return
-        try:
-            mtime = self._clipboard_flag_path.stat().st_mtime
-            if self._clipboard_flag_mtime == 0.0:
-                self._clipboard_flag_mtime = mtime
-                return
-            if mtime > self._clipboard_flag_mtime:
-                self._clipboard_flag_mtime = mtime
-                text = ""
-                try:
-                    import pyperclip
-                    text = pyperclip.paste().strip()
-                except Exception:
-                    try:
-                        text = self.root.clipboard_get().strip()
-                    except Exception:
-                        text = ""
-                if text:
-                    self.events.put({"type": "force_visibility"})
-                    self.events.put({"type": "quick_send", "text": f"Analizza e rispondi a questo testo copiato negli appunti:\n\n{text}"})
-        except OSError:
-            pass
-
-    def _poll_events(self) -> None:
-        self._consume_quick_inbox()
-        self._consume_toggle_flag()
-        self._consume_clipboard_flag()
-        self._check_overlay_request_timeouts()
-        self._present_overlay_window()
-
-        while True:
-            try:
-                event = self.events.get_nowait()
-            except queue.Empty:
-                break
-            self._handle_event(event)
-
-        self.root.after(100, self._poll_events)
-
-    def _handle_event(self, event: dict[str, Any]) -> None:
-        event_type = event.get("type")
-
-        if event_type == "force_visibility":
-            self._force_app_visibility()
-            return
-
-        if event_type == "toggle_visibility":
-            self._toggle_app_visibility()
-            return
-
-        if event_type == "hotkey_overlay":
-            self.on_hotkey_overlay_triggered()
-            return
-
-        if event_type == "quick_overlay":
-            self.on_hotkey_overlay_triggered(str(event.get("prompt", "")))
-            return
-
-        if event_type == "quick_clipboard_overlay":
-            self.on_hotkey_clipboard_triggered(str(event.get("prompt", "")))
-            return
-
-        if event_type == "status":
-            status = event.get("text", "")
-            self.status_var.set(status)
-            self._append_log("System", status)
-            return
-
-        if event_type == "error":
-            message = event.get("text", "Unknown error")
-            lowered = str(message).strip().lower()
-            if "unsupported request type: list_containers" in lowered:
-                self._remote_list_feature_supported = False
-                self._pending_remote_container_requests.clear()
-                self._append_log(
-                    "System",
-                    "Il bridge Android non supporta i container remoti (list_containers). Aggiorna l'app Android.",
-                )
-                return
-            if self._overlay_request_ids and isinstance(message, str) and message:
-                self._show_overlay_message(f"Errore bridge: {message}", ttl_ms=8000)
-                self._cleanup_all_overlay_requests()
-            self._clear_all_pending_requests()
-            self._append_log("Error", message)
-            return
-
-        if event_type == "scan_result":
-            self.devices = event.get("devices", [])
-            self.devices_list.delete(0, tk.END)
-            selected_idx: int | None = None
-            for idx, device in enumerate(self.devices):
-                label = self._format_device_label(device)
-                self.devices_list.insert(tk.END, label)
-                device_bridge = self._normalize_bridge_id(device.get("bridge_id"))
-                address_match = bool(self._last_connected_address and device.get("address") == self._last_connected_address)
-                bridge_match = bool(self._last_connected_bridge_id and device_bridge == self._last_connected_bridge_id)
-                if address_match or bridge_match:
-                    selected_idx = idx
-            if selected_idx is not None:
-                self.devices_list.selection_clear(0, tk.END)
-                self.devices_list.selection_set(selected_idx)
-            if self.devices:
-                self._append_log("System", f"Found {len(self.devices)} Gemini bridge device(s)")
-            else:
-                self._append_log(
-                    "System",
-                    "No Gemini bridge found. Keep Android bridge service active and retry Scan.",
-                )
-            return
-
-        if event_type == "connected":
-            self.connected = True
-            self._pending_remote_container_requests.clear()
-            self._remote_list_feature_supported = True
-            self._remote_list_legacy_attempted = False
-            address = str(event.get("address", "")).strip()
-            bridge_id = self._normalize_bridge_id(event.get("bridge_id"))
-            if address:
-                self._last_connected_address = address
-            if bridge_id:
-                self._last_connected_bridge_id = bridge_id
-            self._update_settings(
-                {
-                    "last_connected_address": self._last_connected_address,
-                    "last_connected_bridge_id": self._last_connected_bridge_id,
-                }
-            )
-            device = event.get("device", "device")
-            packet = event.get("max_packet_size", "?")
-            self.status_var.set(f"Connected: {device}")
-            self.link_var.set("Link: probing...")
-            self._last_link_state = "healthy"
-            id_text = f", bridgeId: {bridge_id}" if bridge_id else ""
-            self._append_log("System", f"Connected ({device}), packet size: {packet}{id_text}")
-            return
-
-        if event_type == "disconnected":
-            self.connected = False
-            self.status_var.set("Disconnected")
-            self.link_var.set("Link: offline")
-            self._pending_remote_container_requests.clear()
-            if self._overlay_request_ids:
-                self._show_overlay_message("Bridge disconnesso durante Shot+Ask", ttl_ms=8000)
-                self._cleanup_all_overlay_requests()
-            self._clear_all_pending_requests()
-            self._append_log("System", "Disconnected")
-            return
-
-        if event_type == "link_quality":
-            rtt = event.get("rtt_ms")
-            if isinstance(rtt, int):
-                self.link_var.set(f"Link RTT: {rtt} ms")
-            return
-
-        if event_type == "link_status":
-            state = str(event.get("state", "unknown"))
-            if state != self._last_link_state:
-                self._last_link_state = state
-                text = event.get("text")
-                if isinstance(text, str) and text:
-                    self._append_log("System", text)
-            return
-
-        if event_type == "transfer_progress":
-            percent = event.get("percent")
-            current = event.get("current_packets")
-            total = event.get("total_packets")
-            request_id = event.get("request_id", "")
-            if isinstance(percent, int) and isinstance(current, int) and isinstance(total, int):
-                # Update status bar always
-                self.status_var.set(f"📡 Invio... {percent}% ({current}/{total} pacchetti)")
-                if request_id and request_id in self._overlay_request_ids:
-                    self._overlay_last_update_at[request_id] = time.monotonic()
-                    self._show_overlay_message(
-                        f"Invio screenshot... {percent}% ({current}/{total})",
-                        ttl_ms=0,
-                    )
-                # Update dedicated progress dialog if this is a container transfer
-                if request_id == self._container_transfer_request_id:
-                    self._update_transfer_dialog(percent, current, total)
-            return
-
-        if event_type == "sent":
-            request_id = str(event.get("request_id", "")).strip()
-            if request_id and request_id in self._overlay_request_ids:
-                self._overlay_last_update_at[request_id] = time.monotonic()
-                self._show_overlay_message("Upload screenshot completato, attendo elaborazione...", ttl_ms=0)
-            if self.connected:
-                self.status_var.set("Connected")
-            return
-
-        if event_type == "incoming":
-            message = event.get("message", {})
-            message_type = message.get("type")
-            message_id = str(message.get("messageId", "")).strip()
-            if not message_id and message_type in {"status", "partial", "result", "error"} and len(self._overlay_request_ids) == 1:
-                # Fallback for malformed replies missing messageId.
-                message_id = next(iter(self._overlay_request_ids))
-            if message_id and message_id in self._overlay_request_ids:
-                self._overlay_last_update_at[message_id] = time.monotonic()
-                if message_type == "partial":
-                    channel = str(message.get("channel", "answer")).strip().lower()
-                    if channel != "thought":
-                        partial_text = str(message.get("text", "")).strip()
-                        if partial_text:
-                            self._show_overlay_message(partial_text + "\n▌", ttl_ms=0)
-                    return
-                if message_type == "result":
-                    response_text = str(message.get("text", "")).strip()
-                    if response_text:
-                        self._show_overlay_message(response_text, ttl_ms=20000)
-                    self._cleanup_overlay_request(message_id)
-                    return
-                if message_type == "error":
-                    error_text = str(message.get("error", "Unknown error")).strip()
-                    if error_text:
-                        self._show_overlay_message(f"Errore: {error_text}", ttl_ms=8000)
-                    self._cleanup_overlay_request(message_id)
-                    return
-                if message_type == "status":
-                    state = str(message.get("state", "processing")).strip()
-                    if state:
-                        self._show_overlay_message(state, ttl_ms=0)
-                    if state.lower().startswith("canceled"):
-                        self._cleanup_overlay_request(message_id)
-                    return
-
-            target_session = self._pending_request_session.get(message_id, self.active_session_id)
-
-            if message_type == "container_ack":
-                chunk_count = message.get("chunkCount", "?")
-                container_id = str(message.get("containerId", "")).strip()
-                self._close_transfer_dialog(success=True)
-                if container_id:
-                    self._active_container_id = container_id
-                    self._refresh_container_list()
-                    self._refresh_context_preview()
-                self._append_log("System", f"📱 Container confermato dal telefono ({chunk_count} chunk salvati).")
-                return
-
-            if message_type == "container_list":
-                raw_containers = message.get("containers", [])
-                parsed: list[dict[str, Any]] = []
-                if isinstance(raw_containers, list):
-                    for item in raw_containers:
-                        if not isinstance(item, dict):
-                            continue
-                        cid = str(item.get("id", "")).strip()
-                        name = str(item.get("name", "")).strip()
-                        if not cid:
-                            continue
-                        parsed.append(
-                            {
-                                "id": cid,
-                                "name": name or cid,
-                                "chunkCount": int(item.get("chunkCount", 0) or 0),
-                            }
-                        )
-                if message_id:
-                    self._pending_remote_container_requests.discard(message_id)
-                else:
-                    self._pending_remote_container_requests.clear()
-                self._remote_list_feature_supported = True
-                self._remote_containers = parsed
-                self._append_log("System", f"Container remoti disponibili: {len(parsed)}")
-                if parsed:
-                    self._open_remote_container_picker()
-                return
-
-            if message_type == "status":
-                state = str(message.get("state", "processing"))
-                if target_session == self.active_session_id:
-                    self._append_log("Phone", state)
-                else:
-                    self._append_log("System", f"[Other chat] {state}")
-                lowered = state.strip().lower()
-                if message_id and lowered.startswith("canceled"):
-                    self._streaming_preview_by_session.pop(target_session, None)
-                    self._streaming_thought_by_session.pop(target_session, None)
-                    self._clear_pending_request(message_id)
-                    if target_session == self.active_session_id:
-                        self._render_active_chat()
-                return
-
-            if message_type == "partial":
-                partial_text = str(message.get("text", ""))
-                if partial_text:
-                    channel = str(message.get("channel", "answer")).strip().lower()
-                    if channel == "thought":
-                        self._streaming_thought_by_session[target_session] = partial_text
-                    else:
-                        self._streaming_preview_by_session[target_session] = partial_text
-                    if target_session == self.active_session_id:
-                        self._render_active_chat()
-                return
-
-            if message_type == "result":
-                response_text = str(message.get("text", ""))
-                self._streaming_preview_by_session.pop(target_session, None)
-                thought_text = str(message.get("thought", "")).strip()
-                self._streaming_thought_by_session.pop(target_session, None)
-                self.sessions_store.add_message(target_session, "assistant", response_text)
-                if thought_text and self.show_thoughts_var.get():
-                    self.sessions_store.add_message(target_session, "thought", thought_text)
-                if target_session == self.active_session_id:
-                    self._render_active_chat()
-                else:
-                    self._append_log("System", "Response received in another chat tab")
-                if message_id:
-                    self._clear_pending_request(message_id)
-                self._refresh_sessions_list(self.active_session_id)
-                self._refresh_memory_label()
-                return
-
-            if message_type == "error":
-                error_text = str(message.get("error", "Unknown error"))
-                if self._handle_remote_container_error(message_id, error_text):
-                    return
-                self._streaming_preview_by_session.pop(target_session, None)
-                self._streaming_thought_by_session.pop(target_session, None)
-                self.sessions_store.add_message(target_session, "error", error_text)
-                if target_session == self.active_session_id:
-                    self._append_log("Phone error", error_text)
-                else:
-                    self._append_log("System", "Phone error received in another chat tab")
-                if message_id:
-                    self._clear_pending_request(message_id)
-                self._refresh_sessions_list(self.active_session_id)
-                return
-
-            self._append_log("Phone", str(message))
-            return
-
-        if event_type == "quick_send":
-            text = str(event.get("text", "")).strip()
-            if not text:
-                return
-            self.prompt_entry.delete("1.0", tk.END)
-            self.prompt_entry.insert("1.0", text)
-            if self.connected:
-                self.on_send()
-            else:
-                self._append_log("System", "Quick request copied into composer (bridge not connected)")
-            return
-
-    def _adjust_input_height(self, _event=None) -> None:
-        try:
-            content = self.prompt_entry.get("1.0", "end-1c")
-            lines = content.count("\n") + 1
-            width_chars = self.prompt_entry.winfo_width() // 8
-            if width_chars > 0:
-                for line in content.split("\n"):
-                    lines += len(line) // width_chars
-            target_lines = max(2, min(7, lines))
-            new_height = 60 + (target_lines - 2) * 20
-            self.prompt_entry.configure(height=new_height)
-        except Exception:
-            pass
-
-    def _force_app_visibility(self) -> None:
-        if self.root.state() == 'withdrawn' or self.root.state() == 'iconic':
-            self.root.deiconify()
-        self.root.lift()
-        if self._is_macos and NSApplication is not None:
-            try:
-                NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-            except Exception:
-                pass
-        if not self.pip_enabled.get():
-            self.pip_enabled.set(True)
-            self._toggle_pip()
-
-    def _toggle_app_visibility(self) -> None:
-        if self.root.state() == 'withdrawn' or self.root.state() == 'iconic':
-            self.root.deiconify()
-            self.root.lift()
-            if self._is_macos and NSApplication is not None:
-                try:
-                    NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-                except Exception:
-                    pass
-            if not self.pip_enabled.get():
-                self.pip_enabled.set(True)
-                self._toggle_pip()
-        else:
-            if self._pip_mode_active:
-                self.pip_enabled.set(False)
-                self._toggle_pip()
-            self.root.iconify()
-
-    def on_close(self) -> None:
+    def _on_app_quit_shortcut(self, _event: tk.Event[Any] | None = None) -> str:
+        self.quit_app()
+        return "break"
+
+    def quit_app(self) -> None:
         if self._closing_app:
             return
         self._closing_app = True
-        if self._overlay_listener is not None:
+        self.save_settings()
+        listener = self._overlay_hotkey_listener
+        self._overlay_hotkey_listener = None
+        if listener is not None:
             try:
-                self._overlay_listener.stop()
+                listener.stop()
             except Exception:
                 pass
-            self._overlay_listener = None
+        self.hide_overlay()
         self._stop_menu_bar_icon()
-        latest_settings = self._load_settings()
-        latest_settings["overlay_bg_color"] = self._overlay_bg_color
-        latest_settings["overlay_width"] = self._overlay_width
-        latest_settings["overlay_height"] = self._overlay_height
-        latest_settings["overlay_resizable"] = self._overlay_resizable
-        latest_settings["overlay_timeout_seconds"] = int(self._overlay_timeout_seconds)
-        latest_settings["auto_connect_on_start"] = self._auto_connect_on_start
-        latest_settings["auto_retry_known_device"] = self._auto_retry_known_device
-        latest_settings["auto_check_updates"] = self._auto_check_updates
-        latest_settings["menu_bar_mode_enabled"] = self._menu_bar_mode_enabled
-        latest_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
-        latest_settings["last_connected_address"] = self._last_connected_address
-        latest_settings["last_connected_bridge_id"] = self._last_connected_bridge_id
-        self._save_settings(latest_settings)
-        self._hide_overlay_window()
         try:
             self.client.stop()
         except Exception:
@@ -3663,20 +1838,17 @@ class DesktopChatApp:
         except Exception:
             pass
 
-    def _on_app_quit_shortcut(self, _event: tk.Event[Any] | None = None) -> str:
-        self.on_close()
-        return "break"
-
     def _atexit_shutdown(self) -> None:
         if self._closing_app:
             return
         self._closing_app = True
-        if self._overlay_listener is not None:
+        listener = self._overlay_hotkey_listener
+        self._overlay_hotkey_listener = None
+        if listener is not None:
             try:
-                self._overlay_listener.stop()
+                listener.stop()
             except Exception:
                 pass
-            self._overlay_listener = None
         try:
             self._stop_menu_bar_icon()
         except Exception:
@@ -3691,4 +1863,4 @@ class DesktopChatApp:
 
 
 if __name__ == "__main__":
-    DesktopChatApp().run()
+    DesktopOverlayApp().run()
