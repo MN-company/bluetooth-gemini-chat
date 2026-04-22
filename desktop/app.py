@@ -161,7 +161,7 @@ else:
 class DesktopChatApp:
     def __init__(self) -> None:
         self.root = CTkinterDnD()
-        self.root.title("Gemini BLE Chat")
+        self.root.title("Device Bridge")
         self.root.geometry("1240x780")
         self.root.minsize(300, 400)
         self._dnd_enabled = False
@@ -174,7 +174,7 @@ class DesktopChatApp:
             except Exception as exc:
                 self._dnd_issue_note = str(exc)
         else:
-            self._dnd_issue_note = "tkinterdnd2/tkdnd non disponibile"
+            self._dnd_issue_note = "tkinterdnd2/tkdnd not available"
 
         self.events: queue.Queue[dict[str, Any]] = queue.Queue()
         self.client = BleChatClient(self.events.put)
@@ -271,9 +271,9 @@ class DesktopChatApp:
         self._build_ui()
         if not self._dnd_enabled:
             if platform.system().lower() == "linux":
-                self._append_log("System", "Drag & drop disabilitato su Linux: usa i pulsanti Attach/Add PDF.")
+                self._append_log("System", "Drag & drop disabled on Linux: use the Attach/Add PDF buttons.")
             elif self._dnd_issue_note:
-                self._append_log("System", f"Drag & drop disabilitato: {self._dnd_issue_note}")
+                self._append_log("System", f"Drag & drop disabled: {self._dnd_issue_note}")
         self.client.set_auto_reconnect(self._auto_retry_known_device)
         self._start_menu_bar_icon_if_needed()
         self._apply_macos_activation_policy()
@@ -283,6 +283,7 @@ class DesktopChatApp:
         self._refresh_context_preview()
         self._auto_install_quick_action()
         self._start_overlay_hotkey_listener()
+        self._poll_scheduled = False
         self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
         self.root.after(100, self._poll_events)
         self.root.after(1200, self._maybe_auto_connect_on_start)
@@ -563,10 +564,14 @@ class DesktopChatApp:
         
         # --- GLOBAL HOTKEYS BINDING ---
         self.root.bind("<Command-n>", lambda e: [self.on_new_chat(), self.prompt_entry.focus()])
+        self.root.bind("<Control-n>", lambda e: [self.on_new_chat(), self.prompt_entry.focus()])
         self.root.bind("<Command-r>", lambda e: self.on_rename_chat())
+        self.root.bind("<Control-r>", lambda e: self.on_rename_chat())
         self.root.bind("<Command-BackSpace>", self._on_global_backspace_hotkey)
         self.root.bind("<Command-k>", lambda e: self.search_entry.focus())
+        self.root.bind("<Control-k>", lambda e: self.search_entry.focus())
         self.root.bind("<Command-f>", lambda e: self.search_entry.focus())
+        self.root.bind("<Control-f>", lambda e: self.search_entry.focus())
         
         self._is_compact_mode = False
 
@@ -659,7 +664,7 @@ class DesktopChatApp:
                     return
             except Exception:
                 continue
-        self._append_log("Error", "Cannot open macOS privacy settings. Apri manualmente Impostazioni > Privacy e Sicurezza.")
+        self._append_log("Error", "Cannot open macOS privacy settings. Open manually: Settings > Privacy & Security.")
 
     def _has_screen_recording_permission(self) -> bool | None:
         if not self._is_macos:
@@ -768,7 +773,7 @@ class DesktopChatApp:
         from tkinter import messagebox
 
         dialog = ctk.CTkToplevel(self.root)
-        dialog.title("Setup permessi macOS")
+        dialog.title("macOS Permissions Setup")
         dialog.geometry("680x560")
         dialog.transient(self.root)
         dialog.grab_set()
@@ -776,14 +781,14 @@ class DesktopChatApp:
 
         ctk.CTkLabel(
             dialog,
-            text="Primo avvio: abilita i permessi richiesti",
+            text="First launch: enable required permissions",
             font=("Avenir", 18, "bold"),
         ).pack(anchor=tk.W, padx=16, pady=(14, 6))
         ctk.CTkLabel(
             dialog,
             text=(
-                "L'app usa Bluetooth (bridge), Screen Recording (Shot+Ask) e "
-                "Accessibility (shortcut globali/overlay)."
+                "The app uses Bluetooth (bridge), Screen Recording (Shot+Ask) and "
+                "Accessibility (global shortcuts/overlay)."
             ),
             justify=tk.LEFT,
             wraplength=640,
@@ -792,8 +797,8 @@ class DesktopChatApp:
         ctk.CTkLabel(
             dialog,
             text=(
-                "Nota: alcuni prompt macOS compaiono solo una volta. "
-                "Se lo stato resta 'Missing', apri Impostazioni e abilita manualmente."
+                "Note: some macOS prompts appear only once. "
+                "If status stays 'Missing', open Settings and enable manually."
             ),
             justify=tk.LEFT,
             wraplength=640,
@@ -828,10 +833,10 @@ class DesktopChatApp:
             ctk.CTkLabel(row, textvariable=status_var, font=("Avenir", 12)).pack(anchor=tk.W, pady=(0, 4))
             btn_row = ctk.CTkFrame(row, fg_color="transparent")
             btn_row.pack(anchor=tk.W, pady=(0, 2))
-            ctk.CTkButton(btn_row, text="Richiedi", width=96, command=request_cmd).pack(side=tk.LEFT, padx=(0, 8))
+            ctk.CTkButton(btn_row, text="Request", width=96, command=request_cmd).pack(side=tk.LEFT, padx=(0, 8))
             ctk.CTkButton(
                 btn_row,
-                text="Apri Impostazioni",
+                text="Open Settings",
                 width=156,
                 command=open_cmd,
                 fg_color="transparent",
@@ -854,9 +859,9 @@ class DesktopChatApp:
             elif bt_state in {"denied", "restricted"}:
                 bt_state_var.set(f"Bluetooth: {bt_state}")
             elif bt_state == "not_determined":
-                bt_state_var.set("Bluetooth: in attesa autorizzazione")
+                bt_state_var.set("Bluetooth: waiting for authorization")
             else:
-                bt_state_var.set("Bluetooth: verifica manuale (premi Richiedi)")
+                bt_state_var.set("Bluetooth: manual check (press Request)")
 
             return (screen_state is True, access_state is True, bt_ok)
 
@@ -879,28 +884,28 @@ class DesktopChatApp:
 
         section_row(
             "1) Screen Recording",
-            "Necessario per Shot+Ask e screenshot area su macOS.",
+            "Required for Shot+Ask and area screenshot on macOS.",
             screen_state_var,
             request_screen_permission,
             lambda: self._open_macos_privacy_pane("Privacy_ScreenCapture"),
         )
         section_row(
             "2) Accessibility",
-            "Necessario per integrazione shortcut globali e overlay affidabile.",
+            "Required for global shortcut integration and reliable overlay.",
             access_state_var,
             request_access_permission,
             lambda: self._open_macos_privacy_pane("Privacy_Accessibility"),
         )
         section_row(
             "3) Bluetooth",
-            "Necessario per scan e connessione BLE col telefono.",
+            "Required for BLE scan and connection with phone.",
             bt_state_var,
             request_bluetooth_permission,
             lambda: self._open_macos_privacy_pane("Privacy_Bluetooth"),
         )
         ctk.CTkCheckBox(
             panel,
-            text="Ho autorizzato il Bluetooth (se lo stato non è rilevabile automaticamente)",
+            text="I have authorized Bluetooth (if status is not automatically detected)",
             variable=bt_manual_confirm,
             command=refresh_states,
         ).pack(anchor=tk.W, padx=12, pady=(2, 12))
@@ -912,11 +917,11 @@ class DesktopChatApp:
             screen_ok, access_ok, bt_ok = refresh_states()
             if not (screen_ok and access_ok and bt_ok):
                 proceed = messagebox.askyesno(
-                    "Permessi incompleti",
+                    "Incomplete permissions",
                     (
-                        "Alcuni permessi risultano mancanti.\n"
-                        "Se continui ora alcune funzioni (scan BLE/screenshot/shortcut) possono fallire.\n\n"
-                        "Vuoi comunque chiudere il setup?"
+                        "Some permissions are missing.\n"
+                        "If you continue now, some features (BLE scan/screenshot/shortcuts) may fail.\n\n"
+                        "Close setup anyway?"
                     ),
                     parent=dialog,
                 )
@@ -930,18 +935,18 @@ class DesktopChatApp:
                     "permissions_bluetooth_ok": bt_ok,
                 }
             )
-            self._append_log("System", "Setup permessi macOS completato")
+            self._append_log("System", "macOS permissions setup complete")
             dialog.destroy()
             self._permissions_dialog = None
 
         def remind_later() -> None:
-            self._append_log("System", "Setup permessi rimandato")
+            self._append_log("System", "Permissions setup deferred")
             dialog.destroy()
             self._permissions_dialog = None
 
         ctk.CTkButton(
             footer,
-            text="Ricarica stato",
+            text="Refresh status",
             width=120,
             command=refresh_states,
             fg_color="transparent",
@@ -950,14 +955,14 @@ class DesktopChatApp:
         ).pack(side=tk.LEFT)
         ctk.CTkButton(
             footer,
-            text="Ricorda dopo",
+            text="Remind later",
             width=120,
             command=remind_later,
             fg_color="transparent",
             border_width=1,
             hover_color="#2a2a2a",
         ).pack(side=tk.RIGHT, padx=(8, 0))
-        ctk.CTkButton(footer, text="Completa setup", width=140, command=finish_setup).pack(side=tk.RIGHT, padx=(0, 8))
+        ctk.CTkButton(footer, text="Complete setup", width=140, command=finish_setup).pack(side=tk.RIGHT, padx=(0, 8))
 
         dialog.protocol("WM_DELETE_WINDOW", remind_later)
         refresh_states()
@@ -1167,7 +1172,7 @@ class DesktopChatApp:
             pystray.MenuItem("Reconnect", on_reconnect),
             pystray.MenuItem("Quit", on_quit),
         )
-        icon = pystray.Icon("gemini_ble_chat", image, "Gemini BLE Chat", menu)
+        icon = pystray.Icon("device_bridge", image, "Device Bridge", menu)
         self._tray_icon = icon
 
         def run_icon() -> None:
@@ -1199,7 +1204,7 @@ class DesktopChatApp:
                 try:
                     image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
                         "bubble.left.and.bubble.right.fill",
-                        "Gemini BLE Chat",
+                        "Device Bridge",
                     )
                     if image is not None:
                         button.setImage_(image)
@@ -1602,7 +1607,7 @@ class DesktopChatApp:
             return
         if self._active_container_id == cid:
             self._active_container_id = None
-            self._append_log("System", "Container deattivato — contesto PDF disabilitato")
+            self._append_log("System", "Container deactivated — PDF context disabled")
         else:
             self._active_container_id = cid
             c = self._context_store.get(cid)
@@ -1753,14 +1758,14 @@ class DesktopChatApp:
         d.attributes("-topmost", True)
         self._transfer_dialog = d
 
-        ctk.CTkLabel(d, text=f"📡 Caricamento libreria sul telefono", font=("Avenir", 14, "bold")).pack(pady=(18, 4))
+        ctk.CTkLabel(d, text="📡 Uploading library to phone", font=("Avenir", 14, "bold")).pack(pady=(18, 4))
         ctk.CTkLabel(d, text=container_name, font=("Avenir", 12), text_color="#888888").pack()
 
         self._transfer_progress_var = tk.DoubleVar(value=0.0)
         bar = ctk.CTkProgressBar(d, variable=self._transfer_progress_var, width=340, height=14)
         bar.pack(pady=(14, 6))
 
-        self._transfer_label_var = tk.StringVar(value=f"0%  —  0 / ? pacchetti  (~{size_kb} KB)")
+        self._transfer_label_var = tk.StringVar(value=f"0%  —  0 / ? packets  (~{size_kb} KB)")
         ctk.CTkLabel(d, textvariable=self._transfer_label_var, font=("Avenir", 11), text_color="#aaaaaa").pack()
 
     def _update_transfer_dialog(self, percent: int, current: int, total: int) -> None:
@@ -1774,9 +1779,9 @@ class DesktopChatApp:
             eta_str = f"  —  ETA {eta_sec:.0f}s" if eta_sec > 1 else ""
         else:
             eta_str = ""
-        self._transfer_label_var.set(f"{percent}%  —  {current}/{total} pacchetti{eta_str}")
+        self._transfer_label_var.set(f"{percent}%  —  {current}/{total} packets{eta_str}")
         if percent >= 100:
-            self._transfer_label_var.set("100%  —  pacchetti inviati, attendo conferma telefono…")
+            self._transfer_label_var.set("100%  —  packets sent, waiting for phone confirmation…")
 
     def _close_transfer_dialog(self, success: bool = True) -> None:
         d = self._transfer_dialog
@@ -2186,7 +2191,7 @@ class DesktopChatApp:
                         elif "not authorized" in lowered or "permission" in lowered:
                             self._append_log(
                                 "Error",
-                                "Screenshot blocked: abilita Screen Recording per BluetoothGeminiChat in macOS Settings.",
+                                "Screenshot blocked: enable Screen Recording for this app in macOS Settings.",
                             )
                         else:
                             detail = stderr if stderr else f"exit code {result.returncode}"
@@ -2195,7 +2200,7 @@ class DesktopChatApp:
                     return None
                 if not Path(path).exists() or Path(path).stat().st_size <= 0:
                     if log_errors:
-                        self._append_log("Error", "Screenshot non disponibile: nessun file creato.")
+                        self._append_log("Error", "Screenshot unavailable: no file was created.")
                     Path(path).unlink(missing_ok=True)
                     return None
                 return path
@@ -2254,7 +2259,7 @@ class DesktopChatApp:
         if role_key == "thought":
             is_streaming = clean.endswith("▌")
             word_count = len(clean.split())
-            btn_text = f"[-] Thinking... ({word_count} w)" if is_streaming else f"[+] Mostra Ragionamento ({word_count} parole)"
+            btn_text = f"[-] Thinking... ({word_count} w)" if is_streaming else f"[+] Show reasoning ({word_count} words)"
             
             tag_name = f"thought_block_{self._md_link_seq}"
             btn_tag = f"thought_btn_{self._md_link_seq}"
@@ -2414,6 +2419,8 @@ class DesktopChatApp:
             return
 
         idx = selected[0]
+        if not (0 <= idx < len(self.devices)):
+            return
         device = self.devices[idx]
         self.client.connect(device["address"])
 
@@ -2437,7 +2444,7 @@ class DesktopChatApp:
             self._append_log("System", f"Recovered active chat for {source}")
             return recovered_id
 
-        session_id = self.sessions_store.create_session("Nuova chat")
+        session_id = self.sessions_store.create_session("New chat")
         self.active_session_id = session_id
         self._refresh_sessions_list(session_id)
         self._render_active_chat()
@@ -2446,7 +2453,7 @@ class DesktopChatApp:
         return session_id
 
     def on_new_chat(self) -> None:
-        session_id = self.sessions_store.create_session("Nuova chat")
+        session_id = self.sessions_store.create_session("New chat")
         self.active_session_id = session_id
         self._refresh_sessions_list(session_id)
         self._render_active_chat()
@@ -2456,8 +2463,8 @@ class DesktopChatApp:
     def on_rename_chat(self) -> None:
         sessions = self.sessions_store.list_sessions()
         current = next((s for s in sessions if s["id"] == self.active_session_id), None)
-        default_title = str(current["title"]) if current else "Nuova chat"
-        title = simpledialog.askstring("Rename chat", "Nuovo titolo:", initialvalue=default_title, parent=self.root)
+        default_title = str(current["title"]) if current else "New chat"
+        title = simpledialog.askstring("Rename chat", "New title:", initialvalue=default_title, parent=self.root)
         if title is None:
             return
         self.sessions_store.rename_session(self.active_session_id, title)
@@ -2557,7 +2564,7 @@ class DesktopChatApp:
         fail_text: str = "Invio richiesta fallito",
     ) -> bool:
         if not self.connected:
-            self._show_overlay_message("Bridge non connesso", ttl_ms=3500)
+            self._show_overlay_message("Bridge not connected", ttl_ms=3500)
             if image_path:
                 try:
                     Path(image_path).unlink(missing_ok=True)
@@ -2624,30 +2631,30 @@ class DesktopChatApp:
 
     def on_hotkey_overlay_triggered(self, prompt_override: str | None = None) -> None:
         if not self.connected:
-            self._show_overlay_message("Bridge non connesso", ttl_ms=3500)
+            self._show_overlay_message("Bridge not connected", ttl_ms=3500)
             return
 
         path = self._capture_area_screenshot_path(log_errors=False)
         if path is None:
-            self._show_overlay_message("Screenshot annullato", ttl_ms=2500)
+            self._show_overlay_message("Screenshot canceled", ttl_ms=2500)
             return
 
         prompt = (
             prompt_override.strip()
             if prompt_override and prompt_override.strip()
-            else "Analizza rapidamente questo screenshot. Rispondi in italiano con massimo 5 righe."
+            else "Quickly analyze this screenshot. Reply in at most 5 lines."
         )
         self._send_overlay_request(
             prompt=prompt,
             source="Shot+Ask",
-            status_text="Analisi screenshot in corso...",
+            status_text="Analyzing screenshot...",
             image_path=path,
-            fail_text="Invio screenshot fallito",
+            fail_text="Screenshot send failed",
         )
 
     def on_hotkey_clipboard_triggered(self, prompt_override: str | None = None) -> None:
         if not self.connected:
-            self._show_overlay_message("Bridge non connesso", ttl_ms=3500)
+            self._show_overlay_message("Bridge not connected", ttl_ms=3500)
             return
 
         override = prompt_override.strip() if prompt_override else ""
@@ -2662,35 +2669,35 @@ class DesktopChatApp:
                 prompt = f"{override}\n\nClipboard:\n{clip_text}"
             else:
                 prompt = (
-                    "Analizza rapidamente questo testo copiato negli appunti. "
-                    "Rispondi in italiano con massimo 5 righe.\n\n"
+                    "Quickly analyze this clipboard text. "
+                    "Reply in at most 5 lines.\n\n"
                     f"{clip_text}"
                 )
             self._send_overlay_request(
                 prompt=prompt,
                 source="Clip+Ask",
-                status_text="Analisi clipboard in corso...",
+                status_text="Analyzing clipboard...",
                 image_path=None,
-                fail_text="Invio clipboard fallito",
+                fail_text="Clipboard send failed",
             )
             return
 
         path = self._capture_clipboard_image_path(log_errors=False)
         if path is None:
-            self._show_overlay_message("Clipboard vuota o formato non supportato", ttl_ms=3200)
+            self._show_overlay_message("Clipboard empty or unsupported format", ttl_ms=3200)
             return
 
         prompt = (
             override
             if override
-            else "Analizza rapidamente questa immagine dagli appunti. Rispondi in italiano con massimo 5 righe."
+            else "Quickly analyze this clipboard image. Reply in at most 5 lines."
         )
         self._send_overlay_request(
             prompt=prompt,
             source="Clip+Ask",
-            status_text="Analisi clipboard in corso...",
+            status_text="Analyzing clipboard image...",
             image_path=path,
-            fail_text="Invio clipboard fallito",
+            fail_text="Clipboard send failed",
         )
 
     def on_clipboard_send(self) -> None:
@@ -3040,7 +3047,7 @@ class DesktopChatApp:
         except ValueError as exc:
             self._append_log("Error", str(exc))
             from tkinter import messagebox
-            messagebox.showerror("Errore di Invio", str(exc), parent=self.root)
+            messagebox.showerror("Send Error", str(exc), parent=self.root)
             return
 
         self._streaming_preview_by_session.pop(session_id, None)
@@ -3116,11 +3123,12 @@ class DesktopChatApp:
                 text = pyperclip.paste().strip()
                 if text:
                     self.events.put({"type": "force_visibility"})
-                    self.events.put({"type": "quick_send", "text": f"Analizza e rispondi a questo testo copiato negli appunti:\n\n{text}"})
+                    self.events.put({"type": "quick_send", "text": f"Analyze and reply to this clipboard text:\n\n{text}"})
         except OSError:
             pass
 
     def _poll_events(self) -> None:
+        self._poll_scheduled = False
         self._consume_quick_inbox()
         self._consume_toggle_flag()
         self._consume_clipboard_flag()
@@ -3134,7 +3142,9 @@ class DesktopChatApp:
                 break
             self._handle_event(event)
 
-        self.root.after(100, self._poll_events)
+        if not self._poll_scheduled:
+            self._poll_scheduled = True
+            self.root.after(100, self._poll_events)
 
     def _handle_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
@@ -3188,7 +3198,7 @@ class DesktopChatApp:
         if event_type == "error":
             message = event.get("text", "Unknown error")
             if self._overlay_request_ids and isinstance(message, str) and message:
-                self._show_overlay_message(f"Errore bridge: {message}", ttl_ms=8000)
+                self._show_overlay_message(f"Bridge error: {message}", ttl_ms=8000)
                 self._cleanup_all_overlay_requests()
             self._clear_all_pending_requests()
             self._append_log("Error", message)
@@ -3207,11 +3217,11 @@ class DesktopChatApp:
                 self.devices_list.selection_clear(0, tk.END)
                 self.devices_list.selection_set(selected_idx)
             if self.devices:
-                self._append_log("System", f"Found {len(self.devices)} Gemini bridge device(s)")
+                self._append_log("System", f"Found {len(self.devices)} device(s)")
             else:
                 self._append_log(
                     "System",
-                    "No Gemini bridge found. Keep Android bridge service active and retry Scan.",
+                    "No device found. Keep the bridge service active and retry Scan.",
                 )
             return
 
@@ -3262,11 +3272,11 @@ class DesktopChatApp:
             request_id = event.get("request_id", "")
             if isinstance(percent, int) and isinstance(current, int) and isinstance(total, int):
                 # Update status bar always
-                self.status_var.set(f"📡 Invio... {percent}% ({current}/{total} pacchetti)")
+                self.status_var.set(f"📡 Sending... {percent}% ({current}/{total} packets)")
                 if request_id and request_id in self._overlay_request_ids:
                     self._overlay_last_update_at[request_id] = time.monotonic()
                     self._show_overlay_message(
-                        f"Invio screenshot... {percent}% ({current}/{total})",
+                        f"Sending screenshot... {percent}% ({current}/{total})",
                         ttl_ms=0,
                     )
                 # Update dedicated progress dialog if this is a container transfer
@@ -3304,7 +3314,7 @@ class DesktopChatApp:
                 if message_type == "error":
                     error_text = str(message.get("error", "Unknown error")).strip()
                     if error_text:
-                        self._show_overlay_message(f"Errore: {error_text}", ttl_ms=8000)
+                        self._show_overlay_message(f"Error: {error_text}", ttl_ms=8000)
                     self._cleanup_overlay_request(message_id)
                     return
                 if message_type == "status":

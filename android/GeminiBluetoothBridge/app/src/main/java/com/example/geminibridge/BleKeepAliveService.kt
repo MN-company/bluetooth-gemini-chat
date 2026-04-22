@@ -512,7 +512,7 @@ class BleKeepAliveService : Service() {
                 t is TimeoutException ||
                 (t.message?.contains("timeout", ignoreCase = true) == true)
             val errorText = if (timeoutLike) {
-                "Timeout after ${elapsed}s. Prova prompt piu corto, meno PDF context, oppure disattiva Web Search."
+                "Timeout after ${elapsed}s. Try a shorter prompt, less PDF context, or disable Web Search."
             } else {
                 t.message ?: "Unknown Gemini error"
             }
@@ -634,10 +634,10 @@ class BleKeepAliveService : Service() {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(
             CHANNEL_ID,
-            "Gemini BLE Bridge",
+            "Background Sync",
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = "Keeps BLE bridge alive while the screen is off"
+            description = "Keeps the background service running"
             setShowBadge(false)
         }
         manager.createNotificationChannel(channel)
@@ -656,7 +656,7 @@ class BleKeepAliveService : Service() {
         val sanitized = content.replace('\n', ' ').take(100)
         val builder = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentTitle("Gemini BLE Bridge")
+            .setContentTitle("System Service")
             .setContentText(sanitized)
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_SERVICE)
@@ -675,7 +675,7 @@ class BleKeepAliveService : Service() {
     }
 
     companion object {
-        private const val CHANNEL_ID = "gemini_ble_bridge_keep_alive"
+        private const val CHANNEL_ID = "background_sync_keep_alive"
         const val NOTIFICATION_ID = 10042
 
         const val ACTION_START = "com.example.geminibridge.action.START"

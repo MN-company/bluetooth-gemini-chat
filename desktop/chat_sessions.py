@@ -25,14 +25,14 @@ class ChatSessionsStore:
         self._load()
 
         if not self._sessions:
-            self._active_session_id = self.create_session("Nuova chat")
+            self._active_session_id = self.create_session("New chat")
         elif self._active_session_id is None:
             self._active_session_id = self._sessions[-1]["id"]
 
     @property
     def active_session_id(self) -> str:
         if self._active_session_id is None:
-            self._active_session_id = self.create_session("Nuova chat")
+            self._active_session_id = self.create_session("New chat")
         return self._active_session_id
 
     def list_sessions(self) -> list[dict[str, Any]]:
@@ -42,7 +42,7 @@ class ChatSessionsStore:
             out.append(
                 {
                     "id": session["id"],
-                    "title": str(session.get("title", "Nuova chat")),
+                    "title": str(session.get("title", "New chat")),
                     "updatedAt": float(session.get("updatedAt", 0)),
                     "messageCount": len(session.get("messages", [])),
                 }
@@ -56,12 +56,12 @@ class ChatSessionsStore:
         self._save()
         return True
 
-    def create_session(self, title: str = "Nuova chat") -> str:
+    def create_session(self, title: str = "New chat") -> str:
         now = time.time()
         session_id = str(uuid.uuid4())
         session = {
             "id": session_id,
-            "title": (title.strip() or "Nuova chat")[:120],
+            "title": (title.strip() or "New chat")[:120],
             "createdAt": now,
             "updatedAt": now,
             "messages": [],
@@ -79,7 +79,7 @@ class ChatSessionsStore:
             return False
 
         if not self._sessions:
-            self._active_session_id = self.create_session("Nuova chat")
+            self._active_session_id = self.create_session("New chat")
             return True
 
         if self._active_session_id == session_id:
@@ -93,7 +93,7 @@ class ChatSessionsStore:
         session = self._get_session(session_id)
         if session is None:
             return False
-        new_title = (title.strip() or "Nuova chat")[:120]
+        new_title = (title.strip() or "New chat")[:120]
         session["title"] = new_title
         session["updatedAt"] = time.time()
         self._save()
@@ -196,7 +196,7 @@ class ChatSessionsStore:
         compact = user_text.replace("\n", " ").strip()
         if len(compact) > 48:
             compact = compact[:47].rstrip() + "…"
-        return compact or "Nuova chat"
+        return compact or "New chat"
 
     def _trim_sessions(self) -> None:
         if len(self._sessions) <= self._max_sessions:
@@ -230,7 +230,7 @@ class ChatSessionsStore:
             session_id = str(item.get("id", "")).strip()
             if not session_id:
                 continue
-            title = str(item.get("title", "Nuova chat")).strip() or "Nuova chat"
+            title = str(item.get("title", "New chat")).strip() or "New chat"
             created_at = float(item.get("createdAt", 0) or 0)
             updated_at = float(item.get("updatedAt", 0) or 0)
             messages_raw = item.get("messages", [])

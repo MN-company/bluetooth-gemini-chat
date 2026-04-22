@@ -12,6 +12,31 @@ HEADER_SIZE = HEADER_STRUCT.size
 DEFAULT_MAX_PACKET_SIZE = 20
 ASSEMBLY_TIMEOUT_SECONDS = 300.0
 
+# Protocol v2: compact binary ping/pong frames (6 bytes each, 90% smaller)
+# Format: [0x01 or 0x02][timestamp_ms:4][status:1]
+PROTO2_PING_TYPE = 0x01
+PROTO2_PONG_TYPE = 0x02
+PROTO2_PING_STRUCT = struct.Struct(">BIB")  # type(1) + ts_ms(4) + status(1) = 6 bytes
+PROTO2_MAGIC = b"\xfe\xfd"  # 2-byte prefix to distinguish v2 binary frames from v1
+
+BINARY_PING_SIZE = 2 + PROTO2_PING_STRUCT.size  # magic(2) + payload(6) = 8 bytes
+
+
+def encode_binary_ping(ts_ms: int) -> bytes:
+    return PROTO2_MAGIC + PROTO2_PING_STRUCT.pack(PROTO2_PING_TYPE, ts_ms & 0xFFFFFFFF, 0)
+
+
+def encode_binary_pong(ts_ms: int) -> bytes:
+    return PROTO2_MAGIC + PROTO2_PING_STRUCT.pack(PROTO2_PONG_TYPE, ts_ms & 0xFFFFFFFF, 0)
+
+
+def decode_binary_frame(data: bytes) -> Optional[tuple[int, int]]:
+    """Return (frame_type, ts_ms) if data is a valid v2 binary frame, else None."""
+    if len(data) < BINARY_PING_SIZE or data[:2] != PROTO2_MAGIC:
+        return None
+    frame_type, ts_ms, _ = PROTO2_PING_STRUCT.unpack(data[2:2 + PROTO2_PING_STRUCT.size])
+    return (frame_type, ts_ms)
+
 
 @dataclass
 class Frame:

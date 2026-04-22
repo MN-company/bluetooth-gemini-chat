@@ -281,9 +281,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
                 if (hasUpdate) {
-                    BridgeRuntimeState.appendLog("Update disponibile: ${release.tag}")
+                    BridgeRuntimeState.appendLog("Update available: ${release.tag}")
                 } else if (!silent) {
-                    BridgeRuntimeState.appendLog("App aggiornata ($APP_VERSION_NAME)")
+                    BridgeRuntimeState.appendLog("App up to date ($APP_VERSION_NAME)")
                 }
             }.onFailure { err ->
                 _uiState.update {

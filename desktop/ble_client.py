@@ -18,7 +18,11 @@ from typing import Any, Callable
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
-from ble_protocol import DEFAULT_MAX_PACKET_SIZE, FrameAssembler, FrameCodec, TransportIdGenerator
+from ble_protocol import (
+    DEFAULT_MAX_PACKET_SIZE, FrameAssembler, FrameCodec, TransportIdGenerator,
+    PROTO2_PING_TYPE, PROTO2_PONG_TYPE,
+    encode_binary_ping, decode_binary_frame,
+)
 
 try:
     from PIL import Image, ImageOps, UnidentifiedImageError
@@ -35,8 +39,8 @@ MAX_IMAGE_BYTES = 140 * 1024
 TARGET_IMAGE_BYTES = 56 * 1024
 MAX_IMAGE_DIMENSION = 768
 MAX_REQUEST_BYTES = 220 * 1024
-PING_INTERVAL_SECONDS = 7.0
-PING_TIMEOUT_SECONDS = 20.0
+PING_INTERVAL_SECONDS = 30.0
+PING_TIMEOUT_SECONDS = 90.0
 RECONNECT_BASE_SECONDS = 1.5
 RECONNECT_MAX_SECONDS = 8.0
 
@@ -255,7 +259,7 @@ class BleChatClient:
 
                     payload.append(
                         {
-                            "name": device.name or adv_data.local_name or "Gemini Bridge",
+                            "name": device.name or adv_data.local_name or "Device",
                             "address": device.address,
                         }
                     )
@@ -275,7 +279,7 @@ class BleChatClient:
                 self._emit(
                     {
                         "type": "status",
-                        "text": "No Gemini bridge found. Keep Android bridge service active and retry Scan.",
+                        "text": "No device found. Keep the bridge service active and retry Scan.",
                     }
                 )
         except Exception as exc:
@@ -380,14 +384,23 @@ class BleChatClient:
                 return
 
             ping_id = str(uuid.uuid4())
-            self._pending_pings[ping_id] = time.monotonic()
-            ping_message = {
-                "type": "ping",
-                "messageId": ping_id,
-                "clientTsMs": int(time.time() * 1000),
-            }
-            payload = json.dumps(ping_message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-            await self._send_payload(payload, ping_id, emit_sent_event=False)
+            sent_at = time.monotonic()
+            self._pending_pings[ping_id] = sent_at
+            # Send compact binary ping (8 bytes) instead of JSON (~55 bytes)
+            binary_ping = encode_binary_ping(int(time.time() * 1000))
+            try:
+                client = self._client
+                if client is not None and client.is_connected:
+                    await client.write_gatt_char(WRITE_CHAR_UUID, binary_ping, response=False)
+            except Exception:
+                # Fall back to JSON ping if binary write fails
+                ping_message = {
+                    "type": "ping",
+                    "messageId": ping_id,
+                    "clientTsMs": int(time.time() * 1000),
+                }
+                payload = json.dumps(ping_message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                await self._send_payload(payload, ping_id, emit_sent_event=False)
 
             # Keep map bounded even if notifications are lost.
             if len(self._pending_pings) > 30:
@@ -570,8 +583,29 @@ class BleChatClient:
             return None
 
     def _on_notification(self, _: Any, data: bytearray) -> None:
+        raw = bytes(data)
+
+        # Handle compact binary pong (8 bytes) — sent by Android when it receives a binary ping
+        binary_frame = decode_binary_frame(raw)
+        if binary_frame is not None:
+            frame_type, _ts_ms = binary_frame
+            if frame_type == PROTO2_PONG_TYPE:
+                self._last_pong_monotonic = time.monotonic()
+                # Binary pong has no messageId; credit the oldest pending ping
+                if self._pending_pings:
+                    oldest_key = next(iter(self._pending_pings))
+                    sent_at = self._pending_pings.pop(oldest_key, None)
+                    rtt_ms = int((time.monotonic() - sent_at) * 1000) if sent_at is not None else None
+                    event: dict[str, Any] = {"type": "link_quality"}
+                    if rtt_ms is not None:
+                        event["rtt_ms"] = rtt_ms
+                    self._emit(event)
+                else:
+                    self._emit({"type": "link_quality"})
+            return
+
         try:
-            complete_payload = self._assembler.add_packet(bytes(data))
+            complete_payload = self._assembler.add_packet(raw)
         except Exception as exc:
             self._emit({"type": "error", "text": f"Invalid packet from phone: {exc}"})
             return

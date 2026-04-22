@@ -122,7 +122,7 @@ class MainActivity : ComponentActivity() {
 
 private enum class Tab(val label: String, val icon: ImageVector) {
     SETTINGS("Settings", Icons.Default.Settings),
-    CONTAINERS("Libreria", Icons.Default.List),
+    CONTAINERS("Library", Icons.Default.List),
     LOGS("Logs", Icons.Default.Info),
 }
 
@@ -174,8 +174,8 @@ private fun BridgeScreen(
         }
         if (!batteryExempt) {
             BannerButton(
-                text = "Ottimizzazione batteria attiva (potrebbe bloccare BLE)",
-                actionLabel = "Disabilita",
+                text = "Battery optimization active (may block BLE)",
+                actionLabel = "Disable",
                 color = Color(0xFFF5A623),
             ) { onRequestDisableBatteryOptimization(batteryLauncher) }
         }
@@ -225,7 +225,7 @@ private fun StatusHeader(uiState: UiState) {
             Spacer(Modifier.width(10.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "Gemini Bridge",
+                    text = "Device Hub",
                     fontSize = 17.sp, fontWeight = FontWeight.SemiBold,
                     color = TextPrim,
                 )
@@ -309,11 +309,11 @@ private fun SettingsTab(
         item {
             AppCard {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    SectionTitle("API & Modello")
+                    SectionTitle("API & Model")
                     OutlinedTextField(
                         value = apiKey, onValueChange = onApiKeyChange,
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("Gemini API Key") },
+                        label = { Text("API Key") },
                         visualTransformation = PasswordVisualTransformation(),
                         singleLine = true,
                         colors = outlinedColors(),
@@ -339,7 +339,7 @@ private fun SettingsTab(
 
         if (uiState.modelsLoading) {
             item {
-                Text("Caricamento modelli…", fontSize = 12.sp, color = TextSec)
+                Text("Loading models…", fontSize = 12.sp, color = TextSec)
             }
         } else if (uiState.modelsError.isNotBlank()) {
             item {
@@ -429,7 +429,7 @@ private fun ContainersTab() {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("📚", fontSize = 48.sp)
                 Spacer(Modifier.height(12.dp))
-                Text("Nessuna libreria caricata", color = TextSec, fontSize = 14.sp)
+                Text("No library loaded", color = TextSec, fontSize = 14.sp)
                 Spacer(Modifier.height(6.dp))
                 Text("Carica un container dal Mac", color = TextSec, fontSize = 12.sp)
             }
@@ -465,7 +465,7 @@ private fun ContainersTab() {
                         Text("${container.chunks.size} chunk", color = TextSec, fontSize = 12.sp)
                     }
                     if (isActive) {
-                        Icon(Icons.Default.Check, contentDescription = "Attivo", tint = AccentGrn, modifier = Modifier.size(20.dp))
+                        Icon(Icons.Default.Check, contentDescription = "Active", tint = AccentGrn, modifier = Modifier.size(20.dp))
                     }
                 }
             }

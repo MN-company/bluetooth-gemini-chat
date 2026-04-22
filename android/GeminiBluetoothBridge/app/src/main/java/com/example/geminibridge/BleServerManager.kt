@@ -139,6 +139,13 @@ class BleServerManager(
         ) {
             try {
                 if (characteristic.uuid == BleConstants.writeCharUuid) {
+                    // Handle compact binary ping (8 bytes) — respond immediately with binary pong
+                    if (BleConstants.isBinaryFrame(value) && BleConstants.parseBinaryFrameType(value) == BleConstants.binaryPingType) {
+                        val pong = BleConstants.buildBinaryPong(System.currentTimeMillis())
+                        scope.launch { sendRawBytes(pong, device.address) }
+                        if (responseNeeded) gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+                        return
+                    }
                     val frame = BleFrameCodec.decodeFrame(value)
                     if (frame == null) {
                         onLog("Received invalid BLE frame")
@@ -323,6 +330,17 @@ class BleServerManager(
                 }
             }
         }
+    }
+
+    suspend fun sendRawBytes(rawPacket: ByteArray, targetAddress: String? = null) {
+        val device = if (!targetAddress.isNullOrBlank()) {
+            connectedDevices[targetAddress]
+        } else {
+            val active = lastActiveDeviceAddress?.let { connectedDevices[it] }
+            active ?: connectedDevices.values.firstOrNull()
+        } ?: return
+        val sendLock = sendMutexByDevice.getOrPut(device.address) { Mutex() }
+        sendLock.withLock { notifyPacket(device, rawPacket) }
     }
 
     private fun startAdvertisingInternal(advertiser: BluetoothLeAdvertiser): Result<Unit> {
