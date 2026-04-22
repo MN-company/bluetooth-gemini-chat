@@ -1,16 +1,33 @@
-name: Build Desktop Clients
+name: Build And Publish Clients
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Optional release tag to upload assets to, for example v0.2.3
+        required: false
+        type: string
   push:
     branches: [ main ]
+    tags:
+      - "v*"
     paths:
-      - 'desktop/**'
-      - '.github/workflows/build-desktop.yml'
-      - 'scripts/build_desktop_bundle.sh'
+      - "desktop/**"
+      - "android/**"
+      - ".github/workflows/build-desktop.yml"
+      - "scripts/build_desktop_bundle.sh"
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: BluetoothGeminiChat
 
 jobs:
-  build:
+  desktop:
+    name: Desktop ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -24,7 +41,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         shell: bash
@@ -33,7 +50,6 @@ jobs:
           python -m pip install -r desktop/requirements.txt pyinstaller
 
       - name: Read app version
-        if: runner.os == 'macOS'
         shell: bash
         run: |
           APP_VERSION=$(python - <<'PY'
@@ -53,7 +69,7 @@ jobs:
             --noconfirm \
             --clean \
             --windowed \
-            --name BluetoothGeminiChat \
+            --name "$APP_NAME" \
             --osx-bundle-identifier com.mncompany.bluetoothgeminichat \
             --paths desktop \
             --collect-submodules bleak \
@@ -67,7 +83,7 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          INFO_PLIST="dist/BluetoothGeminiChat.app/Contents/Info.plist"
+          INFO_PLIST="dist/$APP_NAME.app/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$INFO_PLIST" >/dev/null 2>&1 \
             || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $APP_VERSION" "$INFO_PLIST"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_VERSION" "$INFO_PLIST" >/dev/null 2>&1 \
@@ -81,7 +97,7 @@ jobs:
             --noconfirm \
             --clean \
             --windowed \
-            --name BluetoothGeminiChat \
+            --name "$APP_NAME" \
             --paths desktop \
             --collect-submodules bleak \
             --collect-submodules pystray \
@@ -95,7 +111,7 @@ jobs:
             --noconfirm \
             --clean \
             --windowed \
-            --name BluetoothGeminiChat \
+            --name "$APP_NAME" \
             --paths desktop \
             --collect-submodules bleak \
             --collect-submodules pystray \
@@ -106,28 +122,28 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/dmg-root
-          cp -R dist/BluetoothGeminiChat.app dist/dmg-root/
+          cp -R "dist/$APP_NAME.app" dist/dmg-root/
           ln -s /Applications dist/dmg-root/Applications
           hdiutil create \
-            -volname "BluetoothGeminiChat" \
+            -volname "$APP_NAME" \
             -srcfolder dist/dmg-root \
             -ov \
             -format UDZO \
-            dist/BluetoothGeminiChat-macos.dmg
+            "dist/${APP_NAME}-macos.dmg"
 
       - name: Package artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path dist/BluetoothGeminiChat/* -DestinationPath dist/BluetoothGeminiChat-windows.zip
+          Compress-Archive -Path "dist/$env:APP_NAME/*" -DestinationPath "dist/${env:APP_NAME}-windows.zip"
 
       - name: Package artifact (Linux)
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          tar -C dist -czf dist/BluetoothGeminiChat-linux.tar.gz BluetoothGeminiChat
+          tar -C dist -czf "dist/${APP_NAME}-linux.tar.gz" "$APP_NAME"
 
-      - name: Upload artifact
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ runner.os }}
@@ -135,3 +151,85 @@ jobs:
             dist/BluetoothGeminiChat-macos.dmg
             dist/BluetoothGeminiChat-windows.zip
             dist/BluetoothGeminiChat-linux.tar.gz
+
+      - name: Upload asset to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release' || inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          elif [ -n "${{ inputs.release_tag }}" ]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+
+          case "${{ runner.os }}" in
+            macOS) ASSET="dist/${APP_NAME}-macos.dmg" ;;
+            Windows) ASSET="dist/${APP_NAME}-windows.zip" ;;
+            Linux) ASSET="dist/${APP_NAME}-linux.tar.gz" ;;
+          esac
+
+          gh release upload "$TAG" "$ASSET" --clobber
+
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Create local.properties
+        shell: bash
+        run: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > android/GeminiBluetoothBridge/local.properties
+
+      - name: Build debug APK
+        shell: bash
+        working-directory: android/GeminiBluetoothBridge
+        run: |
+          gradle assembleDebug
+
+      - name: Rename APK
+        shell: bash
+        run: |
+          cp \
+            android/GeminiBluetoothBridge/app/build/outputs/apk/debug/app-debug.apk \
+            dist-app-debug.apk
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist-app-debug.apk
+
+      - name: Upload APK to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release' || inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          elif [ -n "${{ inputs.release_tag }}" ]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+
+          gh release upload "$TAG" dist-app-debug.apk#app-debug.apk --clobber
