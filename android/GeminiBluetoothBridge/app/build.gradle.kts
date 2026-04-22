@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.geminibridge"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.1.5"
+        versionCode = 3
+        versionName = "0.2.0"
     }
 
     buildTypes {
@@ -57,6 +57,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
+    testImplementation("junit:junit:4.13.2")
 
     debugImplementation("androidx.compose.ui:ui-tooling:1.7.6")
 }

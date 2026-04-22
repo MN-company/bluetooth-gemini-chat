@@ -21,6 +21,10 @@ PROTO2_MAGIC = b"\xfe\xfd"  # 2-byte prefix to distinguish v2 binary frames from
 
 BINARY_PING_SIZE = 2 + PROTO2_PING_STRUCT.size  # magic(2) + payload(6) = 8 bytes
 
+PROMPT_BUNDLE_MAGIC = b"bgp2"
+PROMPT_BUNDLE_HEADER_STRUCT = struct.Struct(">4sBII")
+PROMPT_BUNDLE_FLAGS_GZIP_METADATA = 0x01
+
 
 def encode_binary_ping(ts_ms: int) -> bytes:
     return PROTO2_MAGIC + PROTO2_PING_STRUCT.pack(PROTO2_PING_TYPE, ts_ms & 0xFFFFFFFF, 0)
@@ -36,6 +40,55 @@ def decode_binary_frame(data: bytes) -> Optional[tuple[int, int]]:
         return None
     frame_type, ts_ms, _ = PROTO2_PING_STRUCT.unpack(data[2:2 + PROTO2_PING_STRUCT.size])
     return (frame_type, ts_ms)
+
+
+def encode_prompt_bundle(
+    metadata: bytes,
+    image_bytes: bytes = b"",
+    *,
+    gzip_metadata: bool = False,
+) -> bytes:
+    flags = 0
+    if gzip_metadata:
+        import gzip
+
+        metadata = gzip.compress(metadata, compresslevel=6)
+        flags |= PROMPT_BUNDLE_FLAGS_GZIP_METADATA
+
+    header = PROMPT_BUNDLE_HEADER_STRUCT.pack(
+        PROMPT_BUNDLE_MAGIC,
+        flags,
+        len(metadata),
+        len(image_bytes),
+    )
+    return header + metadata + image_bytes
+
+
+def decode_prompt_bundle(data: bytes) -> Optional[tuple[bytes, bytes]]:
+    if len(data) < PROMPT_BUNDLE_HEADER_STRUCT.size:
+        return None
+
+    magic, flags, metadata_len, image_len = PROMPT_BUNDLE_HEADER_STRUCT.unpack(
+        data[:PROMPT_BUNDLE_HEADER_STRUCT.size]
+    )
+    if magic != PROMPT_BUNDLE_MAGIC:
+        return None
+
+    expected_size = PROMPT_BUNDLE_HEADER_STRUCT.size + metadata_len + image_len
+    if len(data) != expected_size:
+        raise ValueError("prompt bundle size mismatch")
+
+    metadata_start = PROMPT_BUNDLE_HEADER_STRUCT.size
+    metadata_end = metadata_start + metadata_len
+    metadata = data[metadata_start:metadata_end]
+    image_bytes = data[metadata_end:]
+
+    if flags & PROMPT_BUNDLE_FLAGS_GZIP_METADATA:
+        import gzip
+
+        metadata = gzip.decompress(metadata)
+
+    return metadata, image_bytes
 
 
 @dataclass

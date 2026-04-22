@@ -134,7 +134,7 @@ MODEL_PRESETS = [
     "gemini-2.0-pro-exp",
 ]
 
-APP_VERSION = "0.1.9"
+APP_VERSION = "0.2.0"
 GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
 
 
@@ -205,6 +205,7 @@ class DesktopChatApp:
         self._pip_mode_active = False
         self._pre_pip_geometry = ""
         self._is_macos = platform.system().lower() == "darwin"
+        self._is_windows = platform.system().lower().startswith("windows")
         self._overlay_listener: Any | None = None
         self._overlay_hotkey = "Apple Shortcut (Cmd+Shift+G)" if self._is_macos else "Ctrl+Shift+G"
         self._overlay_request_ids: set[str] = set()
@@ -230,13 +231,21 @@ class DesktopChatApp:
         self._auto_connect_on_start = bool(_saved.get("auto_connect_on_start", True))
         self._auto_retry_known_device = bool(_saved.get("auto_retry_known_device", True))
         self._auto_check_updates = bool(_saved.get("auto_check_updates", True))
-        self._close_to_background_on_close = bool(_saved.get("close_to_background_on_close", self._is_macos))
-        self._menu_bar_mode_enabled = bool(_saved.get("menu_bar_mode_enabled", self._is_macos))
+        self._close_to_background_on_close = bool(_saved.get("close_to_background_on_close", self._is_macos or self._is_windows))
+        self._menu_bar_mode_enabled = bool(_saved.get("menu_bar_mode_enabled", self._is_macos or self._is_windows))
         self._hide_dock_icon_enabled = bool(_saved.get("hide_dock_icon_enabled", self._is_macos))
+        self._default_model = str(_saved.get("default_model", MODEL_PRESETS[0])).strip() or MODEL_PRESETS[0]
+        if self._default_model not in MODEL_PRESETS:
+            self._default_model = MODEL_PRESETS[0]
         self._overlay_bg_color = self._normalize_hex_color(_saved.get("overlay_bg_color"), "#0f172a")
         self._overlay_width = self._parse_int_setting(_saved.get("overlay_width"), 460, 320, 1280)
         self._overlay_height = self._parse_int_setting(_saved.get("overlay_height"), 220, 160, 900)
         self._overlay_resizable = bool(_saved.get("overlay_resizable", True))
+        self._overlay_font_size = self._parse_int_setting(_saved.get("overlay_font_size"), 16, 11, 28)
+        self._overlay_text_color = self._normalize_hex_color(_saved.get("overlay_text_color"), "#f8fafc")
+        self._overlay_theme = str(_saved.get("overlay_theme", "midnight")).strip() or "midnight"
+        self._overlay_auto_dismiss_ms = self._parse_int_setting(_saved.get("overlay_auto_dismiss_ms"), 20000, 3000, 60000)
+        self._overlay_streaming_enabled = bool(_saved.get("overlay_streaming_enabled", True))
         self._tray_icon: Any | None = None
         self._tray_thread: threading.Thread | None = None
         self._mac_status_item: Any | None = None
@@ -310,13 +319,13 @@ class DesktopChatApp:
         header_left = ctk.CTkFrame(self.header_frame, fg_color="transparent")
         header_left.grid(row=0, column=0, sticky="w")
         
-        self.model_var = tk.StringVar(value=MODEL_PRESETS[0])
+        self.model_var = tk.StringVar(value=self._default_model)
         self.model_combo = ctk.CTkComboBox(
             header_left,
             variable=self.model_var,
             values=MODEL_PRESETS,
             state="readonly",
-            command=lambda _: self._refresh_context_preview(),
+            command=lambda value: self._set_active_model(value, persist=True),
             width=160
         )
         self.model_combo.pack(side=tk.LEFT, padx=(0, 10))
@@ -618,6 +627,30 @@ class DesktopChatApp:
         current = self._load_settings()
         current.update(patch)
         self._save_settings(current)
+
+    def _overlay_theme_palette(self, theme: str) -> tuple[str, str]:
+        theme_key = str(theme).strip().lower()
+        palettes = {
+            "midnight": ("#0f172a", "#f8fafc"),
+            "paper": ("#f8fafc", "#0f172a"),
+            "forest": ("#10261c", "#ecfdf5"),
+            "terminal": ("#0a0f0d", "#86efac"),
+        }
+        return palettes.get(theme_key, palettes["midnight"])
+
+    def _set_active_model(self, model: str, persist: bool = True) -> None:
+        chosen = model.strip() if isinstance(model, str) else ""
+        if chosen not in MODEL_PRESETS:
+            chosen = MODEL_PRESETS[0]
+        self._default_model = chosen
+        if hasattr(self, "model_var"):
+            self.model_var.set(chosen)
+        self._refresh_context_preview()
+        if persist:
+            self._update_settings({"default_model": chosen})
+        if self._menu_bar_mode_enabled:
+            self._stop_menu_bar_icon()
+            self._start_menu_bar_icon_if_needed()
 
     def _open_external_url(self, url: str, use_ssl_fallback: bool = False) -> bytes:
         request = urlrequest.Request(url, headers={"User-Agent": f"BluetoothGeminiChat/{APP_VERSION}"})
@@ -1162,13 +1195,32 @@ class DesktopChatApp:
         def on_reconnect(_icon: Any, _item: Any) -> None:
             self.root.after(0, self._reconnect_last_or_selected)
 
+        def on_settings(_icon: Any, _item: Any) -> None:
+            self.root.after(0, self.on_open_settings)
+
+        def make_model_handler(model_name: str) -> Any:
+            def _handler(_icon: Any, _item: Any) -> None:
+                self.root.after(0, lambda: self.events.put({"type": "tray_model", "model": model_name}))
+            return _handler
+
         def on_quit(_icon: Any, _item: Any) -> None:
             self.root.after(0, self.on_close)
 
+        model_menu = pystray.Menu(
+            *[
+                pystray.MenuItem(
+                    f"{'●' if model == self.model_var.get().strip() else '○'} {model}",
+                    make_model_handler(model),
+                )
+                for model in MODEL_PRESETS
+            ]
+        )
         menu = pystray.Menu(
             pystray.MenuItem("Show/Hide Window", on_toggle),
             pystray.MenuItem("Shot+Ask", on_shot),
             pystray.MenuItem("Clipboard+Ask", on_clip),
+            pystray.MenuItem("Model", model_menu),
+            pystray.MenuItem("Open Settings", on_settings),
             pystray.MenuItem("Reconnect", on_reconnect),
             pystray.MenuItem("Quit", on_quit),
         )
@@ -1228,6 +1280,12 @@ class DesktopChatApp:
         add_item("Show/Hide Window", lambda: self.events.put({"type": "tray_toggle"}))
         add_item("Shot+Ask", lambda: self.events.put({"type": "tray_shot"}))
         add_item("Clipboard+Ask", lambda: self.events.put({"type": "tray_clip"}))
+        menu.addItem_(NSMenuItem.separatorItem())
+        for model in MODEL_PRESETS:
+            marker = "● " if model == self.model_var.get().strip() else "○ "
+            add_item(f"{marker}{model}", lambda m=model: self.events.put({"type": "tray_model", "model": m}))
+        menu.addItem_(NSMenuItem.separatorItem())
+        add_item("Open Settings", lambda: self.events.put({"type": "tray_open_settings"}))
         add_item("Reconnect", lambda: self.events.put({"type": "tray_reconnect"}))
         menu.addItem_(NSMenuItem.separatorItem())
         add_item("Quit", lambda: self.events.put({"type": "tray_quit"}))
@@ -1297,7 +1355,7 @@ class DesktopChatApp:
     def on_open_settings(self) -> None:
         dialog = ctk.CTkToplevel(self.root)
         dialog.title("Settings")
-        dialog.geometry("620x760")
+        dialog.geometry("620x860")
         dialog.minsize(540, 520)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -1370,6 +1428,11 @@ class DesktopChatApp:
         overlay_width_var = tk.StringVar(value=str(self._overlay_width))
         overlay_height_var = tk.StringVar(value=str(self._overlay_height))
         overlay_resizable_var = tk.BooleanVar(value=self._overlay_resizable)
+        overlay_font_size_var = tk.StringVar(value=str(self._overlay_font_size))
+        overlay_text_color_var = tk.StringVar(value=self._overlay_text_color)
+        overlay_theme_var = tk.StringVar(value=self._overlay_theme)
+        overlay_auto_dismiss_var = tk.StringVar(value=str(int(self._overlay_auto_dismiss_ms / 1000)))
+        overlay_streaming_var = tk.BooleanVar(value=self._overlay_streaming_enabled)
 
         overlay_bg_row = ctk.CTkFrame(content, fg_color="transparent")
         overlay_bg_row.pack(fill=tk.X, padx=12, pady=(6, 6))
@@ -1415,6 +1478,31 @@ class DesktopChatApp:
             variable=overlay_resizable_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 12))
 
+        appearance_row = ctk.CTkFrame(content, fg_color="transparent")
+        appearance_row.pack(fill=tk.X, padx=12, pady=(0, 8))
+        ctk.CTkLabel(appearance_row, text="Tema:", width=120).pack(side=tk.LEFT)
+        ctk.CTkComboBox(
+            appearance_row,
+            values=["midnight", "paper", "forest", "terminal"],
+            variable=overlay_theme_var,
+            state="readonly",
+            width=120,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ctk.CTkLabel(appearance_row, text="Font:", width=50).pack(side=tk.LEFT)
+        ctk.CTkEntry(appearance_row, textvariable=overlay_font_size_var, width=60).pack(side=tk.LEFT, padx=(0, 12))
+        ctk.CTkLabel(appearance_row, text="Text:", width=50).pack(side=tk.LEFT)
+        ctk.CTkEntry(appearance_row, textvariable=overlay_text_color_var, width=100).pack(side=tk.LEFT)
+
+        behavior_row = ctk.CTkFrame(content, fg_color="transparent")
+        behavior_row.pack(fill=tk.X, padx=12, pady=(0, 12))
+        ctk.CTkLabel(behavior_row, text="Auto-hide (s):", width=120).pack(side=tk.LEFT)
+        ctk.CTkEntry(behavior_row, textvariable=overlay_auto_dismiss_var, width=70).pack(side=tk.LEFT, padx=(0, 12))
+        ctk.CTkCheckBox(
+            behavior_row,
+            text="Streaming progressivo",
+            variable=overlay_streaming_var,
+        ).pack(side=tk.LEFT)
+
         # --- Section 4: Connection & macOS Shell ---
         ctk.CTkLabel(content, text="🔗 Connessione:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
         auto_connect_var = tk.BooleanVar(value=self._auto_connect_on_start)
@@ -1442,12 +1530,14 @@ class DesktopChatApp:
             variable=close_bg_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 12))
 
-        ctk.CTkLabel(content, text="🍎 macOS Shell:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        shell_label = "🍎 macOS Shell:" if self._is_macos else "🖥️ Background Shell:"
+        tray_label = "Mostra icona nella barra in alto (menu bar)" if self._is_macos else "Mostra icona tray/background"
+        ctk.CTkLabel(content, text=shell_label, font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
         menu_bar_mode_var = tk.BooleanVar(value=self._menu_bar_mode_enabled)
         hide_dock_var = tk.BooleanVar(value=self._hide_dock_icon_enabled)
         ctk.CTkCheckBox(
             content,
-            text="Mostra icona nella barra in alto (menu bar)",
+            text=tray_label,
             variable=menu_bar_mode_var,
         ).pack(anchor=tk.W, padx=12, pady=(0, 4))
         ctk.CTkCheckBox(
@@ -1473,6 +1563,16 @@ class DesktopChatApp:
             self._overlay_width = self._parse_int_setting(overlay_width_var.get(), self._overlay_width, 320, 1280)
             self._overlay_height = self._parse_int_setting(overlay_height_var.get(), self._overlay_height, 160, 900)
             self._overlay_resizable = bool(overlay_resizable_var.get())
+            self._overlay_font_size = self._parse_int_setting(overlay_font_size_var.get(), self._overlay_font_size, 11, 28)
+            self._overlay_text_color = self._normalize_hex_color(overlay_text_color_var.get(), self._overlay_text_color)
+            self._overlay_theme = overlay_theme_var.get().strip() or self._overlay_theme
+            self._overlay_auto_dismiss_ms = self._parse_int_setting(overlay_auto_dismiss_var.get(), int(self._overlay_auto_dismiss_ms / 1000), 3, 60) * 1000
+            self._overlay_streaming_enabled = bool(overlay_streaming_var.get())
+            theme_bg, theme_fg = self._overlay_theme_palette(self._overlay_theme)
+            if overlay_bg_var.get().strip() == self._overlay_bg_color:
+                self._overlay_bg_color = theme_bg
+            if overlay_text_color_var.get().strip() == self._overlay_text_color:
+                self._overlay_text_color = theme_fg
             self._auto_connect_on_start = bool(auto_connect_var.get())
             self._auto_retry_known_device = bool(auto_retry_var.get())
             self._auto_check_updates = bool(auto_updates_var.get())
@@ -1487,6 +1587,11 @@ class DesktopChatApp:
             old_settings["overlay_width"] = self._overlay_width
             old_settings["overlay_height"] = self._overlay_height
             old_settings["overlay_resizable"] = self._overlay_resizable
+            old_settings["overlay_font_size"] = self._overlay_font_size
+            old_settings["overlay_text_color"] = self._overlay_text_color
+            old_settings["overlay_theme"] = self._overlay_theme
+            old_settings["overlay_auto_dismiss_ms"] = self._overlay_auto_dismiss_ms
+            old_settings["overlay_streaming_enabled"] = self._overlay_streaming_enabled
             old_settings["auto_connect_on_start"] = self._auto_connect_on_start
             old_settings["auto_retry_known_device"] = self._auto_retry_known_device
             old_settings["auto_check_updates"] = self._auto_check_updates
@@ -1494,6 +1599,7 @@ class DesktopChatApp:
             old_settings["menu_bar_mode_enabled"] = self._menu_bar_mode_enabled
             old_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
             old_settings["last_connected_address"] = self._last_connected_address
+            old_settings["default_model"] = self._default_model
             self._save_settings(old_settings)
             self._apply_overlay_window_preferences()
             if self._menu_bar_mode_enabled:
@@ -1842,8 +1948,7 @@ class DesktopChatApp:
             self.chat_area_frame.grid(row=1, column=1, rowspan=1, columnspan=1, sticky="nsew", padx=(6, 12), pady=(0, 12))
 
     def _set_phone_default_model(self) -> None:
-        self.model_var.set(MODEL_PRESETS[0])
-        self._refresh_context_preview()
+        self._set_active_model(MODEL_PRESETS[0], persist=True)
 
     def _build_button_grid(
         self,
@@ -1970,7 +2075,12 @@ class DesktopChatApp:
             pass
         if self._overlay_message_widget is not None:
             try:
-                self._overlay_message_widget.configure(bg=self._overlay_bg_color, width=max(140, self._overlay_width - 30))
+                self._overlay_message_widget.configure(
+                    bg=self._overlay_bg_color,
+                    fg=self._overlay_text_color,
+                    font=("Avenir", self._overlay_font_size),
+                    width=max(140, self._overlay_width - 30),
+                )
             except Exception:
                 pass
 
@@ -2049,8 +2159,8 @@ class DesktopChatApp:
                 frame,
                 textvariable=self._overlay_text_var,
                 bg=self._overlay_bg_color,
-                fg="#f8fafc",
-                font=("Avenir", 11),
+                fg=self._overlay_text_color,
+                font=("Avenir", self._overlay_font_size),
                 width=max(140, width - 30),
                 anchor="w",
                 justify=tk.LEFT,
@@ -2555,6 +2665,17 @@ class DesktopChatApp:
             return
         self._set_selected_image(path)
 
+    def _default_visual_prompt(self, source: str = "screenshot") -> str:
+        target = "clipboard image" if source == "clipboard" else "screenshot"
+        return (
+            f"Read this {target} carefully. It usually contains a multiple-choice question with four options. "
+            "Return a compact answer with: "
+            "1) best option, "
+            "2) short quoted clue from the image, "
+            "3) one-line reason, "
+            "4) confidence from 0-100."
+        )
+
     def _send_overlay_request(
         self,
         prompt: str,
@@ -2584,8 +2705,8 @@ class DesktopChatApp:
                 prompt,
                 model=model_override,
                 image_path=image_path,
-                image_target_bytes=38 * 1024,
-                image_max_dimension=640,
+                image_target_bytes=72 * 1024,
+                image_max_dimension=900,
                 enable_web_search=self.web_search_enabled.get(),
                 thinking_enabled=thinking_enabled,
                 thinking_budget=thinking_budget,
@@ -2642,7 +2763,7 @@ class DesktopChatApp:
         prompt = (
             prompt_override.strip()
             if prompt_override and prompt_override.strip()
-            else "Quickly analyze this screenshot. Reply in at most 5 lines."
+            else self._default_visual_prompt("screenshot")
         )
         self._send_overlay_request(
             prompt=prompt,
@@ -2690,7 +2811,7 @@ class DesktopChatApp:
         prompt = (
             override
             if override
-            else "Quickly analyze this clipboard image. Reply in at most 5 lines."
+            else self._default_visual_prompt("clipboard")
         )
         self._send_overlay_request(
             prompt=prompt,
@@ -3035,6 +3156,8 @@ class DesktopChatApp:
                 prompt,
                 model=model_override,
                 image_path=self.selected_image_path,
+                image_target_bytes=84 * 1024 if self.selected_image_path else None,
+                image_max_dimension=960 if self.selected_image_path else None,
                 context_blocks=context_blocks or None,
                 memory_turns=memory_turns or None,
                 enable_web_search=self.web_search_enabled.get(),
@@ -3173,6 +3296,17 @@ class DesktopChatApp:
             self._reconnect_last_or_selected()
             return
 
+        if event_type == "tray_open_settings":
+            self.on_open_settings()
+            return
+
+        if event_type == "tray_model":
+            model_name = str(event.get("model", "")).strip()
+            if model_name:
+                self._set_active_model(model_name, persist=True)
+                self._append_log("System", f"Default model set to {model_name}")
+            return
+
         if event_type == "tray_quit":
             self.on_close()
             return
@@ -3302,13 +3436,13 @@ class DesktopChatApp:
                     channel = str(message.get("channel", "answer")).strip().lower()
                     if channel != "thought":
                         partial_text = str(message.get("text", "")).strip()
-                        if partial_text:
+                        if partial_text and self._overlay_streaming_enabled:
                             self._show_overlay_message(partial_text + "\n▌", ttl_ms=0)
                     return
                 if message_type == "result":
                     response_text = str(message.get("text", "")).strip()
                     if response_text:
-                        self._show_overlay_message(response_text, ttl_ms=20000)
+                        self._show_overlay_message(response_text, ttl_ms=self._overlay_auto_dismiss_ms)
                     self._cleanup_overlay_request(message_id)
                     return
                 if message_type == "error":
@@ -3510,6 +3644,11 @@ class DesktopChatApp:
         latest_settings["overlay_width"] = self._overlay_width
         latest_settings["overlay_height"] = self._overlay_height
         latest_settings["overlay_resizable"] = self._overlay_resizable
+        latest_settings["overlay_font_size"] = self._overlay_font_size
+        latest_settings["overlay_text_color"] = self._overlay_text_color
+        latest_settings["overlay_theme"] = self._overlay_theme
+        latest_settings["overlay_auto_dismiss_ms"] = self._overlay_auto_dismiss_ms
+        latest_settings["overlay_streaming_enabled"] = self._overlay_streaming_enabled
         latest_settings["auto_connect_on_start"] = self._auto_connect_on_start
         latest_settings["auto_retry_known_device"] = self._auto_retry_known_device
         latest_settings["auto_check_updates"] = self._auto_check_updates
@@ -3517,6 +3656,7 @@ class DesktopChatApp:
         latest_settings["menu_bar_mode_enabled"] = self._menu_bar_mode_enabled
         latest_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
         latest_settings["last_connected_address"] = self._last_connected_address
+        latest_settings["default_model"] = self._default_model
         self._save_settings(latest_settings)
         self._hide_overlay_window()
         self.client.stop()
