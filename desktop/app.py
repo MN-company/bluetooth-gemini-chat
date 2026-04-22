@@ -134,7 +134,7 @@ MODEL_PRESETS = [
     "gemini-2.0-pro-exp",
 ]
 
-APP_VERSION = "0.2.3"
+APP_VERSION = "0.2.4"
 GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
 
 
@@ -251,6 +251,7 @@ class DesktopChatApp:
         self._mac_status_item: Any | None = None
         self._mac_status_menu: Any | None = None
         self._mac_status_targets: list[Any] = []
+        self._settings_dialog: ctk.CTkToplevel | None = None
         self._permissions_dialog: ctk.CTkToplevel | None = None
         self._bluetooth_probe_manager: Any | None = None
         self._macos_policy_applied = False
@@ -481,6 +482,9 @@ class DesktopChatApp:
             self.sidebar_frame, height=3, bg="#1c1c1c", fg="#e0e0e0", selectbackground="#1f538d", activestyle=tk.NONE, borderwidth=1, relief=tk.SOLID, highlightthickness=0,
         )
         self.devices_list.pack(fill=tk.X, pady=(0, 6))
+        self.devices_list.bind("<Return>", self._on_devices_list_activate)
+        self.devices_list.bind("<KP_Enter>", self._on_devices_list_activate)
+        self.devices_list.bind("<Double-Button-1>", self._on_devices_list_activate)
         ctk.CTkLabel(
             self.sidebar_frame,
             text=f"Trigger: {self._overlay_hotkey}",
@@ -570,19 +574,111 @@ class DesktopChatApp:
         self.memory_var = tk.StringVar(value="")
         
         self.root.bind("<Configure>", self._on_window_resize)
-        
-        # --- GLOBAL HOTKEYS BINDING ---
-        self.root.bind("<Command-n>", lambda e: [self.on_new_chat(), self.prompt_entry.focus()])
-        self.root.bind("<Control-n>", lambda e: [self.on_new_chat(), self.prompt_entry.focus()])
-        self.root.bind("<Command-r>", lambda e: self.on_rename_chat())
-        self.root.bind("<Control-r>", lambda e: self.on_rename_chat())
-        self.root.bind("<Command-BackSpace>", self._on_global_backspace_hotkey)
-        self.root.bind("<Command-k>", lambda e: self.search_entry.focus())
-        self.root.bind("<Control-k>", lambda e: self.search_entry.focus())
-        self.root.bind("<Command-f>", lambda e: self.search_entry.focus())
-        self.root.bind("<Control-f>", lambda e: self.search_entry.focus())
+        self._bind_keyboard_shortcuts()
         
         self._is_compact_mode = False
+
+    def _bind_keyboard_shortcuts(self) -> None:
+        self.root.bind("<Command-n>", self._on_shortcut_new_chat)
+        self.root.bind("<Control-n>", self._on_shortcut_new_chat)
+        self.root.bind("<Command-r>", self._on_shortcut_rename_chat)
+        self.root.bind("<Control-r>", self._on_shortcut_rename_chat)
+        self.root.bind("<Command-BackSpace>", self._on_global_backspace_hotkey)
+        self.root.bind("<Command-k>", self._on_shortcut_focus_search)
+        self.root.bind("<Control-k>", self._on_shortcut_focus_search)
+        self.root.bind("<Command-f>", self._on_shortcut_focus_search)
+        self.root.bind("<Control-f>", self._on_shortcut_focus_search)
+        self.root.bind("<Command-Shift-s>", self._on_shortcut_scan_devices)
+        self.root.bind("<Control-Shift-s>", self._on_shortcut_scan_devices)
+        self.root.bind("<Command-Shift-c>", self._on_shortcut_connect_device)
+        self.root.bind("<Control-Shift-c>", self._on_shortcut_connect_device)
+        self.root.bind("<Command-Shift-d>", self._on_shortcut_disconnect_device)
+        self.root.bind("<Control-Shift-d>", self._on_shortcut_disconnect_device)
+        self.root.bind("<Command-Shift-g>", self._on_shortcut_shot_ask)
+        self.root.bind("<Control-Shift-g>", self._on_shortcut_shot_ask)
+        self.root.bind("<Command-Shift-v>", self._on_shortcut_clipboard_ask)
+        self.root.bind("<Control-Shift-v>", self._on_shortcut_clipboard_ask)
+        self.root.bind("<Command-Shift-o>", self._on_shortcut_open_settings)
+        self.root.bind("<Control-Shift-o>", self._on_shortcut_open_settings)
+        self.root.bind("<Command-Shift-p>", self._on_shortcut_focus_prompt)
+        self.root.bind("<Control-Shift-p>", self._on_shortcut_focus_prompt)
+        self.root.bind("<Escape>", self._on_shortcut_escape)
+
+    def _shortcut_hint_rows(self) -> list[tuple[str, str]]:
+        mod = "Cmd" if self._is_macos else "Ctrl"
+        return [
+            (f"{mod}+N", "Nuova chat"),
+            (f"{mod}+R", "Rinomina chat"),
+            (f"{mod}+F / {mod}+K", "Focus ricerca chat"),
+            (f"{mod}+Shift+P", "Focus composer"),
+            (f"{mod}+Shift+S", "Scan dispositivi"),
+            (f"{mod}+Shift+C", "Connetti device selezionato o ultimo noto"),
+            (f"{mod}+Shift+D", "Disconnetti bridge"),
+            (f"{mod}+Shift+G", "Shot+Ask"),
+            (f"{mod}+Shift+V", "Clipboard+Ask"),
+            (f"{mod}+Shift+O", "Apri impostazioni"),
+            ("Esc", "Ferma richiesta attiva / chiudi impostazioni"),
+        ]
+
+    def _on_shortcut_new_chat(self, _event: tk.Event[Any] | None = None) -> str:
+        self.on_new_chat()
+        self.prompt_entry.focus_set()
+        return "break"
+
+    def _on_shortcut_rename_chat(self, _event: tk.Event[Any] | None = None) -> str:
+        self.on_rename_chat()
+        return "break"
+
+    def _on_shortcut_focus_search(self, _event: tk.Event[Any] | None = None) -> str:
+        self.search_entry.focus_set()
+        return "break"
+
+    def _on_shortcut_focus_prompt(self, _event: tk.Event[Any] | None = None) -> str:
+        self._force_app_visibility()
+        self.prompt_entry.focus_set()
+        return "break"
+
+    def _on_shortcut_scan_devices(self, _event: tk.Event[Any] | None = None) -> str:
+        self.on_scan()
+        return "break"
+
+    def _on_shortcut_connect_device(self, _event: tk.Event[Any] | None = None) -> str:
+        self.on_connect()
+        return "break"
+
+    def _on_shortcut_disconnect_device(self, _event: tk.Event[Any] | None = None) -> str:
+        self.on_disconnect()
+        return "break"
+
+    def _on_shortcut_shot_ask(self, _event: tk.Event[Any] | None = None) -> str:
+        self.on_hotkey_overlay_triggered()
+        return "break"
+
+    def _on_shortcut_clipboard_ask(self, _event: tk.Event[Any] | None = None) -> str:
+        self.on_hotkey_clipboard_triggered()
+        return "break"
+
+    def _on_shortcut_open_settings(self, _event: tk.Event[Any] | None = None) -> str:
+        self.on_open_settings()
+        return "break"
+
+    def _on_shortcut_escape(self, _event: tk.Event[Any] | None = None) -> str | None:
+        dialog = self._settings_dialog
+        if dialog is not None:
+            try:
+                if dialog.winfo_exists():
+                    self._close_settings_dialog()
+                    return "break"
+            except Exception:
+                self._settings_dialog = None
+        if self._latest_pending_request_for_session(self.active_session_id) is not None:
+            self.on_stop_active_request()
+            return "break"
+        return None
+
+    def _on_devices_list_activate(self, _event: tk.Event[Any] | None = None) -> str:
+        self.on_connect()
+        return "break"
 
     def _on_global_backspace_hotkey(self, event) -> str | None:
         if event.widget == self.prompt_entry._textbox:
@@ -1164,6 +1260,38 @@ class DesktopChatApp:
         except Exception:
             return None
 
+    def _tray_status_label(self) -> str:
+        if self.connected:
+            label = "Connected"
+            if self._last_connected_address:
+                label = f"Connected • {self._last_connected_address}"
+            return f"● {label}"
+        return "○ Disconnected"
+
+    def _tray_device_entries(self) -> list[tuple[str, str | None]]:
+        items: list[tuple[str, str | None]] = []
+        seen: set[str] = set()
+        for device in self.devices:
+            address = str(device.get("address", "")).strip()
+            if not address or address in seen:
+                continue
+            seen.add(address)
+            name = str(device.get("name", "Device")).strip() or "Device"
+            marker = "●" if address == self._last_connected_address else "○"
+            items.append((f"{marker} {name} ({address})", address))
+        if not items:
+            items.append(("No devices yet - run Scan", None))
+        return items
+
+    def _refresh_menu_bar_icon_menu(self) -> None:
+        if not self._menu_bar_mode_enabled:
+            return
+        try:
+            self._stop_menu_bar_icon()
+            self._start_menu_bar_icon_if_needed()
+        except Exception:
+            pass
+
     def _start_menu_bar_icon_if_needed(self) -> None:
         if not self._menu_bar_mode_enabled:
             return
@@ -1195,12 +1323,20 @@ class DesktopChatApp:
         def on_reconnect(_icon: Any, _item: Any) -> None:
             self.root.after(0, self._reconnect_last_or_selected)
 
+        def on_scan(_icon: Any, _item: Any) -> None:
+            self.root.after(0, self.on_scan)
+
         def on_settings(_icon: Any, _item: Any) -> None:
             self.root.after(0, self.on_open_settings)
 
         def make_model_handler(model_name: str) -> Any:
             def _handler(_icon: Any, _item: Any) -> None:
                 self.root.after(0, lambda: self.events.put({"type": "tray_model", "model": model_name}))
+            return _handler
+
+        def make_device_handler(address: str) -> Any:
+            def _handler(_icon: Any, _item: Any) -> None:
+                self.root.after(0, lambda: self.events.put({"type": "tray_connect_device", "address": address}))
             return _handler
 
         def on_quit(_icon: Any, _item: Any) -> None:
@@ -1215,10 +1351,24 @@ class DesktopChatApp:
                 for model in MODEL_PRESETS
             ]
         )
+        device_menu = pystray.Menu(
+            *[
+                pystray.MenuItem(
+                    label,
+                    (make_device_handler(address) if address else (lambda _icon, _item: None)),
+                    enabled=(address is not None),
+                )
+                for label, address in self._tray_device_entries()
+            ]
+        )
         menu = pystray.Menu(
+            pystray.MenuItem(self._tray_status_label(), lambda _icon, _item: None, enabled=False),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Show/Hide Window", on_toggle),
             pystray.MenuItem("Shot+Ask", on_shot),
             pystray.MenuItem("Clipboard+Ask", on_clip),
+            pystray.MenuItem("Scan Devices", on_scan),
+            pystray.MenuItem("Devices", device_menu),
             pystray.MenuItem("Model", model_menu),
             pystray.MenuItem("Open Settings", on_settings),
             pystray.MenuItem("Reconnect", on_reconnect),
@@ -1276,10 +1426,40 @@ class DesktopChatApp:
             item.setTarget_(target)
             menu.addItem_(item)
             targets.append(target)
+            return item
 
+        def add_disabled_item(title: str) -> Any:
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
+            item.setEnabled_(False)
+            menu.addItem_(item)
+            return item
+
+        def build_devices_submenu() -> Any:
+            submenu = NSMenu.alloc().init()
+            for label, address in self._tray_device_entries():
+                if address is None:
+                    item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(label, None, "")
+                    item.setEnabled_(False)
+                    submenu.addItem_(item)
+                    continue
+                target = _MacMenuActionTarget.alloc().initWithCallback_(
+                    lambda addr=address: self.events.put({"type": "tray_connect_device", "address": addr})
+                )
+                item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(label, "onAction:", "")
+                item.setTarget_(target)
+                submenu.addItem_(item)
+                targets.append(target)
+            return submenu
+
+        add_disabled_item(self._tray_status_label())
+        menu.addItem_(NSMenuItem.separatorItem())
         add_item("Show/Hide Window", lambda: self.events.put({"type": "tray_toggle"}))
         add_item("Shot+Ask", lambda: self.events.put({"type": "tray_shot"}))
         add_item("Clipboard+Ask", lambda: self.events.put({"type": "tray_clip"}))
+        add_item("Scan Devices", lambda: self.events.put({"type": "tray_scan"}))
+        devices_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Devices", None, "")
+        devices_item.setSubmenu_(build_devices_submenu())
+        menu.addItem_(devices_item)
         menu.addItem_(NSMenuItem.separatorItem())
         for model in MODEL_PRESETS:
             marker = "● " if model == self.model_var.get().strip() else "○ "
@@ -1353,14 +1533,33 @@ class DesktopChatApp:
             self.client.connect(self._last_connected_address)
 
     def on_open_settings(self) -> None:
+        self._force_app_visibility()
+        dialog = self._settings_dialog
+        if dialog is not None:
+            try:
+                if dialog.winfo_exists():
+                    dialog.deiconify()
+                    dialog.lift()
+                    dialog.focus_force()
+                    dialog.grab_set()
+                    return
+            except Exception:
+                self._settings_dialog = None
+
         dialog = ctk.CTkToplevel(self.root)
+        self._settings_dialog = dialog
         dialog.title("Settings")
         dialog.geometry("620x860")
         dialog.minsize(540, 520)
         dialog.transient(self.root)
         dialog.grab_set()
+        try:
+            dialog.attributes("-topmost", True)
+        except Exception:
+            pass
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(0, weight=1)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: self._close_settings_dialog())
 
         content = ctk.CTkScrollableFrame(dialog, fg_color="transparent")
         content.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
@@ -1555,6 +1754,15 @@ class DesktopChatApp:
                 hover_color="#333333",
             ).pack(anchor=tk.W, padx=12, pady=(0, 12))
 
+        ctk.CTkLabel(content, text="⌨ Shortcuts:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        for combo, description in self._shortcut_hint_rows():
+            ctk.CTkLabel(
+                content,
+                text=f"{combo}  •  {description}",
+                font=("Avenir", 11),
+                text_color="#b0b0b0",
+            ).pack(padx=12, pady=(0, 2), anchor=tk.W)
+
         def save() -> None:
             text = textbox.get("1.0", tk.END).strip()
             self.system_instructions_var.set(text)
@@ -1607,7 +1815,7 @@ class DesktopChatApp:
             else:
                 self._stop_menu_bar_icon()
             self._apply_macos_activation_policy()
-            dialog.destroy()
+            self._close_settings_dialog()
             n = len(self.pinned_pdf_paths)
             self._append_log(
                 "System",
@@ -1622,6 +1830,20 @@ class DesktopChatApp:
             )
 
         ctk.CTkButton(content, text="💾 SALVA", command=save, fg_color="#1f538d").pack(pady=(4, 16), padx=12, anchor=tk.E)
+
+    def _close_settings_dialog(self) -> None:
+        dialog = self._settings_dialog
+        self._settings_dialog = None
+        if dialog is None:
+            return
+        try:
+            dialog.grab_release()
+        except Exception:
+            pass
+        try:
+            dialog.destroy()
+        except Exception:
+            pass
 
     # ── Knowledge Base Container handlers ─────────────────────────────────────
 
@@ -2516,7 +2738,21 @@ class DesktopChatApp:
     def on_scan(self) -> None:
         self.devices_list.delete(0, tk.END)
         self.devices = []
+        self._refresh_menu_bar_icon_menu()
         self.client.scan_devices()
+
+    def _connect_device_by_address(self, address: str) -> None:
+        target = str(address).strip()
+        if not target:
+            return
+        for idx, device in enumerate(self.devices):
+            if str(device.get("address", "")).strip() != target:
+                continue
+            self.devices_list.selection_clear(0, tk.END)
+            self.devices_list.selection_set(idx)
+            self.devices_list.activate(idx)
+            break
+        self.client.connect(target)
 
     def on_connect(self) -> None:
         selected = self.devices_list.curselection()
@@ -3292,6 +3528,16 @@ class DesktopChatApp:
             self.on_hotkey_clipboard_triggered()
             return
 
+        if event_type == "tray_scan":
+            self.on_scan()
+            return
+
+        if event_type == "tray_connect_device":
+            address = str(event.get("address", "")).strip()
+            if address:
+                self._connect_device_by_address(address)
+            return
+
         if event_type == "tray_reconnect":
             self._reconnect_last_or_selected()
             return
@@ -3357,6 +3603,7 @@ class DesktopChatApp:
                     "System",
                     "No device found. Keep the bridge service active and retry Scan.",
                 )
+            self._refresh_menu_bar_icon_menu()
             return
 
         if event_type == "connected":
@@ -3371,6 +3618,7 @@ class DesktopChatApp:
             self.link_var.set("Link: probing...")
             self._last_link_state = "healthy"
             self._append_log("System", f"Connected ({device}), packet size: {packet}")
+            self._refresh_menu_bar_icon_menu()
             return
 
         if event_type == "disconnected":
@@ -3382,6 +3630,7 @@ class DesktopChatApp:
                 self._cleanup_all_overlay_requests()
             self._clear_all_pending_requests()
             self._append_log("System", "Disconnected")
+            self._refresh_menu_bar_icon_menu()
             return
 
         if event_type == "link_quality":
