@@ -19,7 +19,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
 
-const val APP_VERSION_NAME = "0.2.1"
+const val APP_VERSION_NAME = "0.2.3"
 
 @Serializable
 data class IncomingEnvelope(
