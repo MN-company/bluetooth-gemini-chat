@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import java.net.SocketTimeoutException
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeoutException
@@ -32,12 +33,15 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.coroutines.sync.Semaphore
 
 class BleKeepAliveService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val requestRouteByMessageId = ConcurrentHashMap<String, String>()
     private val activePromptJobsByMessageId = ConcurrentHashMap<String, Job>()
+    private val promptConcurrency = Semaphore(MAX_CONCURRENT_PROMPTS)
+    private val queuedPromptCount = AtomicInteger(0)
 
     private lateinit var settingsRepository: SettingsRepository
     private lateinit var geminiApiClient: GeminiApiClient
@@ -410,6 +414,70 @@ class BleKeepAliveService : Service() {
                 else -> budget
             }
         }
+        val queueDepth = queuedPromptCount.incrementAndGet()
+        if (queueDepth > MAX_PENDING_PROMPTS) {
+            queuedPromptCount.decrementAndGet()
+            sendError(request.messageId, "Server busy: too many pending prompts", sourceAddress)
+            appendLog("Rejected prompt (${request.messageId}): queue full")
+            return
+        }
+
+        serviceScope.launch {
+            currentCoroutineContext()[Job]?.let { activePromptJobsByMessageId[request.messageId] = it }
+            var acquiredPermit = false
+            val waitingAhead = maxOf(0, queueDepth - 1)
+            if (waitingAhead > 0 || promptConcurrency.availablePermits == 0) {
+                sendStatus(request.messageId, "queued (${waitingAhead + 1} ahead)", sourceAddress)
+            }
+            try {
+                promptConcurrency.acquire()
+                acquiredPermit = true
+                queuedPromptCount.updateAndGet { current -> maxOf(0, current - 1) }
+                processPromptRequest(
+                    request = request,
+                    sourceAddress = sourceAddress,
+                    sanitizedContextBlocks = sanitizedContextBlocks,
+                    sanitizedMemoryTurns = sanitizedMemoryTurns,
+                    modelOverride = modelOverride,
+                    includeThoughts = includeThoughts,
+                    sanitizedThinkingBudget = sanitizedThinkingBudget,
+                    imageInfo = imageInfo,
+                    contextInfo = contextInfo,
+                    memoryInfo = memoryInfo,
+                    webInfo = webInfo,
+                    modelInfo = modelInfo,
+                    thinkingEnabled = thinkingEnabled,
+                )
+            } catch (t: CancellationException) {
+                if (!acquiredPermit) {
+                    queuedPromptCount.updateAndGet { current -> maxOf(0, current - 1) }
+                    runCatching { sendStatus(request.messageId, "canceled", sourceAddress) }
+                }
+                throw t
+            } finally {
+                if (acquiredPermit) {
+                    promptConcurrency.release()
+                }
+                activePromptJobsByMessageId.remove(request.messageId)
+            }
+        }
+    }
+
+    private suspend fun processPromptRequest(
+        request: PromptRequest,
+        sourceAddress: String,
+        sanitizedContextBlocks: List<ContextBlockRequest>,
+        sanitizedMemoryTurns: List<MemoryTurnRequest>,
+        modelOverride: String?,
+        includeThoughts: Boolean,
+        sanitizedThinkingBudget: Int?,
+        imageInfo: String,
+        contextInfo: String,
+        memoryInfo: String,
+        webInfo: String,
+        modelInfo: String,
+        thinkingEnabled: Boolean,
+    ) {
         val thinkingInfo = if (thinkingEnabled) {
             if (sanitizedThinkingBudget == null || sanitizedThinkingBudget < 0) {
                 " + thinking(auto${if (includeThoughts) ", trace" else ""})"
@@ -421,7 +489,6 @@ class BleKeepAliveService : Service() {
         }
 
         appendLog("Prompt received (${request.messageId})$imageInfo$contextInfo$memoryInfo$webInfo$modelInfo$thinkingInfo")
-        currentCoroutineContext()[Job]?.let { activePromptJobsByMessageId[request.messageId] = it }
         val startedMs = System.currentTimeMillis()
         sendStatus(request.messageId, "processing (0s)", sourceAddress)
         val progressJob = serviceScope.launch {
@@ -522,8 +589,6 @@ class BleKeepAliveService : Service() {
                 appendLog("Failed to send error to PC (${request.messageId}): ${sendFailure.message}")
             }
             appendLog("Gemini error (${request.messageId}) after ${elapsed}s: ${t.message}")
-        } finally {
-            activePromptJobsByMessageId.remove(request.messageId)
         }
     }
 
@@ -677,6 +742,8 @@ class BleKeepAliveService : Service() {
     companion object {
         private const val CHANNEL_ID = "background_sync_keep_alive"
         const val NOTIFICATION_ID = 10042
+        private const val MAX_CONCURRENT_PROMPTS = 2
+        private const val MAX_PENDING_PROMPTS = 10
 
         const val ACTION_START = "com.example.geminibridge.action.START"
         const val ACTION_STOP = "com.example.geminibridge.action.STOP"

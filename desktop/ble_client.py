@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import gzip
 import io
 import json
@@ -21,7 +20,7 @@ from bleak.exc import BleakError
 from ble_protocol import (
     DEFAULT_MAX_PACKET_SIZE, FrameAssembler, FrameCodec, TransportIdGenerator,
     PROTO2_PING_TYPE, PROTO2_PONG_TYPE,
-    encode_binary_ping, decode_binary_frame,
+    decode_prompt_bundle, encode_binary_ping, encode_prompt_bundle, decode_binary_frame,
 )
 
 try:
@@ -39,6 +38,7 @@ MAX_IMAGE_BYTES = 140 * 1024
 TARGET_IMAGE_BYTES = 56 * 1024
 MAX_IMAGE_DIMENSION = 768
 MAX_REQUEST_BYTES = 220 * 1024
+JSON_GZIP_THRESHOLD_BYTES = 900
 PING_INTERVAL_SECONDS = 30.0
 PING_TIMEOUT_SECONDS = 90.0
 RECONNECT_BASE_SECONDS = 1.5
@@ -65,6 +65,7 @@ class BleChatClient:
         self._last_pong_monotonic = time.monotonic()
         self._auto_reconnect_enabled = True
         self._is_windows = platform.system().lower().startswith("windows")
+        self._last_scan_results: list[dict[str, str]] = []
 
     def start(self) -> None:
         if self._thread_started:
@@ -153,10 +154,18 @@ class BleChatClient:
                 max_dimension=image_max_dimension,
             )
             message["imageMimeType"] = mime_type
-            message["imageBase64"] = base64.b64encode(raw).decode("ascii")
             message["imageName"] = image_file.name
 
         payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if image_path is not None:
+            payload = encode_prompt_bundle(
+                payload,
+                raw,
+                gzip_metadata=len(payload) >= 320,
+            )
+        elif len(payload) >= JSON_GZIP_THRESHOLD_BYTES:
+            payload = b"gz\x01" + gzip.compress(payload, compresslevel=6)
+
         if len(payload) > MAX_REQUEST_BYTES:
             raise ValueError(
                 f"Request payload too large ({len(payload)} bytes). "
@@ -274,6 +283,7 @@ class BleChatClient:
                         }
                     )
 
+            self._last_scan_results = list(payload)
             self._emit({"type": "scan_result", "devices": payload})
             if not payload:
                 self._emit(
@@ -425,23 +435,77 @@ class BleChatClient:
 
     async def _reconnect_loop(self, address: str) -> None:
         attempt = 1
+        current_address = address
         while not self._closing:
             if self._client is not None and self._client.is_connected:
                 return
-            if self._last_connected_address != address:
+            if self._last_connected_address != current_address and self._last_connected_address != address:
                 return
 
             self._emit({"type": "status", "text": f"Auto-reconnect attempt {attempt}..."})
-            await self._connect(address, from_reconnect=True)
+            await self._connect(current_address, from_reconnect=True)
             if self._client is not None and self._client.is_connected:
                 self._emit({"type": "status", "text": "Reconnected"})
                 return
+
+            if attempt >= 2:
+                discovered_address = await self._discover_known_device(address)
+                if discovered_address is not None and discovered_address != current_address:
+                    current_address = discovered_address
+                    self._last_connected_address = discovered_address
+                    self._emit(
+                        {
+                            "type": "status",
+                            "text": f"Known bridge rediscovered at {discovered_address}, retrying...",
+                        }
+                    )
 
             base_backoff = min(RECONNECT_BASE_SECONDS * (1.6 ** (attempt - 1)), RECONNECT_MAX_SECONDS)
             # Small jitter reduces reconnect collisions in multi-client scenarios.
             backoff = base_backoff + random.uniform(0.0, 0.4)
             await asyncio.sleep(backoff)
             attempt += 1
+
+    async def _discover_known_device(self, preferred_address: str) -> str | None:
+        try:
+            target_uuid = SERVICE_UUID.lower()
+            matches: list[dict[str, str]] = []
+            try:
+                discovered = await BleakScanner.discover(
+                    timeout=4.0,
+                    return_adv=True,
+                    service_uuids=[SERVICE_UUID],
+                )
+                for device, adv_data in discovered.values():
+                    service_uuids = {uuid.lower() for uuid in (adv_data.service_uuids or [])}
+                    if service_uuids and target_uuid not in service_uuids:
+                        continue
+                    matches.append(
+                        {
+                            "name": device.name or adv_data.local_name or "Device",
+                            "address": device.address,
+                        }
+                    )
+            except TypeError:
+                devices = await BleakScanner.discover(timeout=4.0, service_uuids=[SERVICE_UUID])
+                for device in devices:
+                    matches.append(
+                        {
+                            "name": device.name or "Unknown",
+                            "address": device.address,
+                        }
+                    )
+
+            if matches:
+                self._last_scan_results = matches
+            for device in matches:
+                if device["address"] == preferred_address:
+                    return preferred_address
+            if len(matches) == 1:
+                return matches[0]["address"]
+        except Exception:
+            return None
+        return None
 
     async def _send_payload(self, payload: bytes, request_id: str, emit_sent_event: bool = True, reliable: bool = False) -> None:
         client = self._client
@@ -536,8 +600,9 @@ class BleChatClient:
             max_dimension=max_dim,
         )
         if optimized is not None:
-            raw = optimized
-            mime_type = "image/jpeg"
+            optimized_bytes, optimized_mime = optimized
+            raw = optimized_bytes
+            mime_type = optimized_mime
 
         if len(raw) > MAX_IMAGE_BYTES:
             raise ValueError(
@@ -552,7 +617,7 @@ class BleChatClient:
         image_file: Path,
         target_bytes: int = TARGET_IMAGE_BYTES,
         max_dimension: int = MAX_IMAGE_DIMENSION,
-    ) -> bytes | None:
+    ) -> tuple[bytes, str] | None:
         try:
             with Image.open(image_file) as img:  # type: ignore[arg-type]
                 if ImageOps is not None:
@@ -569,6 +634,10 @@ class BleChatClient:
                 if max(img.size) > max_dimension:
                     img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
 
+                png_candidate = self._optimize_text_image_to_png(img, target_bytes=target_bytes)
+                if png_candidate is not None:
+                    return png_candidate, "image/png"
+
                 best: bytes | None = None
                 for quality in (76, 68, 60, 52, 44, 36):
                     buffer = io.BytesIO()
@@ -577,10 +646,26 @@ class BleChatClient:
                     if best is None or len(candidate) < len(best):
                         best = candidate
                     if len(candidate) <= target_bytes:
-                        return candidate
-                return best
+                        return candidate, "image/jpeg"
+                if best is not None:
+                    return best, "image/jpeg"
+                return None
         except (UnidentifiedImageError, OSError):
             return None
+
+    def _optimize_text_image_to_png(self, img: Image.Image, target_bytes: int) -> bytes | None:
+        try:
+            grayscale = img.convert("L")
+            for colors in (16, 24, 32, 48):
+                candidate = grayscale.quantize(colors=colors)
+                buffer = io.BytesIO()
+                candidate.save(buffer, format="PNG", optimize=True)
+                data = buffer.getvalue()
+                if len(data) <= int(target_bytes * 1.25):
+                    return data
+        except Exception:
+            return None
+        return None
 
     def _on_notification(self, _: Any, data: bytearray) -> None:
         raw = bytes(data)
@@ -614,7 +699,19 @@ class BleChatClient:
             return
 
         try:
-            message = json.loads(complete_payload.decode("utf-8"))
+            decoded_payload = complete_payload
+            if (
+                len(complete_payload) >= 3
+                and complete_payload[0] == ord("g")
+                and complete_payload[1] == ord("z")
+                and complete_payload[2] == 1
+            ):
+                decoded_payload = gzip.decompress(complete_payload[3:])
+            else:
+                bundle = decode_prompt_bundle(complete_payload)
+                if bundle is not None:
+                    decoded_payload = bundle[0]
+            message = json.loads(decoded_payload.decode("utf-8"))
         except Exception as exc:
             self._emit({"type": "error", "text": f"Invalid message JSON: {exc}"})
             return

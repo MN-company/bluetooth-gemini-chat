@@ -19,6 +19,8 @@ import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
 import android.os.Build
 import android.os.ParcelUuid
+import java.io.ByteArrayOutputStream
+import java.util.zip.GZIPOutputStream
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
@@ -35,6 +37,7 @@ class BleServerManager(
     private val onLog: (String) -> Unit,
     private val onBridgeStatus: (String) -> Unit,
 ) {
+    private val jsonParser = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
     private val appContext = context.applicationContext
     private val bluetoothManager =
         appContext.getSystemService(BluetoothManager::class.java)
@@ -154,7 +157,14 @@ class BleServerManager(
                         val payload = assembler.addFrame(frame)
                         if (payload != null) {
                             lastActiveDeviceAddress = device.address
-                            val json = if (
+                            val json = if (BinaryPromptBundle.isPromptBundle(payload)) {
+                                try {
+                                    BinaryPromptBundle.decodeToJson(payload, jsonParser)
+                                } catch (e: Exception) {
+                                    onLog("Prompt bundle decode failed: ${e.message}")
+                                    ""
+                                }
+                            } else if (
                                 payload.size >= 3 &&
                                 payload[0] == 'g'.code.toByte() &&
                                 payload[1] == 'z'.code.toByte() &&
@@ -294,10 +304,11 @@ class BleServerManager(
             val mtuPayloadMax = maxOf(BleConstants.defaultMaxPacketSize, mtu - 3)
             val maxPacketSize = minOf(BleConstants.maxGattAttributeValueBytes, mtuPayloadMax)
             val transportId = transportIds.next()
+            val payloadBytes = encodeTransportPayload(jsonMessage.toByteArray(Charsets.UTF_8))
 
             val packets = BleFrameCodec.encodeMessage(
                 transportId = transportId,
-                payload = jsonMessage.toByteArray(Charsets.UTF_8),
+                payload = payloadBytes,
                 maxPacketSize = maxPacketSize,
             )
 
@@ -380,6 +391,19 @@ class BleServerManager(
             onBridgeStatus("Starting BLE advertising...")
             advertiser.startAdvertising(settings, data, callback)
         }
+    }
+
+    private fun encodeTransportPayload(rawPayload: ByteArray): ByteArray {
+        if (rawPayload.size < 900) return rawPayload
+
+        return runCatching {
+            val output = ByteArrayOutputStream()
+            output.write('g'.code)
+            output.write('z'.code)
+            output.write(1)
+            GZIPOutputStream(output).use { it.write(rawPayload) }
+            output.toByteArray()
+        }.getOrElse { rawPayload }
     }
 
     private fun createService(): BluetoothGattService {
