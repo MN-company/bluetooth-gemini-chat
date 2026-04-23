@@ -134,6 +134,15 @@ MODEL_PRESETS = [
     "gemini-2.0-pro-exp",
 ]
 
+MACOS_SCREENSHOT_MODE_OPTIONS = [
+    ("native_toolbar", "Toolbar nativa"),
+    ("selection", "Selezione area"),
+    ("window", "Selezione finestra"),
+    ("fullscreen", "Schermo intero"),
+]
+MACOS_SCREENSHOT_MODE_LABELS = {key: label for key, label in MACOS_SCREENSHOT_MODE_OPTIONS}
+MACOS_SCREENSHOT_MODE_BY_LABEL = {label: key for key, label in MACOS_SCREENSHOT_MODE_OPTIONS}
+
 APP_VERSION = "0.2.4"
 GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
 
@@ -208,16 +217,21 @@ class DesktopChatApp:
         self._is_windows = platform.system().lower().startswith("windows")
         self._overlay_listener: Any | None = None
         self._overlay_hotkey = "Apple Shortcut (Cmd+Shift+G)" if self._is_macos else "Ctrl+Shift+G"
+        self._overlay_hide_hotkey = "Apple Shortcut (Cmd+Shift+H)" if self._is_macos else "Ctrl+Shift+H"
         self._overlay_request_ids: set[str] = set()
         self._overlay_image_paths_by_request: dict[str, str] = {}
         self._overlay_started_at: dict[str, float] = {}
         self._overlay_last_update_at: dict[str, float] = {}
-        self._overlay_timeout_seconds = 95.0
+        self._overlay_stall_timeout_seconds = 45.0
+        self._overlay_hard_timeout_seconds = 300.0
         self._overlay_last_present_at = 0.0
         self._overlay_hide_after_id: str | None = None
         self._overlay_window: tk.Toplevel | None = None
+        self._overlay_frame: tk.Frame | None = None
+        self._overlay_title_widget: tk.Label | None = None
         self._overlay_message_widget: tk.Message | None = None
         self._overlay_text_var = tk.StringVar(value="")
+        self._overlay_suppressed = False
         self._toggle_flag_path = self._runtime_bridge_dir / "toggle.flag"
         self._toggle_flag_mtime = 0.0
         self._clipboard_flag_path = self._runtime_bridge_dir / "clipboard.flag"
@@ -244,8 +258,16 @@ class DesktopChatApp:
         self._overlay_font_size = self._parse_int_setting(_saved.get("overlay_font_size"), 16, 11, 28)
         self._overlay_text_color = self._normalize_hex_color(_saved.get("overlay_text_color"), "#f8fafc")
         self._overlay_theme = str(_saved.get("overlay_theme", "midnight")).strip() or "midnight"
+        self._overlay_show_background = bool(_saved.get("overlay_show_background", False))
+        self._overlay_opacity = (
+            self._parse_int_setting(_saved.get("overlay_opacity_percent"), 96, 15, 100) / 100.0
+        )
         self._overlay_auto_dismiss_ms = self._parse_int_setting(_saved.get("overlay_auto_dismiss_ms"), 20000, 3000, 60000)
         self._overlay_streaming_enabled = bool(_saved.get("overlay_streaming_enabled", True))
+        screenshot_mode = str(_saved.get("macos_screenshot_mode", "native_toolbar")).strip().lower()
+        if screenshot_mode not in MACOS_SCREENSHOT_MODE_LABELS:
+            screenshot_mode = "native_toolbar"
+        self._macos_screenshot_mode = screenshot_mode
         self._tray_icon: Any | None = None
         self._tray_thread: threading.Thread | None = None
         self._mac_status_item: Any | None = None
@@ -487,7 +509,7 @@ class DesktopChatApp:
         self.devices_list.bind("<Double-Button-1>", self._on_devices_list_activate)
         ctk.CTkLabel(
             self.sidebar_frame,
-            text=f"Trigger: {self._overlay_hotkey}",
+            text=f"Shot+Ask: {self._overlay_hotkey}  •  Hide: {self._overlay_hide_hotkey}",
             text_color="#a1a1a1",
             font=("Avenir", 10),
         ).pack(anchor=tk.W, pady=(0, 6))
@@ -598,6 +620,8 @@ class DesktopChatApp:
         self.root.bind("<Control-Shift-g>", self._on_shortcut_shot_ask)
         self.root.bind("<Command-Shift-v>", self._on_shortcut_clipboard_ask)
         self.root.bind("<Control-Shift-v>", self._on_shortcut_clipboard_ask)
+        self.root.bind("<Command-Shift-h>", self._on_shortcut_hide_overlay)
+        self.root.bind("<Control-Shift-h>", self._on_shortcut_hide_overlay)
         self.root.bind("<Command-Shift-o>", self._on_shortcut_open_settings)
         self.root.bind("<Control-Shift-o>", self._on_shortcut_open_settings)
         self.root.bind("<Command-Shift-p>", self._on_shortcut_focus_prompt)
@@ -615,6 +639,7 @@ class DesktopChatApp:
             (f"{mod}+Shift+C", "Connetti device selezionato o ultimo noto"),
             (f"{mod}+Shift+D", "Disconnetti bridge"),
             (f"{mod}+Shift+G", "Shot+Ask"),
+            (f"{mod}+Shift+H", "Nascondi risposta rapida"),
             (f"{mod}+Shift+V", "Clipboard+Ask"),
             (f"{mod}+Shift+O", "Apri impostazioni"),
             ("Esc", "Ferma richiesta attiva / chiudi impostazioni"),
@@ -656,6 +681,10 @@ class DesktopChatApp:
 
     def _on_shortcut_clipboard_ask(self, _event: tk.Event[Any] | None = None) -> str:
         self.on_hotkey_clipboard_triggered()
+        return "break"
+
+    def _on_shortcut_hide_overlay(self, _event: tk.Event[Any] | None = None) -> str:
+        self._dismiss_overlay_response(suppress_active=True)
         return "break"
 
     def _on_shortcut_open_settings(self, _event: tk.Event[Any] | None = None) -> str:
@@ -1320,6 +1349,9 @@ class DesktopChatApp:
         def on_clip(_icon: Any, _item: Any) -> None:
             self.root.after(0, self.on_hotkey_clipboard_triggered)
 
+        def on_hide_reply(_icon: Any, _item: Any) -> None:
+            self.root.after(0, lambda: self.events.put({"type": "hide_overlay"}))
+
         def on_reconnect(_icon: Any, _item: Any) -> None:
             self.root.after(0, self._reconnect_last_or_selected)
 
@@ -1367,6 +1399,7 @@ class DesktopChatApp:
             pystray.MenuItem("Show/Hide Window", on_toggle),
             pystray.MenuItem("Shot+Ask", on_shot),
             pystray.MenuItem("Clipboard+Ask", on_clip),
+            pystray.MenuItem("Hide Reply", on_hide_reply),
             pystray.MenuItem("Scan Devices", on_scan),
             pystray.MenuItem("Devices", device_menu),
             pystray.MenuItem("Model", model_menu),
@@ -1456,6 +1489,7 @@ class DesktopChatApp:
         add_item("Show/Hide Window", lambda: self.events.put({"type": "tray_toggle"}))
         add_item("Shot+Ask", lambda: self.events.put({"type": "tray_shot"}))
         add_item("Clipboard+Ask", lambda: self.events.put({"type": "tray_clip"}))
+        add_item("Hide Reply", lambda: self.events.put({"type": "hide_overlay"}))
         add_item("Scan Devices", lambda: self.events.put({"type": "tray_scan"}))
         devices_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Devices", None, "")
         devices_item.setSubmenu_(build_devices_submenu())
@@ -1618,7 +1652,7 @@ class DesktopChatApp:
         ctk.CTkLabel(content, text="🪟 Shot+Ask Overlay:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
         ctk.CTkLabel(
             content,
-            text="Scegli sfondo e dimensioni della finestra risposta.",
+            text="Testo rapido in basso a sinistra, con sfondo opzionale e opacita regolabile.",
             font=("Avenir", 11),
             text_color="#888888",
         ).pack(padx=12, anchor=tk.W)
@@ -1630,8 +1664,19 @@ class DesktopChatApp:
         overlay_font_size_var = tk.StringVar(value=str(self._overlay_font_size))
         overlay_text_color_var = tk.StringVar(value=self._overlay_text_color)
         overlay_theme_var = tk.StringVar(value=self._overlay_theme)
+        overlay_show_background_var = tk.BooleanVar(value=self._overlay_show_background)
+        overlay_opacity_var = tk.StringVar(value=str(int(round(self._overlay_opacity * 100))))
         overlay_auto_dismiss_var = tk.StringVar(value=str(int(self._overlay_auto_dismiss_ms / 1000)))
         overlay_streaming_var = tk.BooleanVar(value=self._overlay_streaming_enabled)
+        mac_screenshot_mode_var = tk.StringVar(
+            value=MACOS_SCREENSHOT_MODE_LABELS.get(self._macos_screenshot_mode, MACOS_SCREENSHOT_MODE_LABELS["native_toolbar"])
+        )
+
+        ctk.CTkCheckBox(
+            content,
+            text="Mostra sfondo/riquadro dietro il testo",
+            variable=overlay_show_background_var,
+        ).pack(anchor=tk.W, padx=12, pady=(6, 8))
 
         overlay_bg_row = ctk.CTkFrame(content, fg_color="transparent")
         overlay_bg_row.pack(fill=tk.X, padx=12, pady=(6, 6))
@@ -1670,6 +1715,8 @@ class DesktopChatApp:
         ctk.CTkEntry(overlay_size_row, textvariable=overlay_width_var, width=80).pack(side=tk.LEFT, padx=(0, 12))
         ctk.CTkLabel(overlay_size_row, text="Altezza:", width=70).pack(side=tk.LEFT)
         ctk.CTkEntry(overlay_size_row, textvariable=overlay_height_var, width=80).pack(side=tk.LEFT)
+        ctk.CTkLabel(overlay_size_row, text="Opacita %:", width=80).pack(side=tk.LEFT, padx=(12, 0))
+        ctk.CTkEntry(overlay_size_row, textvariable=overlay_opacity_var, width=60).pack(side=tk.LEFT)
 
         ctk.CTkCheckBox(
             content,
@@ -1701,6 +1748,24 @@ class DesktopChatApp:
             text="Streaming progressivo",
             variable=overlay_streaming_var,
         ).pack(side=tk.LEFT)
+
+        if self._is_macos:
+            mac_capture_row = ctk.CTkFrame(content, fg_color="transparent")
+            mac_capture_row.pack(fill=tk.X, padx=12, pady=(0, 12))
+            ctk.CTkLabel(mac_capture_row, text="Screenshot macOS:", width=120).pack(side=tk.LEFT)
+            ctk.CTkComboBox(
+                mac_capture_row,
+                values=[label for _, label in MACOS_SCREENSHOT_MODE_OPTIONS],
+                variable=mac_screenshot_mode_var,
+                state="readonly",
+                width=190,
+            ).pack(side=tk.LEFT, padx=(0, 12))
+            ctk.CTkLabel(
+                mac_capture_row,
+                text="Toolbar nativa = selezione/finestra dal tool di macOS",
+                font=("Avenir", 10),
+                text_color="#888888",
+            ).pack(side=tk.LEFT)
 
         # --- Section 4: Connection & macOS Shell ---
         ctk.CTkLabel(content, text="🔗 Connessione:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
@@ -1767,20 +1832,23 @@ class DesktopChatApp:
             text = textbox.get("1.0", tk.END).strip()
             self.system_instructions_var.set(text)
             self.pinned_pdf_paths = list(pinned_list_var.get())
-            self._overlay_bg_color = self._normalize_hex_color(overlay_bg_var.get(), self._overlay_bg_color)
             self._overlay_width = self._parse_int_setting(overlay_width_var.get(), self._overlay_width, 320, 1280)
             self._overlay_height = self._parse_int_setting(overlay_height_var.get(), self._overlay_height, 160, 900)
             self._overlay_resizable = bool(overlay_resizable_var.get())
             self._overlay_font_size = self._parse_int_setting(overlay_font_size_var.get(), self._overlay_font_size, 11, 28)
-            self._overlay_text_color = self._normalize_hex_color(overlay_text_color_var.get(), self._overlay_text_color)
             self._overlay_theme = overlay_theme_var.get().strip() or self._overlay_theme
+            self._overlay_show_background = bool(overlay_show_background_var.get())
+            self._overlay_opacity = (
+                self._parse_int_setting(overlay_opacity_var.get(), int(round(self._overlay_opacity * 100)), 15, 100) / 100.0
+            )
             self._overlay_auto_dismiss_ms = self._parse_int_setting(overlay_auto_dismiss_var.get(), int(self._overlay_auto_dismiss_ms / 1000), 3, 60) * 1000
             self._overlay_streaming_enabled = bool(overlay_streaming_var.get())
+            if self._is_macos:
+                selected_label = mac_screenshot_mode_var.get().strip()
+                self._macos_screenshot_mode = MACOS_SCREENSHOT_MODE_BY_LABEL.get(selected_label, "native_toolbar")
             theme_bg, theme_fg = self._overlay_theme_palette(self._overlay_theme)
-            if overlay_bg_var.get().strip() == self._overlay_bg_color:
-                self._overlay_bg_color = theme_bg
-            if overlay_text_color_var.get().strip() == self._overlay_text_color:
-                self._overlay_text_color = theme_fg
+            self._overlay_bg_color = self._normalize_hex_color(overlay_bg_var.get(), theme_bg)
+            self._overlay_text_color = self._normalize_hex_color(overlay_text_color_var.get(), theme_fg)
             self._auto_connect_on_start = bool(auto_connect_var.get())
             self._auto_retry_known_device = bool(auto_retry_var.get())
             self._auto_check_updates = bool(auto_updates_var.get())
@@ -1798,8 +1866,11 @@ class DesktopChatApp:
             old_settings["overlay_font_size"] = self._overlay_font_size
             old_settings["overlay_text_color"] = self._overlay_text_color
             old_settings["overlay_theme"] = self._overlay_theme
+            old_settings["overlay_show_background"] = self._overlay_show_background
+            old_settings["overlay_opacity_percent"] = int(round(self._overlay_opacity * 100))
             old_settings["overlay_auto_dismiss_ms"] = self._overlay_auto_dismiss_ms
             old_settings["overlay_streaming_enabled"] = self._overlay_streaming_enabled
+            old_settings["macos_screenshot_mode"] = self._macos_screenshot_mode
             old_settings["auto_connect_on_start"] = self._auto_connect_on_start
             old_settings["auto_retry_known_device"] = self._auto_retry_known_device
             old_settings["auto_check_updates"] = self._auto_check_updates
@@ -1822,7 +1893,9 @@ class DesktopChatApp:
                 (
                     f"Settings saved. Pinned PDFs: {n}. "
                     f"System instructions: {'YES' if text else 'none'}. "
-                    f"Overlay: {self._overlay_width}x{self._overlay_height}, bg {self._overlay_bg_color}. "
+                    f"Overlay: {self._overlay_width}x{self._overlay_height}, "
+                    f"{'bg on' if self._overlay_show_background else 'text only'}, "
+                    f"opacity {int(round(self._overlay_opacity * 100))}%. "
                     f"Auto-connect: {'on' if self._auto_connect_on_start else 'off'}. "
                     f"Auto-retry: {'on' if self._auto_retry_known_device else 'off'}. "
                     f"Close button to background: {'on' if self._close_to_background_on_close else 'off'}."
@@ -2264,7 +2337,11 @@ class DesktopChatApp:
         if self._is_macos:
             self._append_log(
                 "System",
-                "Overlay trigger su macOS via Apple Shortcuts: ~/.gemini_ble/ask_gemini_ble_shot.sh",
+                (
+                    "Overlay trigger su macOS via Apple Shortcuts: "
+                    "~/.gemini_ble/ask_gemini_ble_shot.sh | hide: "
+                    "~/.gemini_ble/hide_gemini_ble_overlay.sh"
+                ),
             )
             return
 
@@ -2272,16 +2349,19 @@ class DesktopChatApp:
             self._append_log("System", "Global hotkey disabled: install 'pynput' to enable overlay shortcut")
             return
 
-        combo = "<ctrl>+<shift>+g"
         try:
             listener = pynput_keyboard.GlobalHotKeys(
                 {
-                    combo: lambda: self.events.put({"type": "hotkey_overlay"}),
+                    "<ctrl>+<shift>+g": lambda: self.events.put({"type": "hotkey_overlay"}),
+                    "<ctrl>+<shift>+h": lambda: self.events.put({"type": "hide_overlay"}),
                 }
             )
             listener.start()
             self._overlay_listener = listener
-            self._append_log("System", f"Global hotkey ready: {self._overlay_hotkey}")
+            self._append_log(
+                "System",
+                f"Global hotkeys ready: {self._overlay_hotkey} / {self._overlay_hide_hotkey}",
+            )
         except Exception as exc:
             self._append_log("Error", f"Global hotkey unavailable: {exc}")
 
@@ -2289,22 +2369,110 @@ class DesktopChatApp:
         win = self._overlay_window
         if win is None or not win.winfo_exists():
             return
+        frame = self._overlay_frame
+        title_widget = self._overlay_title_widget
+        show_background = self._overlay_show_background
+        bg_color = self._overlay_bg_color
+        if not show_background and self._is_macos:
+            bg_color = "systemTransparent"
+
         try:
-            win.configure(bg=self._overlay_bg_color)
-            win.resizable(self._overlay_resizable, self._overlay_resizable)
-            win.geometry(f"{self._overlay_width}x{self._overlay_height}")
+            win.overrideredirect(not show_background)
         except Exception:
             pass
-        if self._overlay_message_widget is not None:
+        try:
+            win.attributes("-alpha", self._overlay_opacity)
+        except Exception:
+            pass
+        try:
+            if show_background:
+                if self._is_windows:
+                    try:
+                        win.wm_attributes("-transparentcolor", "")
+                    except Exception:
+                        pass
+                if self._is_macos:
+                    try:
+                        win.attributes("-transparent", False)
+                    except Exception:
+                        pass
+                win.configure(bg=bg_color)
+            else:
+                if self._is_windows:
+                    try:
+                        win.wm_attributes("-transparentcolor", self._overlay_bg_color)
+                    except Exception:
+                        pass
+                if self._is_macos:
+                    try:
+                        win.attributes("-transparent", True)
+                    except Exception:
+                        pass
+                win.configure(bg=bg_color)
+            win.resizable(self._overlay_resizable and show_background, self._overlay_resizable and show_background)
+        except Exception:
+            pass
+        if frame is not None:
             try:
-                self._overlay_message_widget.configure(
-                    bg=self._overlay_bg_color,
-                    fg=self._overlay_text_color,
-                    font=("Avenir", self._overlay_font_size),
-                    width=max(140, self._overlay_width - 30),
+                frame.configure(bg=bg_color)
+                frame.pack_configure(
+                    fill=tk.BOTH,
+                    expand=True,
+                    padx=(12 if show_background else 0),
+                    pady=(10 if show_background else 0),
                 )
             except Exception:
                 pass
+        if title_widget is not None:
+            try:
+                title_widget.configure(bg=bg_color, fg="#dbeafe", font=("Avenir", 11, "bold"))
+                if show_background:
+                    if not title_widget.winfo_manager():
+                        title_widget.pack(fill=tk.X)
+                elif title_widget.winfo_manager():
+                    title_widget.pack_forget()
+            except Exception:
+                pass
+        if self._overlay_message_widget is not None:
+            try:
+                self._overlay_message_widget.configure(
+                    bg=bg_color,
+                    fg=self._overlay_text_color,
+                    font=("Avenir", self._overlay_font_size),
+                    width=max(140, self._overlay_width - (30 if show_background else 6)),
+                    borderwidth=0,
+                    highlightthickness=0,
+                    padx=0,
+                    pady=0,
+                )
+                self._overlay_message_widget.pack_configure(
+                    fill=tk.BOTH,
+                    expand=True,
+                    pady=((8, 0) if show_background else (0, 0)),
+                )
+            except Exception:
+                pass
+        self._position_overlay_window()
+
+    def _position_overlay_window(self) -> None:
+        win = self._overlay_window
+        if win is None or not win.winfo_exists():
+            return
+        width = self._overlay_width
+        height = self._overlay_height
+        try:
+            win.update_idletasks()
+            if not self._overlay_show_background:
+                height = max(44, min(self._overlay_height, win.winfo_reqheight()))
+        except Exception:
+            pass
+        x = 18
+        bottom_margin = 54 if self._is_windows else 44
+        try:
+            y = max(12, win.winfo_screenheight() - height - bottom_margin)
+            win.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            pass
 
     def _present_overlay_window(self, force: bool = False) -> None:
         win = self._overlay_window
@@ -2322,7 +2490,7 @@ class DesktopChatApp:
             win.attributes("-topmost", True)
         except Exception:
             pass
-        if self._is_macos:
+        if self._is_macos and self._overlay_show_background:
             try:
                 self.root.tk.call("::tk::unsupported::MacWindowStyle", "style", win._w, "floating", "none")
             except Exception:
@@ -2334,6 +2502,8 @@ class DesktopChatApp:
 
     def _on_overlay_window_configure(self, event: tk.Event[Any]) -> None:
         if self._overlay_window is None or event.widget is not self._overlay_window:
+            return
+        if not self._overlay_show_background:
             return
         width = max(320, int(getattr(event, "width", self._overlay_width)))
         height = max(160, int(getattr(event, "height", self._overlay_height)))
@@ -2349,58 +2519,53 @@ class DesktopChatApp:
         clean = text.strip()
         if not clean:
             return
+        if self._overlay_suppressed:
+            return
 
         if self._overlay_window is None or not self._overlay_window.winfo_exists():
             win = tk.Toplevel(self.root)
             win.attributes("-topmost", True)
-            try:
-                win.attributes("-alpha", 0.5)
-            except Exception:
-                pass
             win.title("Gemini Quick Reply")
-            win.configure(bg=self._overlay_bg_color)
-            win.resizable(self._overlay_resizable, self._overlay_resizable)
-
-            width, height = self._overlay_width, self._overlay_height
-            x = max(12, win.winfo_screenwidth() - width - 18)
-            y = max(12, win.winfo_screenheight() - height - 40)
-            win.geometry(f"{width}x{height}+{x}+{y}")
             win.bind("<Configure>", self._on_overlay_window_configure)
 
-            frame = tk.Frame(win, bg=self._overlay_bg_color, padx=12, pady=10)
+            frame = tk.Frame(win, borderwidth=0, highlightthickness=0)
             frame.pack(fill=tk.BOTH, expand=True)
-            tk.Label(
+            title_widget = tk.Label(
                 frame,
                 text="Gemini Quick Reply",
-                bg=self._overlay_bg_color,
-                fg="#dbeafe",
-                font=("Avenir", 11, "bold"),
                 anchor="w",
-            ).pack(fill=tk.X)
+                borderwidth=0,
+                highlightthickness=0,
+            )
+            title_widget.pack(fill=tk.X)
             message_widget = tk.Message(
                 frame,
                 textvariable=self._overlay_text_var,
-                bg=self._overlay_bg_color,
-                fg=self._overlay_text_color,
-                font=("Avenir", self._overlay_font_size),
-                width=max(140, width - 30),
                 anchor="w",
                 justify=tk.LEFT,
+                borderwidth=0,
+                highlightthickness=0,
             )
             message_widget.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
             self._overlay_window = win
+            self._overlay_frame = frame
+            self._overlay_title_widget = title_widget
             self._overlay_message_widget = message_widget
-        else:
-            self._apply_overlay_window_preferences()
 
         self._overlay_text_var.set(clean[:1800])
+        self._apply_overlay_window_preferences()
         self._present_overlay_window(force=True)
         if self._overlay_hide_after_id is not None:
             self.root.after_cancel(self._overlay_hide_after_id)
             self._overlay_hide_after_id = None
         if ttl_ms > 0:
             self._overlay_hide_after_id = self.root.after(ttl_ms, self._hide_overlay_window)
+
+    def _dismiss_overlay_response(self, suppress_active: bool = True) -> None:
+        if suppress_active and self._overlay_request_ids:
+            self._overlay_suppressed = True
+        self._hide_overlay_window()
 
     def _hide_overlay_window(self) -> None:
         if self._overlay_hide_after_id is not None:
@@ -2411,6 +2576,8 @@ class DesktopChatApp:
             self._overlay_hide_after_id = None
         win = self._overlay_window
         self._overlay_window = None
+        self._overlay_frame = None
+        self._overlay_title_widget = None
         self._overlay_message_widget = None
         if win is not None and win.winfo_exists():
             win.destroy()
@@ -2426,25 +2593,30 @@ class DesktopChatApp:
                 Path(path).unlink(missing_ok=True)
             except OSError:
                 pass
+        if not self._overlay_request_ids:
+            self._overlay_suppressed = False
 
     def _cleanup_all_overlay_requests(self) -> None:
         for request_id in list(self._overlay_request_ids):
             self._cleanup_overlay_request(request_id)
+        if not self._overlay_request_ids:
+            self._overlay_suppressed = False
 
     def _check_overlay_request_timeouts(self) -> None:
         if not self._overlay_request_ids:
             return
         now = time.monotonic()
-        timed_out: list[str] = []
+        timed_out: list[tuple[str, str]] = []
         for request_id in list(self._overlay_request_ids):
             started_at = self._overlay_started_at.get(request_id, now)
-            if (now - started_at) >= self._overlay_timeout_seconds:
-                timed_out.append(request_id)
-        for request_id in timed_out:
-            self._show_overlay_message(
-                "Timeout Shot+Ask: nessuna risposta dal bridge. Riprova.",
-                ttl_ms=9000,
-            )
+            last_update_at = self._overlay_last_update_at.get(request_id, started_at)
+            if (now - started_at) >= self._overlay_hard_timeout_seconds:
+                timed_out.append((request_id, "Timeout Shot+Ask: richiesta troppo lunga."))
+                continue
+            if (now - last_update_at) >= self._overlay_stall_timeout_seconds:
+                timed_out.append((request_id, "Timeout Shot+Ask: nessun aggiornamento dal bridge."))
+        for request_id, message in timed_out:
+            self._show_overlay_message(message, ttl_ms=9000)
             self._cleanup_overlay_request(request_id)
 
     def _select_area_rect(self) -> tuple[int, int, int, int] | None:
@@ -2503,47 +2675,7 @@ class DesktopChatApp:
     def _capture_area_screenshot_path(self, log_errors: bool = True) -> str | None:
         system_name = platform.system().lower()
         if system_name == "darwin":
-            tmp = tempfile.NamedTemporaryFile(prefix="gemini-shot-", suffix=".png", delete=False)
-            path = tmp.name
-            tmp.close()
-            try:
-                Path(path).unlink(missing_ok=True)
-                result = subprocess.run(
-                    ["screencapture", "-i", "-x", path],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                )
-                stderr = (result.stderr or "").strip()
-                if result.returncode != 0:
-                    lowered = stderr.lower()
-                    if log_errors:
-                        if "cancel" in lowered:
-                            self._append_log("System", "Screenshot canceled")
-                        elif "not authorized" in lowered or "permission" in lowered:
-                            self._append_log(
-                                "Error",
-                                "Screenshot blocked: enable Screen Recording for this app in macOS Settings.",
-                            )
-                        else:
-                            detail = stderr if stderr else f"exit code {result.returncode}"
-                            self._append_log("Error", f"Screenshot failed: {detail}")
-                    Path(path).unlink(missing_ok=True)
-                    return None
-                if not Path(path).exists() or Path(path).stat().st_size <= 0:
-                    if log_errors:
-                        self._append_log("Error", "Screenshot unavailable: no file was created.")
-                    Path(path).unlink(missing_ok=True)
-                    return None
-                return path
-            except Exception as exc:
-                if log_errors:
-                    self._append_log("Error", f"Screenshot failed: {exc}")
-                try:
-                    Path(path).unlink(missing_ok=True)
-                except OSError:
-                    pass
-                return None
+            return self._capture_macos_screenshot_path(log_errors=log_errors)
 
         if ImageGrab is None:
             if log_errors:
@@ -2565,6 +2697,58 @@ class DesktopChatApp:
         except Exception as exc:
             if log_errors:
                 self._append_log("Error", f"Screenshot failed: {exc}")
+            return None
+
+    def _capture_macos_screenshot_path(self, log_errors: bool = True) -> str | None:
+        tmp = tempfile.NamedTemporaryFile(prefix="gemini-shot-", suffix=".png", delete=False)
+        path = tmp.name
+        tmp.close()
+        mode = self._macos_screenshot_mode
+        if mode == "fullscreen":
+            command = ["screencapture", "-x", path]
+        elif mode == "window":
+            command = ["screencapture", "-i", "-w", "-x", path]
+        elif mode == "selection":
+            command = ["screencapture", "-i", "-s", "-x", path]
+        else:
+            command = ["screencapture", "-i", "-U", "-J", "selection", "-x", path]
+        try:
+            Path(path).unlink(missing_ok=True)
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            stderr = (result.stderr or "").strip()
+            if result.returncode != 0:
+                lowered = stderr.lower()
+                if log_errors:
+                    if "cancel" in lowered:
+                        self._append_log("System", "Screenshot canceled")
+                    elif "not authorized" in lowered or "permission" in lowered:
+                        self._append_log(
+                            "Error",
+                            "Screenshot blocked: enable Screen Recording for this app in macOS Settings.",
+                        )
+                    else:
+                        detail = stderr if stderr else f"exit code {result.returncode}"
+                        self._append_log("Error", f"Screenshot failed: {detail}")
+                Path(path).unlink(missing_ok=True)
+                return None
+            if not Path(path).exists() or Path(path).stat().st_size <= 0:
+                if log_errors:
+                    self._append_log("System", "Screenshot canceled")
+                Path(path).unlink(missing_ok=True)
+                return None
+            return path
+        except Exception as exc:
+            if log_errors:
+                self._append_log("Error", f"Screenshot failed: {exc}")
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
             return None
 
     def _append_log(self, role: str, text: str) -> None:
@@ -2957,6 +3141,7 @@ class DesktopChatApp:
                     pass
             return False
 
+        self._overlay_suppressed = False
         self._overlay_request_ids.add(request_id)
         now = time.monotonic()
         self._overlay_started_at[request_id] = now
@@ -3159,6 +3344,9 @@ class DesktopChatApp:
             if payload_type in {"quick_clipboard_overlay", "quick_clipboard", "quick_clip_ask"}:
                 prompt = str(payload.get("prompt", "")).strip()
                 self.events.put({"type": "quick_clipboard_overlay", "prompt": prompt})
+                continue
+            if payload_type == "hide_overlay":
+                self.events.put({"type": "hide_overlay"})
                 continue
             if payload_type == "toggle_visibility":
                 self.events.put({"type": "toggle_visibility"})
@@ -3528,6 +3716,10 @@ class DesktopChatApp:
             self.on_hotkey_clipboard_triggered()
             return
 
+        if event_type == "hide_overlay":
+            self._dismiss_overlay_response(suppress_active=True)
+            return
+
         if event_type == "tray_scan":
             self.on_scan()
             return
@@ -3559,6 +3751,10 @@ class DesktopChatApp:
 
         if event_type == "hotkey_overlay":
             self.on_hotkey_overlay_triggered()
+            return
+
+        if event_type == "hotkey_hide_overlay":
+            self._dismiss_overlay_response(suppress_active=True)
             return
 
         if event_type == "quick_overlay":
@@ -3896,8 +4092,11 @@ class DesktopChatApp:
         latest_settings["overlay_font_size"] = self._overlay_font_size
         latest_settings["overlay_text_color"] = self._overlay_text_color
         latest_settings["overlay_theme"] = self._overlay_theme
+        latest_settings["overlay_show_background"] = self._overlay_show_background
+        latest_settings["overlay_opacity_percent"] = int(round(self._overlay_opacity * 100))
         latest_settings["overlay_auto_dismiss_ms"] = self._overlay_auto_dismiss_ms
         latest_settings["overlay_streaming_enabled"] = self._overlay_streaming_enabled
+        latest_settings["macos_screenshot_mode"] = self._macos_screenshot_mode
         latest_settings["auto_connect_on_start"] = self._auto_connect_on_start
         latest_settings["auto_retry_known_device"] = self._auto_retry_known_device
         latest_settings["auto_check_updates"] = self._auto_check_updates
