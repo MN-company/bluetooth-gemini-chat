@@ -2536,22 +2536,20 @@ class DesktopChatApp:
         if self._overlay_listener is not None:
             return
 
+        if self._is_macos:
+            self._append_log(
+                "System",
+                (
+                    "Global hotkeys macOS disabilitate in-app per evitare crash al primo avvio. "
+                    "Usa i wrapper in ~/.gemini_ble/ask_gemini_ble_shot.sh, "
+                    "~/.gemini_ble/hide_gemini_ble_overlay.sh e il menu bar."
+                ),
+            )
+            return
+
         if pynput_keyboard is None:
             self._append_log("System", "Global hotkey disabled: install 'pynput' to enable assistant shortcuts")
             return
-
-        if self._is_macos:
-            trusted = self._has_accessibility_permission()
-            if trusted is False:
-                self._append_log(
-                    "System",
-                    (
-                        "Global hotkeys in attesa del permesso Accessibility. "
-                        "Fallback disponibili in ~/.gemini_ble/ask_gemini_ble_shot.sh "
-                        "e ~/.gemini_ble/hide_gemini_ble_overlay.sh"
-                    ),
-                )
-                return
 
         bindings = self._global_hotkey_bindings()
         try:
@@ -2566,10 +2564,7 @@ class DesktopChatApp:
             ready_labels = ", ".join(label for _spec, (_event_type, label) in bindings.items())
             self._append_log("System", f"Global hotkeys ready: {ready_labels}")
         except Exception as exc:
-            fallback_note = ""
-            if self._is_macos:
-                fallback_note = " | fallback wrappers in ~/.gemini_ble"
-            self._append_log("Error", f"Global hotkey unavailable: {exc}{fallback_note}")
+            self._append_log("Error", f"Global hotkey unavailable: {exc}")
 
     def _apply_overlay_window_preferences(self) -> None:
         win = self._overlay_window
