@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import platform
@@ -152,6 +153,153 @@ OVERLAY_CORNER_OPTIONS = [
 OVERLAY_CORNER_LABELS = {key: label for key, label in OVERLAY_CORNER_OPTIONS}
 OVERLAY_CORNER_BY_LABEL = {label: key for key, label in OVERLAY_CORNER_OPTIONS}
 
+DEFAULT_MAC_SHOT_ASK_HOTKEY = "Cmd+Shift+G"
+DEFAULT_MAC_TOGGLE_OVERLAY_HOTKEY = "Cmd+Shift+H"
+DEFAULT_WINDOWS_SHOT_ASK_HOTKEY = "Ctrl+Shift+G"
+DEFAULT_WINDOWS_TOGGLE_OVERLAY_HOTKEY = "Ctrl+Shift+H"
+
+MAC_HOTKEY_MODIFIER_ORDER = ["Cmd", "Ctrl", "Option", "Shift"]
+MAC_HOTKEY_MODIFIER_ALIASES = {
+    "cmd": "Cmd",
+    "command": "Cmd",
+    "⌘": "Cmd",
+    "ctrl": "Ctrl",
+    "control": "Ctrl",
+    "^": "Ctrl",
+    "option": "Option",
+    "opt": "Option",
+    "alt": "Option",
+    "⌥": "Option",
+    "shift": "Shift",
+    "⇧": "Shift",
+}
+MAC_HOTKEY_MODIFIER_FLAGS = {
+    "Cmd": 0x0100,
+    "Shift": 0x0200,
+    "Option": 0x0800,
+    "Ctrl": 0x1000,
+}
+MAC_HOTKEY_KEY_ALIASES = {
+    "return": "Return",
+    "enter": "Return",
+    "space": "Space",
+    "spacebar": "Space",
+    "tab": "Tab",
+    "esc": "Escape",
+    "escape": "Escape",
+}
+MAC_HOTKEY_KEY_CODES = {
+    "A": 0x00,
+    "S": 0x01,
+    "D": 0x02,
+    "F": 0x03,
+    "H": 0x04,
+    "G": 0x05,
+    "Z": 0x06,
+    "X": 0x07,
+    "C": 0x08,
+    "V": 0x09,
+    "B": 0x0B,
+    "Q": 0x0C,
+    "W": 0x0D,
+    "E": 0x0E,
+    "R": 0x0F,
+    "Y": 0x10,
+    "T": 0x11,
+    "1": 0x12,
+    "2": 0x13,
+    "3": 0x14,
+    "4": 0x15,
+    "6": 0x16,
+    "5": 0x17,
+    "=": 0x18,
+    "9": 0x19,
+    "7": 0x1A,
+    "-": 0x1B,
+    "8": 0x1C,
+    "0": 0x1D,
+    "]": 0x1E,
+    "O": 0x1F,
+    "U": 0x20,
+    "[": 0x21,
+    "I": 0x22,
+    "P": 0x23,
+    "Return": 0x24,
+    "L": 0x25,
+    "J": 0x26,
+    "'": 0x27,
+    "K": 0x28,
+    ";": 0x29,
+    "\\": 0x2A,
+    ",": 0x2B,
+    "/": 0x2C,
+    "N": 0x2D,
+    "M": 0x2E,
+    ".": 0x2F,
+    "Tab": 0x30,
+    "Space": 0x31,
+    "Escape": 0x35,
+}
+
+CARBON_EVENT_CLASS_KEYBOARD = 0x6B657962
+CARBON_EVENT_HOTKEY_PRESSED = 6
+CARBON_EVENT_PARAM_DIRECT_OBJECT = 0x2D2D2D2D
+CARBON_TYPE_EVENT_HOTKEY_ID = 0x686B6964
+CARBON_NO_ERR = 0
+
+
+class CarbonEventTypeSpec(ctypes.Structure):
+    _fields_ = [
+        ("eventClass", ctypes.c_uint32),
+        ("eventKind", ctypes.c_uint32),
+    ]
+
+
+class CarbonEventHotKeyID(ctypes.Structure):
+    _fields_ = [
+        ("signature", ctypes.c_uint32),
+        ("id", ctypes.c_uint32),
+    ]
+
+
+try:
+    _CARBON = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Carbon.framework/Carbon")
+except Exception:
+    _CARBON = None
+
+if _CARBON is not None:
+    _CARBON.GetApplicationEventTarget.restype = ctypes.c_void_p
+    _CARBON.InstallEventHandler.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(CarbonEventTypeSpec),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    _CARBON.InstallEventHandler.restype = ctypes.c_int32
+    _CARBON.GetEventParameter.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_void_p,
+    ]
+    _CARBON.GetEventParameter.restype = ctypes.c_int32
+    _CARBON.RegisterEventHotKey.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        CarbonEventHotKeyID,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    _CARBON.RegisterEventHotKey.restype = ctypes.c_int32
+    _CARBON.UnregisterEventHotKey.argtypes = [ctypes.c_void_p]
+    _CARBON.UnregisterEventHotKey.restype = ctypes.c_int32
+
 APP_VERSION = "0.2.4"
 GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
 
@@ -225,10 +373,15 @@ class DesktopChatApp:
         self._is_macos = platform.system().lower() == "darwin"
         self._is_windows = platform.system().lower().startswith("windows")
         self._overlay_listener: Any | None = None
-        self._overlay_hotkey = "Cmd+Shift+G" if self._is_macos else "Ctrl+Shift+G"
-        self._overlay_hide_hotkey = "Cmd+Shift+H" if self._is_macos else "Ctrl+Shift+H"
+        self._overlay_hotkey = DEFAULT_MAC_SHOT_ASK_HOTKEY if self._is_macos else DEFAULT_WINDOWS_SHOT_ASK_HOTKEY
+        self._overlay_hide_hotkey = DEFAULT_MAC_TOGGLE_OVERLAY_HOTKEY if self._is_macos else DEFAULT_WINDOWS_TOGGLE_OVERLAY_HOTKEY
         self._overlay_clipboard_hotkey = "Cmd+Shift+V" if self._is_macos else "Ctrl+Shift+V"
         self._overlay_settings_hotkey = "Cmd+Shift+O" if self._is_macos else "Ctrl+Shift+O"
+        self._overlay_shortcut_bindings: dict[str, str] = {}
+        self._mac_hotkey_handler_ref: Any | None = None
+        self._mac_hotkey_handler_proc: Any | None = None
+        self._mac_hotkey_refs: dict[int, Any] = {}
+        self._mac_hotkey_actions_by_id: dict[int, str] = {}
         self._overlay_request_ids: set[str] = set()
         self._overlay_image_paths_by_request: dict[str, str] = {}
         self._overlay_started_at: dict[str, float] = {}
@@ -245,6 +398,8 @@ class DesktopChatApp:
         self._overlay_scrollbar: tk.Scrollbar | None = None
         self._overlay_text_item: int | None = None
         self._overlay_text_var = tk.StringVar(value="")
+        self._overlay_last_message_text = ""
+        self._overlay_last_message_ttl_ms = 12000
         self._overlay_suppressed = False
         self._toggle_flag_path = self._runtime_bridge_dir / "toggle.flag"
         self._toggle_flag_mtime = 0.0
@@ -281,6 +436,15 @@ class DesktopChatApp:
         )
         self._overlay_auto_dismiss_ms = self._parse_int_setting(_saved.get("overlay_auto_dismiss_ms"), 20000, 3000, 60000)
         self._overlay_streaming_enabled = bool(_saved.get("overlay_streaming_enabled", True))
+        self._overlay_hotkey = self._normalize_hotkey_string(
+            _saved.get("hotkey_shot_ask"),
+            DEFAULT_MAC_SHOT_ASK_HOTKEY if self._is_macos else DEFAULT_WINDOWS_SHOT_ASK_HOTKEY,
+        )
+        self._overlay_hide_hotkey = self._normalize_hotkey_string(
+            _saved.get("hotkey_toggle_overlay"),
+            DEFAULT_MAC_TOGGLE_OVERLAY_HOTKEY if self._is_macos else DEFAULT_WINDOWS_TOGGLE_OVERLAY_HOTKEY,
+        )
+        self._ensure_distinct_overlay_hotkeys()
         self.web_search_enabled = tk.BooleanVar(value=bool(_saved.get("web_search_enabled", False)))
         self.thinking_enabled = tk.BooleanVar(value=bool(_saved.get("thinking_enabled", False)))
         self.thinking_auto_var = tk.BooleanVar(value=bool(_saved.get("thinking_auto", False)))
@@ -531,13 +695,10 @@ class DesktopChatApp:
         self.devices_list.bind("<Return>", self._on_devices_list_activate)
         self.devices_list.bind("<KP_Enter>", self._on_devices_list_activate)
         self.devices_list.bind("<Double-Button-1>", self._on_devices_list_activate)
+        self._overlay_hotkey_hint_var = tk.StringVar(value=self._overlay_hotkey_hint_text())
         ctk.CTkLabel(
             self.sidebar_frame,
-            text=(
-                f"Shot+Ask: {self._overlay_hotkey}  •  "
-                f"Clip: {self._overlay_clipboard_hotkey}  •  "
-                f"Hide: {self._overlay_hide_hotkey}"
-            ),
+            textvariable=self._overlay_hotkey_hint_var,
             text_color="#a1a1a1",
             font=("Avenir", 10),
         ).pack(anchor=tk.W, pady=(0, 6))
@@ -647,17 +808,74 @@ class DesktopChatApp:
         self.root.bind("<Control-Shift-c>", self._on_shortcut_connect_device)
         self.root.bind("<Command-Shift-d>", self._on_shortcut_disconnect_device)
         self.root.bind("<Control-Shift-d>", self._on_shortcut_disconnect_device)
-        self.root.bind("<Command-Shift-g>", self._on_shortcut_shot_ask)
-        self.root.bind("<Control-Shift-g>", self._on_shortcut_shot_ask)
         self.root.bind("<Command-Shift-v>", self._on_shortcut_clipboard_ask)
         self.root.bind("<Control-Shift-v>", self._on_shortcut_clipboard_ask)
-        self.root.bind("<Command-Shift-h>", self._on_shortcut_hide_overlay)
-        self.root.bind("<Control-Shift-h>", self._on_shortcut_hide_overlay)
         self.root.bind("<Command-Shift-o>", self._on_shortcut_open_settings)
         self.root.bind("<Control-Shift-o>", self._on_shortcut_open_settings)
         self.root.bind("<Command-Shift-p>", self._on_shortcut_focus_prompt)
         self.root.bind("<Control-Shift-p>", self._on_shortcut_focus_prompt)
         self.root.bind("<Escape>", self._on_shortcut_escape)
+        self._refresh_configurable_shortcut_bindings()
+
+    def _overlay_hotkey_hint_text(self) -> str:
+        return f"Shot+Ask: {self._overlay_hotkey}  •  Hide/Show: {self._overlay_hide_hotkey}"
+
+    def _refresh_hotkey_labels(self) -> None:
+        if hasattr(self, "_overlay_hotkey_hint_var"):
+            self._overlay_hotkey_hint_var.set(self._overlay_hotkey_hint_text())
+
+    def _hotkey_to_tk_sequence(self, hotkey: str) -> str | None:
+        normalized = self._normalize_hotkey_string(hotkey, "")
+        if not normalized:
+            return None
+        tokens = normalized.split("+")
+        if not tokens:
+            return None
+        key_name = tokens[-1]
+        modifiers = tokens[:-1]
+        prefix_parts: list[str] = []
+        for modifier in modifiers:
+            if modifier == "Cmd":
+                prefix_parts.append("Command")
+            elif modifier == "Ctrl":
+                prefix_parts.append("Control")
+            elif modifier == "Option":
+                prefix_parts.append("Option")
+            elif modifier == "Shift":
+                prefix_parts.append("Shift")
+        if len(key_name) == 1 and key_name.isalpha():
+            key_token = key_name.lower()
+        elif key_name == "Space":
+            key_token = "space"
+        elif key_name == "Tab":
+            key_token = "Tab"
+        elif key_name == "Return":
+            key_token = "Return"
+        elif key_name == "Escape":
+            key_token = "Escape"
+        else:
+            key_token = key_name
+        return "<" + "-".join(prefix_parts + [key_token]) + ">"
+
+    def _refresh_configurable_shortcut_bindings(self) -> None:
+        previous = getattr(self, "_overlay_shortcut_bindings", {})
+        for sequence in previous:
+            try:
+                self.root.unbind(sequence)
+            except Exception:
+                pass
+
+        bindings: dict[str, str] = {}
+        shot_sequence = self._hotkey_to_tk_sequence(self._overlay_hotkey)
+        toggle_sequence = self._hotkey_to_tk_sequence(self._overlay_hide_hotkey)
+        if shot_sequence:
+            self.root.bind(shot_sequence, self._on_shortcut_shot_ask)
+            bindings[shot_sequence] = "shot"
+        if toggle_sequence:
+            self.root.bind(toggle_sequence, self._on_shortcut_toggle_overlay)
+            bindings[toggle_sequence] = "toggle"
+        self._overlay_shortcut_bindings = bindings
+        self._refresh_hotkey_labels()
 
     def _shortcut_hint_rows(self) -> list[tuple[str, str]]:
         mod = "Cmd" if self._is_macos else "Ctrl"
@@ -669,8 +887,8 @@ class DesktopChatApp:
             (f"{mod}+Shift+S", "Scan dispositivi (globale)"),
             (f"{mod}+Shift+C", "Connetti ultimo device noto (globale)"),
             (f"{mod}+Shift+D", "Disconnetti bridge (globale)"),
-            (f"{mod}+Shift+G", "Shot+Ask (globale)"),
-            (f"{mod}+Shift+H", "Nascondi risposta rapida (globale)"),
+            (self._overlay_hotkey, "Shot+Ask (globale, configurabile)"),
+            (self._overlay_hide_hotkey, "Mostra/Nascondi risposta (globale, configurabile)"),
             (f"{mod}+Shift+V", "Clipboard+Ask (globale)"),
             (f"{mod}+Shift+O", "Apri impostazioni (globale)"),
             ("Esc", "Ferma richiesta attiva / chiudi impostazioni"),
@@ -714,8 +932,8 @@ class DesktopChatApp:
         self.on_hotkey_clipboard_triggered()
         return "break"
 
-    def _on_shortcut_hide_overlay(self, _event: tk.Event[Any] | None = None) -> str:
-        self._dismiss_overlay_response(suppress_active=True)
+    def _on_shortcut_toggle_overlay(self, _event: tk.Event[Any] | None = None) -> str:
+        self._toggle_overlay_response_visibility()
         return "break"
 
     def _on_shortcut_open_settings(self, _event: tk.Event[Any] | None = None) -> str:
@@ -764,6 +982,43 @@ class DesktopChatApp:
             value = default
         return max(low, min(high, value))
 
+    def _normalize_hotkey_string(self, raw: Any, fallback: str) -> str:
+        if not isinstance(raw, str):
+            return fallback
+        text = raw.strip()
+        if not text:
+            return fallback
+        tokens = [token.strip() for token in text.replace("-", "+").split("+") if token.strip()]
+        if not tokens:
+            return fallback
+
+        modifiers: set[str] = set()
+        key_name = ""
+        for token in tokens:
+            lower = token.lower()
+            modifier = MAC_HOTKEY_MODIFIER_ALIASES.get(lower)
+            if modifier is not None:
+                modifiers.add(modifier)
+                continue
+            if key_name:
+                return fallback
+            alias = MAC_HOTKEY_KEY_ALIASES.get(lower)
+            if alias is not None:
+                key_name = alias
+                continue
+            if len(token) == 1:
+                key_name = token.upper()
+                continue
+            return fallback
+
+        if not key_name or key_name not in MAC_HOTKEY_KEY_CODES:
+            return fallback
+
+        ordered_modifiers = [name for name in MAC_HOTKEY_MODIFIER_ORDER if name in modifiers]
+        if not ordered_modifiers:
+            return fallback
+        return "+".join(ordered_modifiers + [key_name])
+
     def _normalize_hex_color(self, raw: Any, fallback: str) -> str:
         if not isinstance(raw, str):
             return fallback
@@ -771,6 +1026,30 @@ class DesktopChatApp:
         if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
             return value
         return fallback
+
+    def _hotkey_to_carbon_registration(self, hotkey: str) -> tuple[int, int] | None:
+        normalized = self._normalize_hotkey_string(hotkey, "")
+        if not normalized:
+            return None
+        tokens = normalized.split("+")
+        key_name = tokens[-1]
+        modifiers = 0
+        for modifier_name in tokens[:-1]:
+            modifiers |= MAC_HOTKEY_MODIFIER_FLAGS.get(modifier_name, 0)
+        key_code = MAC_HOTKEY_KEY_CODES.get(key_name)
+        if key_code is None:
+            return None
+        return key_code, modifiers
+
+    def _ensure_distinct_overlay_hotkeys(self) -> None:
+        if self._overlay_hotkey != self._overlay_hide_hotkey:
+            return
+        fallback_toggle = DEFAULT_MAC_TOGGLE_OVERLAY_HOTKEY if self._is_macos else DEFAULT_WINDOWS_TOGGLE_OVERLAY_HOTKEY
+        fallback_shot = DEFAULT_MAC_SHOT_ASK_HOTKEY if self._is_macos else DEFAULT_WINDOWS_SHOT_ASK_HOTKEY
+        if self._overlay_hotkey != fallback_toggle:
+            self._overlay_hide_hotkey = fallback_toggle
+        elif self._overlay_hotkey != fallback_shot:
+            self._overlay_hotkey = fallback_shot
 
     def _save_settings(self, data: dict[str, Any]) -> None:
         try:
@@ -1984,6 +2263,34 @@ class DesktopChatApp:
             ).pack(anchor=tk.W, padx=12, pady=(0, 12))
 
         ctk.CTkLabel(content, text="⌨ Shortcuts:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
+        hotkey_shot_var = tk.StringVar(value=self._overlay_hotkey)
+        hotkey_toggle_var = tk.StringVar(value=self._overlay_hide_hotkey)
+        hotkey_row = ctk.CTkFrame(content, fg_color="transparent")
+        hotkey_row.pack(fill=tk.X, padx=12, pady=(0, 8))
+        ctk.CTkLabel(hotkey_row, text="Shot+Ask:", width=120).pack(side=tk.LEFT)
+        ctk.CTkEntry(hotkey_row, textvariable=hotkey_shot_var, width=150).pack(side=tk.LEFT, padx=(0, 12))
+        ctk.CTkLabel(hotkey_row, text="Hide/Show:", width=110).pack(side=tk.LEFT)
+        ctk.CTkEntry(hotkey_row, textvariable=hotkey_toggle_var, width=170).pack(side=tk.LEFT, padx=(0, 12))
+
+        def reset_hotkeys() -> None:
+            hotkey_shot_var.set(DEFAULT_MAC_SHOT_ASK_HOTKEY if self._is_macos else DEFAULT_WINDOWS_SHOT_ASK_HOTKEY)
+            hotkey_toggle_var.set(DEFAULT_MAC_TOGGLE_OVERLAY_HOTKEY if self._is_macos else DEFAULT_WINDOWS_TOGGLE_OVERLAY_HOTKEY)
+
+        ctk.CTkButton(
+            hotkey_row,
+            text="Default",
+            width=84,
+            command=reset_hotkeys,
+            fg_color="transparent",
+            border_width=1,
+            hover_color="#333333",
+        ).pack(side=tk.LEFT)
+        ctk.CTkLabel(
+            content,
+            text="Formato supportato: Cmd+Shift+G, Cmd+Option+H, Ctrl+Shift+J",
+            font=("Avenir", 10),
+            text_color="#888888",
+        ).pack(padx=12, pady=(0, 4), anchor=tk.W)
         for combo, description in self._shortcut_hint_rows():
             ctk.CTkLabel(
                 content,
@@ -2011,6 +2318,15 @@ class DesktopChatApp:
             if self._is_macos:
                 selected_label = mac_screenshot_mode_var.get().strip()
                 self._macos_screenshot_mode = MACOS_SCREENSHOT_MODE_BY_LABEL.get(selected_label, "native_toolbar")
+            self._overlay_hotkey = self._normalize_hotkey_string(
+                hotkey_shot_var.get(),
+                DEFAULT_MAC_SHOT_ASK_HOTKEY if self._is_macos else DEFAULT_WINDOWS_SHOT_ASK_HOTKEY,
+            )
+            self._overlay_hide_hotkey = self._normalize_hotkey_string(
+                hotkey_toggle_var.get(),
+                DEFAULT_MAC_TOGGLE_OVERLAY_HOTKEY if self._is_macos else DEFAULT_WINDOWS_TOGGLE_OVERLAY_HOTKEY,
+            )
+            self._ensure_distinct_overlay_hotkeys()
             theme_bg, theme_fg = self._overlay_theme_palette(self._overlay_theme)
             self._overlay_bg_color = self._normalize_hex_color(overlay_bg_var.get(), theme_bg)
             self._overlay_text_color = self._normalize_hex_color(overlay_text_color_var.get(), theme_fg)
@@ -2037,6 +2353,8 @@ class DesktopChatApp:
             old_settings["overlay_auto_dismiss_ms"] = self._overlay_auto_dismiss_ms
             old_settings["overlay_streaming_enabled"] = self._overlay_streaming_enabled
             old_settings["macos_screenshot_mode"] = self._macos_screenshot_mode
+            old_settings["hotkey_shot_ask"] = self._overlay_hotkey
+            old_settings["hotkey_toggle_overlay"] = self._overlay_hide_hotkey
             old_settings["auto_connect_on_start"] = self._auto_connect_on_start
             old_settings["auto_retry_known_device"] = self._auto_retry_known_device
             old_settings["auto_check_updates"] = self._auto_check_updates
@@ -2052,6 +2370,8 @@ class DesktopChatApp:
             old_settings["show_thoughts"] = self.show_thoughts_var.get()
             self._save_settings(old_settings)
             self._apply_overlay_window_preferences()
+            self._refresh_configurable_shortcut_bindings()
+            self._restart_overlay_hotkey_listener()
             if self._menu_bar_mode_enabled:
                 self._refresh_menu_bar_icon_menu()
             else:
@@ -2506,6 +2826,14 @@ class DesktopChatApp:
         return "break"
 
     def _stop_overlay_hotkey_listener(self) -> None:
+        if self._is_macos and _CARBON is not None:
+            for hotkey_ref in self._mac_hotkey_refs.values():
+                try:
+                    _CARBON.UnregisterEventHotKey(hotkey_ref)
+                except Exception:
+                    pass
+            self._mac_hotkey_refs = {}
+            self._mac_hotkey_actions_by_id = {}
         if self._overlay_listener is None:
             return
         try:
@@ -2522,9 +2850,9 @@ class DesktopChatApp:
         mod = "<cmd>" if self._is_macos else "<ctrl>"
         mod_label = "Cmd" if self._is_macos else "Ctrl"
         return {
-            f"{mod}+<shift>+g": ("hotkey_overlay", f"{mod_label}+Shift+G"),
+            self._hotkey_to_pynput_spec(self._overlay_hotkey): ("hotkey_overlay", self._overlay_hotkey),
+            self._hotkey_to_pynput_spec(self._overlay_hide_hotkey): ("hotkey_toggle_overlay", self._overlay_hide_hotkey),
             f"{mod}+<shift>+v": ("hotkey_clipboard", f"{mod_label}+Shift+V"),
-            f"{mod}+<shift>+h": ("hotkey_hide_overlay", f"{mod_label}+Shift+H"),
             f"{mod}+<shift>+o": ("hotkey_open_settings", f"{mod_label}+Shift+O"),
             f"{mod}+<shift>+p": ("hotkey_focus_prompt", f"{mod_label}+Shift+P"),
             f"{mod}+<shift>+s": ("hotkey_scan", f"{mod_label}+Shift+S"),
@@ -2532,19 +2860,43 @@ class DesktopChatApp:
             f"{mod}+<shift>+d": ("hotkey_disconnect", f"{mod_label}+Shift+D"),
         }
 
+    def _hotkey_to_pynput_spec(self, hotkey: str) -> str:
+        normalized = self._normalize_hotkey_string(hotkey, "")
+        if not normalized:
+            return ""
+        tokens = normalized.split("+")
+        key_name = tokens[-1]
+        modifier_tokens: list[str] = []
+        for modifier in tokens[:-1]:
+            if modifier == "Cmd":
+                modifier_tokens.append("<cmd>")
+            elif modifier == "Ctrl":
+                modifier_tokens.append("<ctrl>")
+            elif modifier == "Option":
+                modifier_tokens.append("<alt>")
+            elif modifier == "Shift":
+                modifier_tokens.append("<shift>")
+        return "+".join(modifier_tokens + [key_name.lower()])
+
     def _start_overlay_hotkey_listener(self) -> None:
         if self._overlay_listener is not None:
             return
 
         if self._is_macos:
-            self._append_log(
-                "System",
-                (
-                    "Global hotkeys macOS disabilitate in-app per evitare crash al primo avvio. "
-                    "Usa i wrapper in ~/.gemini_ble/ask_gemini_ble_shot.sh, "
-                    "~/.gemini_ble/hide_gemini_ble_overlay.sh e il menu bar."
-                ),
-            )
+            if self._register_macos_hotkeys():
+                self._append_log(
+                    "System",
+                    f"Global hotkeys macOS ready: {self._overlay_hotkey} / {self._overlay_hide_hotkey}",
+                )
+            else:
+                self._append_log(
+                    "System",
+                    (
+                        "Hotkey globali macOS non disponibili. "
+                        "Usa i wrapper in ~/.gemini_ble/ask_gemini_ble_shot.sh e "
+                        "~/.gemini_ble/hide_gemini_ble_overlay.sh."
+                    ),
+                )
             return
 
         if pynput_keyboard is None:
@@ -2557,6 +2909,7 @@ class DesktopChatApp:
                 {
                     spec: (lambda event_type=event_type: self.events.put({"type": event_type}))
                     for spec, (event_type, _label) in bindings.items()
+                    if spec
                 }
             )
             listener.start()
@@ -2565,6 +2918,90 @@ class DesktopChatApp:
             self._append_log("System", f"Global hotkeys ready: {ready_labels}")
         except Exception as exc:
             self._append_log("Error", f"Global hotkey unavailable: {exc}")
+
+    def _ensure_macos_hotkey_handler(self) -> bool:
+        if not self._is_macos or _CARBON is None:
+            return False
+        if self._mac_hotkey_handler_ref is not None:
+            return True
+
+        callback_type = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _handler(_call_ref: Any, event_ref: Any, _user_data: Any) -> int:
+            hotkey_id = CarbonEventHotKeyID()
+            actual_type = ctypes.c_uint32(0)
+            actual_size = ctypes.c_uint32(0)
+            status = _CARBON.GetEventParameter(
+                event_ref,
+                CARBON_EVENT_PARAM_DIRECT_OBJECT,
+                CARBON_TYPE_EVENT_HOTKEY_ID,
+                ctypes.byref(actual_type),
+                ctypes.sizeof(hotkey_id),
+                ctypes.byref(actual_size),
+                ctypes.byref(hotkey_id),
+            )
+            if status != CARBON_NO_ERR:
+                return status
+            event_type = self._mac_hotkey_actions_by_id.get(int(hotkey_id.id))
+            if event_type:
+                self.events.put({"type": event_type})
+            return CARBON_NO_ERR
+
+        self._mac_hotkey_handler_proc = callback_type(_handler)
+        handler_ref = ctypes.c_void_p()
+        event_spec = CarbonEventTypeSpec(CARBON_EVENT_CLASS_KEYBOARD, CARBON_EVENT_HOTKEY_PRESSED)
+        status = _CARBON.InstallEventHandler(
+            _CARBON.GetApplicationEventTarget(),
+            self._mac_hotkey_handler_proc,
+            1,
+            ctypes.byref(event_spec),
+            None,
+            ctypes.byref(handler_ref),
+        )
+        if status != CARBON_NO_ERR:
+            return False
+        self._mac_hotkey_handler_ref = handler_ref
+        return True
+
+    def _register_macos_hotkeys(self) -> bool:
+        if not self._ensure_macos_hotkey_handler():
+            return False
+
+        for hotkey_ref in self._mac_hotkey_refs.values():
+            try:
+                _CARBON.UnregisterEventHotKey(hotkey_ref)
+            except Exception:
+                pass
+        self._mac_hotkey_refs = {}
+        self._mac_hotkey_actions_by_id = {}
+
+        hotkey_specs = [
+            (1, self._overlay_hotkey, "hotkey_overlay"),
+            (2, self._overlay_hide_hotkey, "hotkey_toggle_overlay"),
+        ]
+        registered = 0
+        target = _CARBON.GetApplicationEventTarget()
+        for hotkey_id, hotkey_value, event_name in hotkey_specs:
+            carbon_values = self._hotkey_to_carbon_registration(hotkey_value)
+            if carbon_values is None:
+                continue
+            key_code, modifiers = carbon_values
+            hotkey_ref = ctypes.c_void_p()
+            hotkey_record = CarbonEventHotKeyID(0x47424C45, hotkey_id)
+            status = _CARBON.RegisterEventHotKey(
+                key_code,
+                modifiers,
+                hotkey_record,
+                target,
+                0,
+                ctypes.byref(hotkey_ref),
+            )
+            if status != CARBON_NO_ERR:
+                continue
+            self._mac_hotkey_refs[hotkey_id] = hotkey_ref
+            self._mac_hotkey_actions_by_id[hotkey_id] = event_name
+            registered += 1
+        return registered == len(hotkey_specs)
 
     def _apply_overlay_window_preferences(self) -> None:
         win = self._overlay_window
@@ -2846,6 +3283,9 @@ class DesktopChatApp:
         if self._overlay_suppressed:
             return
 
+        self._overlay_last_message_text = clean[:1800]
+        self._overlay_last_message_ttl_ms = ttl_ms
+
         if self._overlay_window is None or not self._overlay_window.winfo_exists():
             win = tk.Toplevel(self.root)
             win.attributes("-topmost", True)
@@ -2904,6 +3344,17 @@ class DesktopChatApp:
             self._overlay_hide_after_id = None
         if ttl_ms > 0:
             self._overlay_hide_after_id = self.root.after(ttl_ms, self._hide_overlay_window)
+
+    def _toggle_overlay_response_visibility(self) -> None:
+        win = self._overlay_window
+        if win is not None and win.winfo_exists():
+            self._dismiss_overlay_response(suppress_active=True)
+            return
+        if self._overlay_request_ids:
+            self._overlay_suppressed = False
+        if self._overlay_last_message_text:
+            ttl_ms = 0 if self._overlay_request_ids else self._overlay_last_message_ttl_ms
+            self._show_overlay_message(self._overlay_last_message_text, ttl_ms=ttl_ms)
 
     def _dismiss_overlay_response(self, suppress_active: bool = True) -> None:
         if suppress_active and self._overlay_request_ids:
@@ -4114,8 +4565,8 @@ class DesktopChatApp:
             self.on_hotkey_clipboard_triggered()
             return
 
-        if event_type == "hotkey_hide_overlay":
-            self._dismiss_overlay_response(suppress_active=True)
+        if event_type == "hotkey_toggle_overlay":
+            self._toggle_overlay_response_visibility()
             return
 
         if event_type == "hotkey_focus_prompt":
@@ -4476,6 +4927,8 @@ class DesktopChatApp:
         latest_settings["overlay_auto_dismiss_ms"] = self._overlay_auto_dismiss_ms
         latest_settings["overlay_streaming_enabled"] = self._overlay_streaming_enabled
         latest_settings["macos_screenshot_mode"] = self._macos_screenshot_mode
+        latest_settings["hotkey_shot_ask"] = self._overlay_hotkey
+        latest_settings["hotkey_toggle_overlay"] = self._overlay_hide_hotkey
         latest_settings["auto_connect_on_start"] = self._auto_connect_on_start
         latest_settings["auto_retry_known_device"] = self._auto_retry_known_device
         latest_settings["auto_check_updates"] = self._auto_check_updates
