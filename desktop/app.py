@@ -143,6 +143,15 @@ MACOS_SCREENSHOT_MODE_OPTIONS = [
 MACOS_SCREENSHOT_MODE_LABELS = {key: label for key, label in MACOS_SCREENSHOT_MODE_OPTIONS}
 MACOS_SCREENSHOT_MODE_BY_LABEL = {label: key for key, label in MACOS_SCREENSHOT_MODE_OPTIONS}
 
+OVERLAY_CORNER_OPTIONS = [
+    ("bottom_left", "Basso sinistra"),
+    ("bottom_right", "Basso destra"),
+    ("top_left", "Alto sinistra"),
+    ("top_right", "Alto destra"),
+]
+OVERLAY_CORNER_LABELS = {key: label for key, label in OVERLAY_CORNER_OPTIONS}
+OVERLAY_CORNER_BY_LABEL = {label: key for key, label in OVERLAY_CORNER_OPTIONS}
+
 APP_VERSION = "0.2.4"
 GITHUB_REPO = "MN-company/bluetooth-gemini-chat"
 
@@ -216,8 +225,10 @@ class DesktopChatApp:
         self._is_macos = platform.system().lower() == "darwin"
         self._is_windows = platform.system().lower().startswith("windows")
         self._overlay_listener: Any | None = None
-        self._overlay_hotkey = "Apple Shortcut (Cmd+Shift+G)" if self._is_macos else "Ctrl+Shift+G"
-        self._overlay_hide_hotkey = "Apple Shortcut (Cmd+Shift+H)" if self._is_macos else "Ctrl+Shift+H"
+        self._overlay_hotkey = "Cmd+Shift+G" if self._is_macos else "Ctrl+Shift+G"
+        self._overlay_hide_hotkey = "Cmd+Shift+H" if self._is_macos else "Ctrl+Shift+H"
+        self._overlay_clipboard_hotkey = "Cmd+Shift+V" if self._is_macos else "Ctrl+Shift+V"
+        self._overlay_settings_hotkey = "Cmd+Shift+O" if self._is_macos else "Ctrl+Shift+O"
         self._overlay_request_ids: set[str] = set()
         self._overlay_image_paths_by_request: dict[str, str] = {}
         self._overlay_started_at: dict[str, float] = {}
@@ -228,8 +239,11 @@ class DesktopChatApp:
         self._overlay_hide_after_id: str | None = None
         self._overlay_window: tk.Toplevel | None = None
         self._overlay_frame: tk.Frame | None = None
+        self._overlay_body_frame: tk.Frame | None = None
         self._overlay_title_widget: tk.Label | None = None
-        self._overlay_message_widget: tk.Message | None = None
+        self._overlay_message_widget: tk.Canvas | None = None
+        self._overlay_scrollbar: tk.Scrollbar | None = None
+        self._overlay_text_item: int | None = None
         self._overlay_text_var = tk.StringVar(value="")
         self._overlay_suppressed = False
         self._toggle_flag_path = self._runtime_bridge_dir / "toggle.flag"
@@ -258,12 +272,22 @@ class DesktopChatApp:
         self._overlay_font_size = self._parse_int_setting(_saved.get("overlay_font_size"), 16, 11, 28)
         self._overlay_text_color = self._normalize_hex_color(_saved.get("overlay_text_color"), "#f8fafc")
         self._overlay_theme = str(_saved.get("overlay_theme", "midnight")).strip() or "midnight"
+        self._overlay_corner = str(_saved.get("overlay_corner", "bottom_left")).strip().lower()
+        if self._overlay_corner not in OVERLAY_CORNER_LABELS:
+            self._overlay_corner = "bottom_left"
         self._overlay_show_background = bool(_saved.get("overlay_show_background", False))
         self._overlay_opacity = (
             self._parse_int_setting(_saved.get("overlay_opacity_percent"), 96, 15, 100) / 100.0
         )
         self._overlay_auto_dismiss_ms = self._parse_int_setting(_saved.get("overlay_auto_dismiss_ms"), 20000, 3000, 60000)
         self._overlay_streaming_enabled = bool(_saved.get("overlay_streaming_enabled", True))
+        self.web_search_enabled = tk.BooleanVar(value=bool(_saved.get("web_search_enabled", False)))
+        self.thinking_enabled = tk.BooleanVar(value=bool(_saved.get("thinking_enabled", False)))
+        self.thinking_auto_var = tk.BooleanVar(value=bool(_saved.get("thinking_auto", False)))
+        self.thinking_budget_var = tk.StringVar(
+            value=str(self._parse_int_setting(_saved.get("thinking_budget"), 1024, 0, 24576))
+        )
+        self.show_thoughts_var = tk.BooleanVar(value=bool(_saved.get("show_thoughts", True)))
         screenshot_mode = str(_saved.get("macos_screenshot_mode", "native_toolbar")).strip().lower()
         if screenshot_mode not in MACOS_SCREENSHOT_MODE_LABELS:
             screenshot_mode = "native_toolbar"
@@ -509,7 +533,11 @@ class DesktopChatApp:
         self.devices_list.bind("<Double-Button-1>", self._on_devices_list_activate)
         ctk.CTkLabel(
             self.sidebar_frame,
-            text=f"Shot+Ask: {self._overlay_hotkey}  •  Hide: {self._overlay_hide_hotkey}",
+            text=(
+                f"Shot+Ask: {self._overlay_hotkey}  •  "
+                f"Clip: {self._overlay_clipboard_hotkey}  •  "
+                f"Hide: {self._overlay_hide_hotkey}"
+            ),
             text_color="#a1a1a1",
             font=("Avenir", 10),
         ).pack(anchor=tk.W, pady=(0, 6))
@@ -538,19 +566,22 @@ class DesktopChatApp:
         toggles_row = ctk.CTkFrame(self.chat_area_frame, fg_color="transparent")
         toggles_row.pack(fill=tk.X, pady=(0, 6))
         
-        self.web_search_enabled = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(toggles_row, text="WEBSEARCH", variable=self.web_search_enabled, command=self._refresh_context_preview).pack(side=tk.LEFT, padx=(0, 12))
-        self.thinking_enabled = tk.BooleanVar(value=False)
-        ctk.CTkCheckBox(toggles_row, text="THINKING", variable=self.thinking_enabled, command=self._refresh_context_preview).pack(side=tk.LEFT, padx=(0, 12))
+        ctk.CTkCheckBox(
+            toggles_row,
+            text="WEBSEARCH",
+            variable=self.web_search_enabled,
+            command=lambda: self._set_web_search_enabled(self.web_search_enabled.get()),
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ctk.CTkCheckBox(
+            toggles_row,
+            text="THINKING",
+            variable=self.thinking_enabled,
+            command=lambda: self._set_thinking_enabled(self.thinking_enabled.get()),
+        ).pack(side=tk.LEFT, padx=(0, 12))
         
         self.pip_enabled = tk.BooleanVar(value=False)
         ctk.CTkCheckBox(toggles_row, text="PiP MODE", variable=self.pip_enabled, command=self._toggle_pip).pack(side=tk.LEFT)
         
-        # Hidden variables for thinking budget since they were in older UI
-        self.thinking_auto_var = tk.BooleanVar(value=False)
-        self.thinking_budget_var = tk.StringVar(value="1024")
-        self.show_thoughts_var = tk.BooleanVar(value=True)
-
         self.context_preview_var = tk.StringVar(value="No active attachments")
         ctk.CTkLabel(toggles_row, textvariable=self.context_preview_var, text_color="#a1a1a1", font=("Avenir", 11)).pack(side=tk.RIGHT)
 
@@ -634,14 +665,14 @@ class DesktopChatApp:
             (f"{mod}+N", "Nuova chat"),
             (f"{mod}+R", "Rinomina chat"),
             (f"{mod}+F / {mod}+K", "Focus ricerca chat"),
-            (f"{mod}+Shift+P", "Focus composer"),
-            (f"{mod}+Shift+S", "Scan dispositivi"),
-            (f"{mod}+Shift+C", "Connetti device selezionato o ultimo noto"),
-            (f"{mod}+Shift+D", "Disconnetti bridge"),
-            (f"{mod}+Shift+G", "Shot+Ask"),
-            (f"{mod}+Shift+H", "Nascondi risposta rapida"),
-            (f"{mod}+Shift+V", "Clipboard+Ask"),
-            (f"{mod}+Shift+O", "Apri impostazioni"),
+            (f"{mod}+Shift+P", "Focus composer (globale)"),
+            (f"{mod}+Shift+S", "Scan dispositivi (globale)"),
+            (f"{mod}+Shift+C", "Connetti ultimo device noto (globale)"),
+            (f"{mod}+Shift+D", "Disconnetti bridge (globale)"),
+            (f"{mod}+Shift+G", "Shot+Ask (globale)"),
+            (f"{mod}+Shift+H", "Nascondi risposta rapida (globale)"),
+            (f"{mod}+Shift+V", "Clipboard+Ask (globale)"),
+            (f"{mod}+Shift+O", "Apri impostazioni (globale)"),
             ("Esc", "Ferma richiesta attiva / chiudi impostazioni"),
         ]
 
@@ -776,6 +807,35 @@ class DesktopChatApp:
         if self._menu_bar_mode_enabled:
             self._stop_menu_bar_icon()
             self._start_menu_bar_icon_if_needed()
+
+    def _set_web_search_enabled(self, enabled: bool, persist: bool = True) -> None:
+        self.web_search_enabled.set(bool(enabled))
+        self._refresh_context_preview()
+        if persist:
+            self._update_settings({"web_search_enabled": self.web_search_enabled.get()})
+        if self._menu_bar_mode_enabled:
+            self._refresh_menu_bar_icon_menu()
+
+    def _set_thinking_enabled(self, enabled: bool, persist: bool = True) -> None:
+        self.thinking_enabled.set(bool(enabled))
+        self._refresh_context_preview()
+        if persist:
+            self._update_settings({"thinking_enabled": self.thinking_enabled.get()})
+        if self._menu_bar_mode_enabled:
+            self._refresh_menu_bar_icon_menu()
+
+    def _tray_model_entries(self) -> list[tuple[str, str]]:
+        selected = self.model_var.get().strip() if hasattr(self, "model_var") else self._default_model
+        return [
+            (f"{'●' if model == selected else '○'} {model}", model)
+            for model in MODEL_PRESETS
+        ]
+
+    def _tray_binary_option_entries(self, enabled: bool) -> list[tuple[str, bool]]:
+        return [
+            (f"{'●' if enabled else '○'} On", True),
+            (f"{'○' if enabled else '●'} Off", False),
+        ]
 
     def _open_external_url(self, url: str, use_ssl_fallback: bool = False) -> bytes:
         request = urlrequest.Request(url, headers={"User-Agent": f"BluetoothGeminiChat/{APP_VERSION}"})
@@ -1094,6 +1154,7 @@ class DesktopChatApp:
                 }
             )
             self._append_log("System", "macOS permissions setup complete")
+            self._restart_overlay_hotkey_listener()
             dialog.destroy()
             self._permissions_dialog = None
 
@@ -1366,6 +1427,11 @@ class DesktopChatApp:
                 self.root.after(0, lambda: self.events.put({"type": "tray_model", "model": model_name}))
             return _handler
 
+        def make_flag_handler(event_name: str, enabled: bool) -> Any:
+            def _handler(_icon: Any, _item: Any) -> None:
+                self.root.after(0, lambda: self.events.put({"type": event_name, "enabled": enabled}))
+            return _handler
+
         def make_device_handler(address: str) -> Any:
             def _handler(_icon: Any, _item: Any) -> None:
                 self.root.after(0, lambda: self.events.put({"type": "tray_connect_device", "address": address}))
@@ -1377,10 +1443,10 @@ class DesktopChatApp:
         model_menu = pystray.Menu(
             *[
                 pystray.MenuItem(
-                    f"{'●' if model == self.model_var.get().strip() else '○'} {model}",
+                    label,
                     make_model_handler(model),
                 )
-                for model in MODEL_PRESETS
+                for label, model in self._tray_model_entries()
             ]
         )
         device_menu = pystray.Menu(
@@ -1393,6 +1459,18 @@ class DesktopChatApp:
                 for label, address in self._tray_device_entries()
             ]
         )
+        web_search_menu = pystray.Menu(
+            *[
+                pystray.MenuItem(label, make_flag_handler("tray_set_web_search", enabled))
+                for label, enabled in self._tray_binary_option_entries(self.web_search_enabled.get())
+            ]
+        )
+        thinking_menu = pystray.Menu(
+            *[
+                pystray.MenuItem(label, make_flag_handler("tray_set_thinking", enabled))
+                for label, enabled in self._tray_binary_option_entries(self.thinking_enabled.get())
+            ]
+        )
         menu = pystray.Menu(
             pystray.MenuItem(self._tray_status_label(), lambda _icon, _item: None, enabled=False),
             pystray.Menu.SEPARATOR,
@@ -1402,7 +1480,9 @@ class DesktopChatApp:
             pystray.MenuItem("Hide Reply", on_hide_reply),
             pystray.MenuItem("Scan Devices", on_scan),
             pystray.MenuItem("Devices", device_menu),
-            pystray.MenuItem("Model", model_menu),
+            pystray.MenuItem("Models", model_menu),
+            pystray.MenuItem("Web Search", web_search_menu),
+            pystray.MenuItem("Thinking", thinking_menu),
             pystray.MenuItem("Open Settings", on_settings),
             pystray.MenuItem("Reconnect", on_reconnect),
             pystray.MenuItem("Quit", on_quit),
@@ -1484,6 +1564,30 @@ class DesktopChatApp:
                 targets.append(target)
             return submenu
 
+        def build_models_submenu() -> Any:
+            submenu = NSMenu.alloc().init()
+            for label, model in self._tray_model_entries():
+                target = _MacMenuActionTarget.alloc().initWithCallback_(
+                    lambda chosen=model: self.events.put({"type": "tray_model", "model": chosen})
+                )
+                item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(label, "onAction:", "")
+                item.setTarget_(target)
+                submenu.addItem_(item)
+                targets.append(target)
+            return submenu
+
+        def build_toggle_submenu(event_name: str, enabled: bool) -> Any:
+            submenu = NSMenu.alloc().init()
+            for label, value in self._tray_binary_option_entries(enabled):
+                target = _MacMenuActionTarget.alloc().initWithCallback_(
+                    lambda selected=value, event_type=event_name: self.events.put({"type": event_type, "enabled": selected})
+                )
+                item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(label, "onAction:", "")
+                item.setTarget_(target)
+                submenu.addItem_(item)
+                targets.append(target)
+            return submenu
+
         add_disabled_item(self._tray_status_label())
         menu.addItem_(NSMenuItem.separatorItem())
         add_item("Show/Hide Window", lambda: self.events.put({"type": "tray_toggle"}))
@@ -1494,10 +1598,15 @@ class DesktopChatApp:
         devices_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Devices", None, "")
         devices_item.setSubmenu_(build_devices_submenu())
         menu.addItem_(devices_item)
-        menu.addItem_(NSMenuItem.separatorItem())
-        for model in MODEL_PRESETS:
-            marker = "● " if model == self.model_var.get().strip() else "○ "
-            add_item(f"{marker}{model}", lambda m=model: self.events.put({"type": "tray_model", "model": m}))
+        models_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Models", None, "")
+        models_item.setSubmenu_(build_models_submenu())
+        menu.addItem_(models_item)
+        web_search_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Web Search", None, "")
+        web_search_item.setSubmenu_(build_toggle_submenu("tray_set_web_search", self.web_search_enabled.get()))
+        menu.addItem_(web_search_item)
+        thinking_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Thinking", None, "")
+        thinking_item.setSubmenu_(build_toggle_submenu("tray_set_thinking", self.thinking_enabled.get()))
+        menu.addItem_(thinking_item)
         menu.addItem_(NSMenuItem.separatorItem())
         add_item("Open Settings", lambda: self.events.put({"type": "tray_open_settings"}))
         add_item("Reconnect", lambda: self.events.put({"type": "tray_reconnect"}))
@@ -1652,7 +1761,7 @@ class DesktopChatApp:
         ctk.CTkLabel(content, text="🪟 Shot+Ask Overlay:", font=("Avenir", 14, "bold")).pack(pady=(4, 4), padx=12, anchor=tk.W)
         ctk.CTkLabel(
             content,
-            text="Testo rapido in basso a sinistra, con sfondo opzionale e opacita regolabile.",
+            text="Risposta rapida nell'angolo scelto, con solo testo o riquadro opzionale, colori personalizzati e scroll.",
             font=("Avenir", 11),
             text_color="#888888",
         ).pack(padx=12, anchor=tk.W)
@@ -1664,6 +1773,9 @@ class DesktopChatApp:
         overlay_font_size_var = tk.StringVar(value=str(self._overlay_font_size))
         overlay_text_color_var = tk.StringVar(value=self._overlay_text_color)
         overlay_theme_var = tk.StringVar(value=self._overlay_theme)
+        overlay_corner_var = tk.StringVar(
+            value=OVERLAY_CORNER_LABELS.get(self._overlay_corner, OVERLAY_CORNER_LABELS["bottom_left"])
+        )
         overlay_show_background_var = tk.BooleanVar(value=self._overlay_show_background)
         overlay_opacity_var = tk.StringVar(value=str(int(round(self._overlay_opacity * 100))))
         overlay_auto_dismiss_var = tk.StringVar(value=str(int(self._overlay_auto_dismiss_ms / 1000)))
@@ -1671,6 +1783,23 @@ class DesktopChatApp:
         mac_screenshot_mode_var = tk.StringVar(
             value=MACOS_SCREENSHOT_MODE_LABELS.get(self._macos_screenshot_mode, MACOS_SCREENSHOT_MODE_LABELS["native_toolbar"])
         )
+
+        position_row = ctk.CTkFrame(content, fg_color="transparent")
+        position_row.pack(fill=tk.X, padx=12, pady=(6, 6))
+        ctk.CTkLabel(position_row, text="Angolo:", width=120).pack(side=tk.LEFT)
+        ctk.CTkComboBox(
+            position_row,
+            values=[label for _, label in OVERLAY_CORNER_OPTIONS],
+            variable=overlay_corner_var,
+            state="readonly",
+            width=180,
+        ).pack(side=tk.LEFT, padx=(0, 12))
+        ctk.CTkLabel(
+            position_row,
+            text="L'overlay resta sempre ancorato all'angolo scelto",
+            font=("Avenir", 10),
+            text_color="#888888",
+        ).pack(side=tk.LEFT)
 
         ctk.CTkCheckBox(
             content,
@@ -1709,6 +1838,37 @@ class DesktopChatApp:
 
         overlay_bg_var.trace_add("write", on_overlay_bg_changed)
 
+        overlay_text_row = ctk.CTkFrame(content, fg_color="transparent")
+        overlay_text_row.pack(fill=tk.X, padx=12, pady=(0, 6))
+        ctk.CTkLabel(overlay_text_row, text="Testo (#RRGGBB):", width=120).pack(side=tk.LEFT)
+        ctk.CTkEntry(overlay_text_row, textvariable=overlay_text_color_var, width=120).pack(side=tk.LEFT, padx=(0, 8))
+        text_color_swatch = tk.Frame(
+            overlay_text_row,
+            width=24,
+            height=24,
+            bg=self._overlay_text_color,
+            highlightthickness=1,
+            highlightbackground="#555555",
+        )
+        text_color_swatch.pack(side=tk.LEFT, padx=(0, 8))
+        text_color_swatch.pack_propagate(False)
+
+        def choose_overlay_text() -> None:
+            _, picked = colorchooser.askcolor(color=overlay_text_color_var.get().strip(), parent=dialog, title="Colore testo overlay")
+            if not picked:
+                return
+            overlay_text_color_var.set(picked)
+            text_color_swatch.configure(bg=picked)
+
+        ctk.CTkButton(overlay_text_row, text="Scegli", width=80, command=choose_overlay_text).pack(side=tk.LEFT)
+
+        def on_overlay_text_changed(*_: Any) -> None:
+            value = self._normalize_hex_color(overlay_text_color_var.get(), "")
+            if value:
+                text_color_swatch.configure(bg=value)
+
+        overlay_text_color_var.trace_add("write", on_overlay_text_changed)
+
         overlay_size_row = ctk.CTkFrame(content, fg_color="transparent")
         overlay_size_row.pack(fill=tk.X, padx=12, pady=(0, 8))
         ctk.CTkLabel(overlay_size_row, text="Larghezza:", width=120).pack(side=tk.LEFT)
@@ -1736,8 +1896,12 @@ class DesktopChatApp:
         ).pack(side=tk.LEFT, padx=(0, 12))
         ctk.CTkLabel(appearance_row, text="Font:", width=50).pack(side=tk.LEFT)
         ctk.CTkEntry(appearance_row, textvariable=overlay_font_size_var, width=60).pack(side=tk.LEFT, padx=(0, 12))
-        ctk.CTkLabel(appearance_row, text="Text:", width=50).pack(side=tk.LEFT)
-        ctk.CTkEntry(appearance_row, textvariable=overlay_text_color_var, width=100).pack(side=tk.LEFT)
+        ctk.CTkLabel(
+            appearance_row,
+            text="Scroll: mouse wheel / trackpad",
+            font=("Avenir", 10),
+            text_color="#888888",
+        ).pack(side=tk.LEFT)
 
         behavior_row = ctk.CTkFrame(content, fg_color="transparent")
         behavior_row.pack(fill=tk.X, padx=12, pady=(0, 12))
@@ -1837,6 +2001,7 @@ class DesktopChatApp:
             self._overlay_resizable = bool(overlay_resizable_var.get())
             self._overlay_font_size = self._parse_int_setting(overlay_font_size_var.get(), self._overlay_font_size, 11, 28)
             self._overlay_theme = overlay_theme_var.get().strip() or self._overlay_theme
+            self._overlay_corner = OVERLAY_CORNER_BY_LABEL.get(overlay_corner_var.get().strip(), "bottom_left")
             self._overlay_show_background = bool(overlay_show_background_var.get())
             self._overlay_opacity = (
                 self._parse_int_setting(overlay_opacity_var.get(), int(round(self._overlay_opacity * 100)), 15, 100) / 100.0
@@ -1866,6 +2031,7 @@ class DesktopChatApp:
             old_settings["overlay_font_size"] = self._overlay_font_size
             old_settings["overlay_text_color"] = self._overlay_text_color
             old_settings["overlay_theme"] = self._overlay_theme
+            old_settings["overlay_corner"] = self._overlay_corner
             old_settings["overlay_show_background"] = self._overlay_show_background
             old_settings["overlay_opacity_percent"] = int(round(self._overlay_opacity * 100))
             old_settings["overlay_auto_dismiss_ms"] = self._overlay_auto_dismiss_ms
@@ -1879,10 +2045,15 @@ class DesktopChatApp:
             old_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
             old_settings["last_connected_address"] = self._last_connected_address
             old_settings["default_model"] = self._default_model
+            old_settings["web_search_enabled"] = self.web_search_enabled.get()
+            old_settings["thinking_enabled"] = self.thinking_enabled.get()
+            old_settings["thinking_auto"] = self.thinking_auto_var.get()
+            old_settings["thinking_budget"] = self.thinking_budget_var.get().strip() or "1024"
+            old_settings["show_thoughts"] = self.show_thoughts_var.get()
             self._save_settings(old_settings)
             self._apply_overlay_window_preferences()
             if self._menu_bar_mode_enabled:
-                self._start_menu_bar_icon_if_needed()
+                self._refresh_menu_bar_icon_menu()
             else:
                 self._stop_menu_bar_icon()
             self._apply_macos_activation_policy()
@@ -1894,6 +2065,7 @@ class DesktopChatApp:
                     f"Settings saved. Pinned PDFs: {n}. "
                     f"System instructions: {'YES' if text else 'none'}. "
                     f"Overlay: {self._overlay_width}x{self._overlay_height}, "
+                    f"{OVERLAY_CORNER_LABELS.get(self._overlay_corner, self._overlay_corner)}, "
                     f"{'bg on' if self._overlay_show_background else 'text only'}, "
                     f"opacity {int(round(self._overlay_opacity * 100))}%. "
                     f"Auto-connect: {'on' if self._auto_connect_on_start else 'off'}. "
@@ -2333,43 +2505,78 @@ class DesktopChatApp:
         self.prompt_entry.delete("1.0", tk.END)
         return "break"
 
+    def _stop_overlay_hotkey_listener(self) -> None:
+        if self._overlay_listener is None:
+            return
+        try:
+            self._overlay_listener.stop()
+        except Exception:
+            pass
+        self._overlay_listener = None
+
+    def _restart_overlay_hotkey_listener(self) -> None:
+        self._stop_overlay_hotkey_listener()
+        self._start_overlay_hotkey_listener()
+
+    def _global_hotkey_bindings(self) -> dict[str, tuple[str, str]]:
+        mod = "<cmd>" if self._is_macos else "<ctrl>"
+        mod_label = "Cmd" if self._is_macos else "Ctrl"
+        return {
+            f"{mod}+<shift>+g": ("hotkey_overlay", f"{mod_label}+Shift+G"),
+            f"{mod}+<shift>+v": ("hotkey_clipboard", f"{mod_label}+Shift+V"),
+            f"{mod}+<shift>+h": ("hotkey_hide_overlay", f"{mod_label}+Shift+H"),
+            f"{mod}+<shift>+o": ("hotkey_open_settings", f"{mod_label}+Shift+O"),
+            f"{mod}+<shift>+p": ("hotkey_focus_prompt", f"{mod_label}+Shift+P"),
+            f"{mod}+<shift>+s": ("hotkey_scan", f"{mod_label}+Shift+S"),
+            f"{mod}+<shift>+c": ("hotkey_reconnect", f"{mod_label}+Shift+C"),
+            f"{mod}+<shift>+d": ("hotkey_disconnect", f"{mod_label}+Shift+D"),
+        }
+
     def _start_overlay_hotkey_listener(self) -> None:
-        if self._is_macos:
-            self._append_log(
-                "System",
-                (
-                    "Overlay trigger su macOS via Apple Shortcuts: "
-                    "~/.gemini_ble/ask_gemini_ble_shot.sh | hide: "
-                    "~/.gemini_ble/hide_gemini_ble_overlay.sh"
-                ),
-            )
+        if self._overlay_listener is not None:
             return
 
         if pynput_keyboard is None:
-            self._append_log("System", "Global hotkey disabled: install 'pynput' to enable overlay shortcut")
+            self._append_log("System", "Global hotkey disabled: install 'pynput' to enable assistant shortcuts")
             return
 
+        if self._is_macos:
+            trusted = self._has_accessibility_permission()
+            if trusted is False:
+                self._append_log(
+                    "System",
+                    (
+                        "Global hotkeys in attesa del permesso Accessibility. "
+                        "Fallback disponibili in ~/.gemini_ble/ask_gemini_ble_shot.sh "
+                        "e ~/.gemini_ble/hide_gemini_ble_overlay.sh"
+                    ),
+                )
+                return
+
+        bindings = self._global_hotkey_bindings()
         try:
             listener = pynput_keyboard.GlobalHotKeys(
                 {
-                    "<ctrl>+<shift>+g": lambda: self.events.put({"type": "hotkey_overlay"}),
-                    "<ctrl>+<shift>+h": lambda: self.events.put({"type": "hide_overlay"}),
+                    spec: (lambda event_type=event_type: self.events.put({"type": event_type}))
+                    for spec, (event_type, _label) in bindings.items()
                 }
             )
             listener.start()
             self._overlay_listener = listener
-            self._append_log(
-                "System",
-                f"Global hotkeys ready: {self._overlay_hotkey} / {self._overlay_hide_hotkey}",
-            )
+            ready_labels = ", ".join(label for _spec, (_event_type, label) in bindings.items())
+            self._append_log("System", f"Global hotkeys ready: {ready_labels}")
         except Exception as exc:
-            self._append_log("Error", f"Global hotkey unavailable: {exc}")
+            fallback_note = ""
+            if self._is_macos:
+                fallback_note = " | fallback wrappers in ~/.gemini_ble"
+            self._append_log("Error", f"Global hotkey unavailable: {exc}{fallback_note}")
 
     def _apply_overlay_window_preferences(self) -> None:
         win = self._overlay_window
         if win is None or not win.winfo_exists():
             return
         frame = self._overlay_frame
+        body_frame = self._overlay_body_frame
         title_widget = self._overlay_title_widget
         show_background = self._overlay_show_background
         bg_color = self._overlay_bg_color
@@ -2433,26 +2640,139 @@ class DesktopChatApp:
                     title_widget.pack_forget()
             except Exception:
                 pass
-        if self._overlay_message_widget is not None:
+        if body_frame is not None:
             try:
-                self._overlay_message_widget.configure(
-                    bg=bg_color,
-                    fg=self._overlay_text_color,
-                    font=("Avenir", self._overlay_font_size),
-                    width=max(140, self._overlay_width - (30 if show_background else 6)),
-                    borderwidth=0,
-                    highlightthickness=0,
-                    padx=0,
-                    pady=0,
-                )
-                self._overlay_message_widget.pack_configure(
+                body_frame.configure(bg=bg_color)
+                body_frame.pack_configure(
                     fill=tk.BOTH,
                     expand=True,
                     pady=((8, 0) if show_background else (0, 0)),
                 )
             except Exception:
                 pass
+        if self._overlay_message_widget is not None:
+            try:
+                self._overlay_message_widget.configure(
+                    bg=bg_color,
+                    borderwidth=0,
+                    highlightthickness=0,
+                    relief=tk.FLAT,
+                    yscrollincrement=max(14, self._overlay_font_size + 2),
+                )
+                if self._overlay_text_item is not None:
+                    self._overlay_message_widget.itemconfigure(
+                        self._overlay_text_item,
+                        fill=self._overlay_text_color,
+                        font=("Avenir", self._overlay_font_size),
+                        width=self._overlay_text_width(),
+                    )
+            except Exception:
+                pass
+        if self._overlay_scrollbar is not None:
+            try:
+                if show_background:
+                    if not self._overlay_scrollbar.winfo_manager():
+                        self._overlay_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+                elif self._overlay_scrollbar.winfo_manager():
+                    self._overlay_scrollbar.pack_forget()
+            except Exception:
+                pass
+        self._update_overlay_scrollregion(reset_view=False)
         self._position_overlay_window()
+
+    def _overlay_text_width(self, fallback_width: int | None = None) -> int:
+        base_width = fallback_width if fallback_width is not None else self._overlay_width
+        padding = 56 if self._overlay_show_background else 8
+        return max(140, base_width - padding)
+
+    def _update_overlay_scrollregion(self, reset_view: bool = False) -> None:
+        canvas = self._overlay_message_widget
+        text_item = self._overlay_text_item
+        if canvas is None or text_item is None or not canvas.winfo_exists():
+            return
+        try:
+            canvas.update_idletasks()
+            canvas_width = canvas.winfo_width()
+        except Exception:
+            canvas_width = 0
+        wrap_width = self._overlay_text_width()
+        if canvas_width > 8:
+            wrap_width = max(140, canvas_width - 4)
+        try:
+            canvas.itemconfigure(text_item, width=wrap_width)
+            canvas.update_idletasks()
+            bbox = canvas.bbox(text_item)
+            if bbox:
+                text_height = max(1, bbox[3] - bbox[1])
+                canvas.configure(scrollregion=(0, 0, wrap_width, text_height + 6))
+            else:
+                canvas.configure(scrollregion=(0, 0, wrap_width, 1))
+            if reset_view:
+                canvas.yview_moveto(0.0)
+        except Exception:
+            pass
+
+    def _set_overlay_message_text(self, text: str, reset_view: bool = True) -> None:
+        clean = text[:1800]
+        self._overlay_text_var.set(clean)
+        canvas = self._overlay_message_widget
+        text_item = self._overlay_text_item
+        if canvas is None or text_item is None:
+            return
+        try:
+            canvas.itemconfigure(text_item, text=clean)
+        except Exception:
+            return
+        self._update_overlay_scrollregion(reset_view=reset_view)
+
+    def _scroll_overlay_canvas(self, units: int) -> None:
+        canvas = self._overlay_message_widget
+        if canvas is None or not canvas.winfo_exists():
+            return
+        try:
+            canvas.yview_scroll(units, "units")
+        except Exception:
+            pass
+
+    def _on_overlay_mousewheel(self, event: tk.Event[Any]) -> str:
+        delta = 0
+        raw_delta = getattr(event, "delta", 0)
+        if raw_delta:
+            delta = -1 if raw_delta > 0 else 1
+        else:
+            button_num = getattr(event, "num", None)
+            if button_num == 4:
+                delta = -1
+            elif button_num == 5:
+                delta = 1
+        if delta:
+            self._scroll_overlay_canvas(delta)
+        return "break"
+
+    def _on_overlay_key_scroll(self, event: tk.Event[Any]) -> str:
+        canvas = self._overlay_message_widget
+        if canvas is None or not canvas.winfo_exists():
+            return "break"
+        keysym = str(getattr(event, "keysym", "")).lower()
+        if keysym == "up":
+            self._scroll_overlay_canvas(-1)
+        elif keysym == "down":
+            self._scroll_overlay_canvas(1)
+        elif keysym in {"prior", "pageup"}:
+            self._scroll_overlay_canvas(-6)
+        elif keysym in {"next", "pagedown"}:
+            self._scroll_overlay_canvas(6)
+        elif keysym == "home":
+            try:
+                canvas.yview_moveto(0.0)
+            except Exception:
+                pass
+        elif keysym == "end":
+            try:
+                canvas.yview_moveto(1.0)
+            except Exception:
+                pass
+        return "break"
 
     def _position_overlay_window(self) -> None:
         win = self._overlay_window
@@ -2462,14 +2782,27 @@ class DesktopChatApp:
         height = self._overlay_height
         try:
             win.update_idletasks()
-            if not self._overlay_show_background:
-                height = max(44, min(self._overlay_height, win.winfo_reqheight()))
+            if not self._overlay_show_background and self._overlay_message_widget is not None and self._overlay_text_item is not None:
+                bbox = self._overlay_message_widget.bbox(self._overlay_text_item)
+                if bbox:
+                    text_height = max(44, bbox[3] - bbox[1] + 6)
+                    height = max(44, min(self._overlay_height, text_height))
+                else:
+                    height = max(44, min(self._overlay_height, win.winfo_reqheight()))
         except Exception:
             pass
-        x = 18
+        left_margin = 18
+        right_margin = 18
+        top_margin = 18
         bottom_margin = 54 if self._is_windows else 44
         try:
-            y = max(12, win.winfo_screenheight() - height - bottom_margin)
+            screen_width = win.winfo_screenwidth()
+            screen_height = win.winfo_screenheight()
+            x = left_margin if "left" in self._overlay_corner else max(12, screen_width - width - right_margin)
+            if "top" in self._overlay_corner:
+                y = top_margin
+            else:
+                y = max(12, screen_height - height - bottom_margin)
             win.geometry(f"{width}x{height}+{x}+{y}")
         except Exception:
             pass
@@ -2509,11 +2842,7 @@ class DesktopChatApp:
         height = max(160, int(getattr(event, "height", self._overlay_height)))
         self._overlay_width = width
         self._overlay_height = height
-        if self._overlay_message_widget is not None:
-            try:
-                self._overlay_message_widget.configure(width=max(140, width - 30))
-            except Exception:
-                pass
+        self._update_overlay_scrollregion(reset_view=False)
 
     def _show_overlay_message(self, text: str, ttl_ms: int = 12000) -> None:
         clean = text.strip()
@@ -2538,22 +2867,41 @@ class DesktopChatApp:
                 highlightthickness=0,
             )
             title_widget.pack(fill=tk.X)
-            message_widget = tk.Message(
-                frame,
-                textvariable=self._overlay_text_var,
-                anchor="w",
-                justify=tk.LEFT,
+            body_frame = tk.Frame(frame, borderwidth=0, highlightthickness=0)
+            body_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+            message_widget = tk.Canvas(
+                body_frame,
                 borderwidth=0,
                 highlightthickness=0,
             )
-            message_widget.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+            scrollbar = tk.Scrollbar(body_frame, orient=tk.VERTICAL, command=message_widget.yview)
+            message_widget.configure(yscrollcommand=scrollbar.set, cursor="arrow", takefocus=1)
+            message_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            text_item = message_widget.create_text(
+                0,
+                0,
+                anchor="nw",
+                justify=tk.LEFT,
+                text="",
+                width=self._overlay_text_width(),
+            )
+            for sequence in ("<MouseWheel>", "<Shift-MouseWheel>", "<Button-4>", "<Button-5>"):
+                message_widget.bind(sequence, self._on_overlay_mousewheel)
+            for sequence in ("<Up>", "<Down>", "<Prior>", "<Next>", "<Home>", "<End>"):
+                message_widget.bind(sequence, self._on_overlay_key_scroll)
+            message_widget.bind("<Button-1>", lambda _event: message_widget.focus_set())
+            message_widget.bind("<Configure>", lambda _event: self._update_overlay_scrollregion(reset_view=False))
 
             self._overlay_window = win
             self._overlay_frame = frame
+            self._overlay_body_frame = body_frame
             self._overlay_title_widget = title_widget
             self._overlay_message_widget = message_widget
+            self._overlay_scrollbar = scrollbar
+            self._overlay_text_item = text_item
 
-        self._overlay_text_var.set(clean[:1800])
+        self._set_overlay_message_text(clean, reset_view=True)
         self._apply_overlay_window_preferences()
         self._present_overlay_window(force=True)
         if self._overlay_hide_after_id is not None:
@@ -2577,8 +2925,11 @@ class DesktopChatApp:
         win = self._overlay_window
         self._overlay_window = None
         self._overlay_frame = None
+        self._overlay_body_frame = None
         self._overlay_title_widget = None
         self._overlay_message_widget = None
+        self._overlay_scrollbar = None
+        self._overlay_text_item = None
         if win is not None and win.winfo_exists():
             win.destroy()
 
@@ -3735,6 +4086,7 @@ class DesktopChatApp:
             return
 
         if event_type == "tray_open_settings":
+            self._force_app_visibility()
             self.on_open_settings()
             return
 
@@ -3745,6 +4097,16 @@ class DesktopChatApp:
                 self._append_log("System", f"Default model set to {model_name}")
             return
 
+        if event_type == "tray_set_web_search":
+            self._set_web_search_enabled(bool(event.get("enabled", False)), persist=True)
+            self._append_log("System", f"Web search {'enabled' if self.web_search_enabled.get() else 'disabled'}")
+            return
+
+        if event_type == "tray_set_thinking":
+            self._set_thinking_enabled(bool(event.get("enabled", False)), persist=True)
+            self._append_log("System", f"Thinking {'enabled' if self.thinking_enabled.get() else 'disabled'}")
+            return
+
         if event_type == "tray_quit":
             self.on_close()
             return
@@ -3753,8 +4115,34 @@ class DesktopChatApp:
             self.on_hotkey_overlay_triggered()
             return
 
+        if event_type == "hotkey_clipboard":
+            self.on_hotkey_clipboard_triggered()
+            return
+
         if event_type == "hotkey_hide_overlay":
             self._dismiss_overlay_response(suppress_active=True)
+            return
+
+        if event_type == "hotkey_focus_prompt":
+            self._force_app_visibility()
+            self.prompt_entry.focus_set()
+            return
+
+        if event_type == "hotkey_open_settings":
+            self._force_app_visibility()
+            self.on_open_settings()
+            return
+
+        if event_type == "hotkey_scan":
+            self.on_scan()
+            return
+
+        if event_type == "hotkey_reconnect":
+            self._reconnect_last_or_selected()
+            return
+
+        if event_type == "hotkey_disconnect":
+            self.on_disconnect()
             return
 
         if event_type == "quick_overlay":
@@ -4077,12 +4465,7 @@ class DesktopChatApp:
         self.on_close()
 
     def on_close(self) -> None:
-        if self._overlay_listener is not None:
-            try:
-                self._overlay_listener.stop()
-            except Exception:
-                pass
-            self._overlay_listener = None
+        self._stop_overlay_hotkey_listener()
         self._stop_menu_bar_icon()
         latest_settings = self._load_settings()
         latest_settings["overlay_bg_color"] = self._overlay_bg_color
@@ -4092,6 +4475,7 @@ class DesktopChatApp:
         latest_settings["overlay_font_size"] = self._overlay_font_size
         latest_settings["overlay_text_color"] = self._overlay_text_color
         latest_settings["overlay_theme"] = self._overlay_theme
+        latest_settings["overlay_corner"] = self._overlay_corner
         latest_settings["overlay_show_background"] = self._overlay_show_background
         latest_settings["overlay_opacity_percent"] = int(round(self._overlay_opacity * 100))
         latest_settings["overlay_auto_dismiss_ms"] = self._overlay_auto_dismiss_ms
@@ -4105,6 +4489,11 @@ class DesktopChatApp:
         latest_settings["hide_dock_icon_enabled"] = self._hide_dock_icon_enabled
         latest_settings["last_connected_address"] = self._last_connected_address
         latest_settings["default_model"] = self._default_model
+        latest_settings["web_search_enabled"] = self.web_search_enabled.get()
+        latest_settings["thinking_enabled"] = self.thinking_enabled.get()
+        latest_settings["thinking_auto"] = self.thinking_auto_var.get()
+        latest_settings["thinking_budget"] = self.thinking_budget_var.get().strip() or "1024"
+        latest_settings["show_thoughts"] = self.show_thoughts_var.get()
         self._save_settings(latest_settings)
         self._hide_overlay_window()
         self.client.stop()
