@@ -24,6 +24,9 @@ elif [ "${1:-}" = "--clip-ask" ] || [ "${1:-}" = "--clipboard-overlay" ]; then
 elif [ "${1:-}" = "--toggle" ]; then
   MODE="toggle_visibility"
   shift
+elif [ "${1:-}" = "--hide-overlay" ]; then
+  MODE="hide_overlay"
+  shift
 fi
 
 INPUT_TEXT=""

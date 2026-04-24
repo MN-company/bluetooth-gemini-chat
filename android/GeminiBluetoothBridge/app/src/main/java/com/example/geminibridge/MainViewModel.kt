@@ -19,7 +19,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
 
-const val APP_VERSION_NAME = "0.2.3"
+const val APP_VERSION_NAME = "0.2.4"
 
 @Serializable
 data class IncomingEnvelope(
@@ -376,9 +376,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun stopBridgeService() {
         val app = getApplication<Application>()
-        val intent = Intent(app, BleKeepAliveService::class.java).apply {
-            action = BleKeepAliveService.ACTION_STOP
+        val intent = Intent(app, BleKeepAliveService::class.java)
+        runCatching {
+            app.stopService(intent)
+        }.onFailure { err ->
+            BridgeRuntimeState.appendLog("Stop request failed: ${err.message}")
         }
-        app.startService(intent)
     }
 }

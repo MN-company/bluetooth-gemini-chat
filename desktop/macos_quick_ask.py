@@ -33,6 +33,11 @@ elif mode == "quick_clipboard":
         "prompt": overlay_prompt,
         "ts": time.time(),
     }
+elif mode == "hide_overlay":
+    payload = {
+        "type": "hide_overlay",
+        "ts": time.time(),
+    }
 else:
     payload = {
         "type": "toggle_visibility",
