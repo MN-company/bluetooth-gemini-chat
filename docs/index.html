@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gemini AirBridge - BLE AI bridge</title>
+  <meta name="description" content="Gemini AirBridge lets desktop clients use Gemini through an Android device over Bluetooth Low Energy.">
+  <style>
+    :root{
+      color-scheme:dark;
+      --bg:#060914;
+      --panel:#0f1728;
+      --panel2:#151f34;
+      --text:#f5f7fb;
+      --muted:#a7b0c3;
+      --line:#26344f;
+      --blue:#4ba3ff;
+      --green:#61d394;
+      --violet:#b38cff;
+      --amber:#ffcc66;
+      --red:#ff6b7a;
+      --radius:10px;
+      font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    *{box-sizing:border-box}
+    html{scroll-behavior:smooth}
+    body{margin:0;background:radial-gradient(circle at 20% 0%,rgba(75,163,255,.16),transparent 34%),radial-gradient(circle at 80% 10%,rgba(179,140,255,.14),transparent 30%),var(--bg);color:var(--text);line-height:1.5}
+    a{color:inherit}
+    .wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+    nav{position:sticky;top:0;z-index:10;background:rgba(6,9,20,.82);backdrop-filter:blur(18px);border-bottom:1px solid rgba(38,52,79,.75)}
+    .nav-inner{height:62px;display:flex;align-items:center;justify-content:space-between;gap:18px}
+    .brand{display:flex;align-items:center;gap:10px;text-decoration:none;font-weight:760}
+    .mark{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--blue),var(--violet));display:grid;place-items:center;color:#06101e;font-weight:900}
+    .nav-links{display:flex;align-items:center;gap:18px;font-size:13px;color:var(--muted)}
+    .nav-links a{text-decoration:none}.nav-links a:hover{color:var(--text)}
+    .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:1px solid var(--line);border-radius:8px;padding:10px 15px;text-decoration:none;font-size:13px;font-weight:700;background:rgba(255,255,255,.04);white-space:nowrap}
+    .btn.primary{background:linear-gradient(135deg,var(--blue),var(--violet));color:#07101f;border-color:transparent}
+    .btn:hover{transform:translateY(-1px)}
+    .hero{min-height:calc(100vh - 62px);display:grid;align-items:center;padding:72px 0 52px}
+    .hero-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(340px,.9fr);gap:54px;align-items:center}
+    .eyebrow{display:inline-flex;align-items:center;gap:8px;color:var(--green);font-weight:740;font-size:12px;text-transform:uppercase;letter-spacing:.12em;margin-bottom:18px}
+    .pulse{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 7px rgba(97,211,148,.12)}
+    h1{font-size:clamp(44px,7vw,82px);line-height:.95;letter-spacing:0;margin:0 0 22px;font-weight:860}
+    .lead{font-size:clamp(17px,2vw,21px);color:var(--muted);max-width:650px;margin:0 0 30px}
+    .actions{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:34px}
+    .hero-pills{display:flex;flex-wrap:wrap;gap:9px}
+    .pill{border:1px solid rgba(38,52,79,.9);background:rgba(15,23,40,.72);color:var(--muted);border-radius:999px;padding:7px 11px;font-size:12px}
+    .device-scene{position:relative;min-height:520px}
+    .phone{position:absolute;right:0;top:30px;width:210px;height:420px;border-radius:30px;background:#0b1221;border:1px solid #34425e;box-shadow:0 26px 80px rgba(0,0,0,.45);padding:16px}
+    .phone::before{content:"";position:absolute;top:8px;left:72px;width:66px;height:5px;border-radius:999px;background:#2c3852}
+    .screen{height:100%;border-radius:22px;background:linear-gradient(180deg,#101a2f,#081020);padding:22px 14px;border:1px solid #27344f}
+    .screen h3{font-size:14px;margin:6px 0 18px}
+    .status{display:flex;justify-content:space-between;align-items:center;border:1px solid #26344f;border-radius:8px;padding:10px;margin-bottom:10px;font-size:12px;color:var(--muted)}
+    .status strong{color:var(--green)}
+    .desktop{position:absolute;left:0;bottom:24px;width:390px;border-radius:16px;background:#101827;border:1px solid #34425e;box-shadow:0 24px 90px rgba(0,0,0,.5);overflow:hidden}
+    .bar{height:34px;background:#172238;border-bottom:1px solid #26344f;display:flex;align-items:center;gap:7px;padding:0 12px}
+    .dot{width:9px;height:9px;border-radius:50%;background:#ff6b7a}.dot:nth-child(2){background:#ffcc66}.dot:nth-child(3){background:#61d394}
+    .desk-body{padding:18px}
+    .chat{background:#0a1020;border:1px solid #26344f;border-radius:10px;padding:12px;margin-bottom:12px}
+    .chat .label{font-size:11px;color:var(--blue);font-weight:800;margin-bottom:7px}
+    .chat p{margin:0;color:var(--muted);font-size:13px}
+    .answer{border-color:rgba(97,211,148,.45);background:rgba(97,211,148,.08)}
+    .line{position:absolute;height:2px;background:linear-gradient(90deg,transparent,var(--blue),var(--violet),transparent);left:340px;right:160px;top:250px;opacity:.85;animation:flow 2.3s infinite}
+    .packet{position:absolute;width:12px;height:12px;border-radius:4px;background:var(--blue);left:352px;top:245px;box-shadow:0 0 22px rgba(75,163,255,.75);animation:packet 2.3s infinite}
+    @keyframes packet{0%{transform:translateX(0);opacity:0}18%{opacity:1}78%{opacity:1}100%{transform:translateX(250px);opacity:0}}
+    @keyframes flow{0%,100%{opacity:.4}50%{opacity:1}}
+    section{padding:76px 0;border-top:1px solid rgba(38,52,79,.7)}
+    .section-head{max-width:690px;margin-bottom:34px}
+    h2{font-size:clamp(28px,4vw,44px);line-height:1.05;margin:0 0 12px}
+    .section-head p{color:var(--muted);margin:0;font-size:17px}
+    .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+    .card{background:rgba(15,23,40,.78);border:1px solid rgba(38,52,79,.9);border-radius:var(--radius);padding:22px}
+    .card h3{margin:0 0 8px;font-size:17px}.card p{margin:0;color:var(--muted);font-size:14px}
+    .icon{width:36px;height:36px;border-radius:8px;display:grid;place-items:center;margin-bottom:14px;background:rgba(75,163,255,.12);color:var(--blue);font-weight:900}
+    .architecture{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:14px;align-items:center}
+    .node{background:#0f1728;border:1px solid #34425e;border-radius:12px;padding:20px;min-height:130px}
+    .node small{display:block;color:var(--muted);margin-bottom:8px}.node strong{font-size:18px}
+    .arrow{color:var(--blue);font-size:28px}
+    .stack{display:flex;flex-wrap:wrap;gap:10px}
+    .stack span{background:#101827;border:1px solid #34425e;border-radius:8px;padding:9px 11px;color:var(--muted);font-size:13px}
+    footer{padding:40px 0;color:var(--muted);border-top:1px solid rgba(38,52,79,.7)}
+    .footer-row{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}
+    @media(max-width:900px){
+      .hero-grid,.grid{grid-template-columns:1fr}
+      .device-scene{min-height:600px}
+      .desktop{width:min(100%,390px)}
+      .line,.packet{display:none}
+      .architecture{grid-template-columns:1fr}.arrow{transform:rotate(90deg);justify-self:center}
+      .nav-links{display:none}
+    }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="wrap nav-inner">
+      <a class="brand" href="#"><span class="mark">A</span>Gemini AirBridge</a>
+      <div class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#stack">Stack</a>
+        <a class="btn" href="https://github.com/MN-company/bluetooth-gemini-chat">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <header class="hero">
+    <div class="wrap hero-grid">
+      <div>
+        <div class="eyebrow"><span class="pulse"></span>Android-powered AI bridge</div>
+        <h1>Gemini from your desktop. Credentials on your phone.</h1>
+        <p class="lead">A cross-platform BLE workflow where macOS, Windows, and Linux clients send prompts, screenshots, clipboard content, images, PDFs, and local context to an Android device running Gemini.</p>
+        <div class="actions">
+          <a class="btn primary" href="https://github.com/MN-company/bluetooth-gemini-chat">View on GitHub</a>
+          <a class="btn" href="#architecture">See architecture</a>
+        </div>
+        <div class="hero-pills">
+          <span class="pill">Bluetooth Low Energy</span>
+          <span class="pill">Android bridge</span>
+          <span class="pill">Python desktop</span>
+          <span class="pill">Gemini API</span>
+          <span class="pill">Multi-client routing</span>
+        </div>
+      </div>
+      <div class="device-scene" aria-label="Gemini AirBridge product diagram">
+        <div class="desktop">
+          <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+          <div class="desk-body">
+            <div class="chat"><div class="label">DESKTOP CLIENT</div><p>Screenshot + PDF context sent over BLE</p></div>
+            <div class="chat answer"><div class="label">STREAMED RESPONSE</div><p>Answer returned to the correct desktop session.</p></div>
+          </div>
+        </div>
+        <div class="line"></div><div class="packet"></div>
+        <div class="phone">
+          <div class="screen">
+            <h3>Android bridge</h3>
+            <div class="status"><span>BLE service</span><strong>live</strong></div>
+            <div class="status"><span>Gemini key</span><strong>local</strong></div>
+            <div class="status"><span>Clients</span><strong>3</strong></div>
+            <div class="status"><span>Streaming</span><strong>on</strong></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <section id="features">
+    <div class="wrap">
+      <div class="section-head">
+        <h2>Built around a different AI workflow</h2>
+        <p>The phone owns the model connection. The desktop owns the interaction layer. BLE is the local bridge between them.</p>
+      </div>
+      <div class="grid">
+        <article class="card"><div class="icon">K</div><h3>API-key isolation</h3><p>Gemini credentials stay on Android instead of being copied into every desktop environment.</p></article>
+        <article class="card"><div class="icon">M</div><h3>Multimodal input</h3><p>Send typed prompts, screenshots, clipboard content, images, PDFs, and local context through one channel.</p></article>
+        <article class="card"><div class="icon">R</div><h3>Multi-client routing</h3><p>Several desktop clients can connect to one Android bridge and receive the correct streamed response.</p></article>
+        <article class="card"><div class="icon">O</div><h3>Overlay workflow</h3><p>Global shortcuts, tray/menu bar behavior, and overlay answers keep the workflow fast and low-friction.</p></article>
+        <article class="card"><div class="icon">P</div><h3>PDF context</h3><p>Local PDF extraction and chunk retrieval let the client send relevant context without a cloud backend.</p></article>
+        <article class="card"><div class="icon">B</div><h3>BLE protocol</h3><p>Custom binary framing, chunking, compression, heartbeat, and reconnect logic make BLE practical for large prompts.</p></article>
+      </div>
+    </div>
+  </section>
+
+  <section id="architecture">
+    <div class="wrap">
+      <div class="section-head">
+        <h2>Architecture</h2>
+        <p>A small local system: desktop clients talk to Android over BLE, Android talks to Gemini, and responses stream back to the requesting client.</p>
+      </div>
+      <div class="architecture">
+        <div class="node"><small>macOS / Windows / Linux</small><strong>Desktop client</strong><p>Prompt, screenshot, image, PDF, clipboard, overlay UI.</p></div>
+        <div class="arrow">→</div>
+        <div class="node"><small>Bluetooth Low Energy</small><strong>Custom transport</strong><p>GATT, framing, chunking, heartbeat, reconnect, routing IDs.</p></div>
+        <div class="arrow">→</div>
+        <div class="node"><small>Android</small><strong>Gemini bridge</strong><p>API key storage, model discovery, streaming requests, queueing.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="stack">
+    <div class="wrap">
+      <div class="section-head">
+        <h2>Technical stack</h2>
+        <p>A prototype that crosses product, mobile, desktop, transport protocols, and AI APIs.</p>
+      </div>
+      <div class="stack">
+        <span>Python</span><span>Bleak</span><span>Tkinter</span><span>pypdf</span><span>Pillow</span><span>Kotlin</span><span>Android foreground service</span><span>Coroutines</span><span>OkHttp</span><span>BLE GATT</span><span>Gemini API</span><span>GitHub Actions</span>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="wrap footer-row">
+      <span>Gemini AirBridge by Paolo Gobber</span>
+      <a href="https://github.com/MN-company/bluetooth-gemini-chat">github.com/MN-company/bluetooth-gemini-chat</a>
+    </div>
+  </footer>
+</body>
+</html>

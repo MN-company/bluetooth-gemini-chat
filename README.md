@@ -1,5 +1,12 @@
 # Gemini AirBridge
 
+[![GitHub Pages](https://img.shields.io/badge/demo-live-2ea44f?style=for-the-badge&logo=githubpages&logoColor=white)](https://mn-company.github.io/bluetooth-gemini-chat/)
+[![Android](https://img.shields.io/badge/Android-bridge-3DDC84?style=for-the-badge&logo=android&logoColor=white)](https://developer.android.com/)
+[![Python](https://img.shields.io/badge/Python-desktop-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Kotlin](https://img.shields.io/badge/Kotlin-Android-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white)](https://kotlinlang.org/)
+[![Gemini](https://img.shields.io/badge/Gemini-API-8E75B2?style=for-the-badge&logo=googlegemini&logoColor=white)](https://ai.google.dev/)
+[![BLE](https://img.shields.io/badge/BLE-GATT-0052CC?style=for-the-badge&logo=bluetooth&logoColor=white)](https://www.bluetooth.com/)
+
 **A Bluetooth Low Energy bridge that lets desktop clients use Gemini through an Android device.**
 
 Gemini AirBridge is an experimental cross-platform AI workflow. An Android
