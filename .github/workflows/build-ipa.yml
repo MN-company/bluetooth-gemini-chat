@@ -35,14 +35,13 @@ jobs:
             -destination generic/platform=iOS \
             -configuration Release \
             build \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_ALLOWED=NO \
+            SYMROOT=build
 
       - name: Prepare IPA
         run: |
-          APP_PATH=$(find /Users/runner/Library/Developer/Xcode/DerivedData -name "GeminiAirBridge.app" -path "*/Release-iphoneos/*" | head -1)
-          echo "Found app at: $APP_PATH"
           mkdir -p Payload
-          cp -r "$APP_PATH" Payload/
+          cp -r build/Release-iphoneos/GeminiAirBridge.app Payload/
           cd Payload
           zip -qr ../GeminiAirBridge.ipa GeminiAirBridge.app/
           cd ..
