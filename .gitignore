@@ -28,3 +28,8 @@ android/**/*.iml
 
 # Logs
 *.log
+
+# Swift / SPM
+.build/
+*.dia
+*.pcm
