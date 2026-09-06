@@ -11,23 +11,27 @@ public final class BridgeService: ObservableObject {
     @Published public private(set) var apiKeySet: Bool = false
     @Published public private(set) var modelName: String = "gemini-2.0-flash"
 
-    private let bleManager: BLEServerManager
-    private var geminiClient: GeminiApiClient?
-    private let settings = UserDefaultsSettingsStore()
-    private var cancellables = Set<AnyCancellable>()
+    private var bleManager: BLEServerManager!
+        private var geminiClient: GeminiApiClient?
+        private let settings = UserDefaultsSettingsStore()
+        private var cancellables = Set<AnyCancellable>()
 
-    private var msgRoute: [String: String] = [:]
-    private var promptTasks: [String: Task<Void, Never>] = [:]
-    private let sema = AsyncSemaphore(count: 2)
+        private var msgRoute: [String: String] = [:]
+        private var promptTasks: [String: Task<Void, Never>] = [:]
+        private let sema = AsyncSemaphore(count: 2)
 
-    private init() {
-        bleManager = BLEServerManager(
-            onPrompt: { [weak self] json, addr in await self?.handleIncoming(json, addr: addr) ?? () },
-            onLog: { [weak self] msg in Task { await self?.appendLog(msg) } }
-        )
-        bleManager.statePublisher.receive(on: DispatchQueue.main).sink { [weak self] s in self?.bleState = s }.store(in: &cancellables)
-        refreshClient()
-    }
+        private init() {
+            // 1. Create bleManager FIRST with closures that don't capture self (use shared)
+            let ble = BLEServerManager(
+                onPrompt: { json, addr in await BridgeService.shared.handleIncoming(json, addr: addr) },
+                onLog: { msg in Task { await BridgeService.shared.appendLog(msg) } }
+            )
+            // 2. Assign before using self in subscriber (avoids 'used before init')
+            self.bleManager = ble
+            // 3. Now safe to use self
+            ble.statePublisher.receive(on: DispatchQueue.main).sink { [weak self] s in self?.bleState = s }.store(in: &cancellables)
+            refreshClient()
+        }
 
     public func start() { Task { await bleManager.start() } }
     public func stop() { promptTasks.values.forEach { $0.cancel() }; promptTasks.removeAll(); Task { await bleManager.stop() } }
