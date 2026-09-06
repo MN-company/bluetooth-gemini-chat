@@ -1,26 +1,51 @@
 import Foundation
 import CoreBluetooth
 import Combine
-import OSLog
 
-public actor BLEServerManager: NSObject {
+// MARK: - BLE Delegate Coordinator (non-actor, @objc-compatible)
+/// Bridges CBPeripheralManagerDelegate callbacks to the actor-isolated BLEServerManager.
+final class BLEPeripheralDelegate: NSObject, CBPeripheralManagerDelegate {
+    weak var owner: BLEServerManager?
+
+    func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
+        owner?.handleStateChange(peripheral.state)
+    }
+
+    func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {
+        if let err = error { owner?.log("Failed to add service: \(err.localizedDescription)"); owner?.subject.send(.error(err.localizedDescription)); return }
+        owner?.log("GATT service added")
+        owner?.startAdvertising()
+    }
+
+    func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {
+        if let err = error { owner?.log("Advertising failed: \(err.localizedDescription)"); owner?.subject.send(.error(err.localizedDescription)) }
+        else { owner?.subject.send(.advertising) }
+    }
+
+    func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
+        owner?.handleWrites(requests)
+    }
+
+    func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
+        owner?.addCentral(central)
+    }
+
+    func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
+        owner?.removeCentral(central)
+    }
+}
+
+// MARK: - BLEServerManager (actor, state)
+public actor BLEServerManager {
     public typealias PromptHandler = @Sendable (_ json: String, _ address: String) async -> Void
     public typealias LogHandler = @Sendable (String) -> Void
 
     public enum State: Sendable, Equatable {
-        case idle
-        case starting
-        case advertising
-        case connected(count: Int)
-        case error(String)
+        case idle, starting, advertising, connected(count: Int), error(String)
     }
 
     public enum BLEError: Swift.Error, LocalizedError {
-        case serverNotReady
-        case noConnectedCentral
-        case invalidBundle
-        case bundleSizeMismatch
-
+        case serverNotReady, noConnectedCentral, invalidBundle, bundleSizeMismatch
         public var errorDescription: String? {
             switch self {
             case .serverNotReady: return "BLE bridge not ready"
@@ -31,299 +56,193 @@ public actor BLEServerManager: NSObject {
         }
     }
 
-    private var peripheralManager: CBPeripheralManager?
-    private var notifyCharacteristic: CBMutableCharacteristic?
+    private var pm: CBPeripheralManager?
+    private var delegateCoordinator: BLEPeripheralDelegate?
+    private var notifyChar: CBMutableCharacteristic?
 
-    private var connectedCentrals: [String: CBCentral] = [:]
-    private var mtuByCentral: [String: Int] = [:]
-    private let sendQueue = DispatchQueue(label: "com.geminiairbridge.ble.send")
+    private var centrals: [String: CBCentral] = [:]
+    private var mtu: [String: Int] = [:]
+    private let sendQ = DispatchQueue(label: "com.geminiairbridge.ble.send")
 
-    private let frameAssembler = FrameAssembler()
-    private let transportIds = TransportIdGenerator()
+    private let assembler = FrameAssembler()
+    private let tids = TransportIdGenerator()
 
     private let onPrompt: PromptHandler
     private let onLog: LogHandler
 
-    private var managerReady = false
+    private var ready = false
     private var pendingStart = false
 
-    private let stateSubject = PassthroughSubject<State, Never>()
-    public nonisolated var statePublisher: AnyPublisher<State, Never> {
-        stateSubject.eraseToAnyPublisher()
-    }
+    let subject = PassthroughSubject<State, Never>()
+    public nonisolated var statePublisher: AnyPublisher<State, Never> { subject.eraseToAnyPublisher() }
 
-    private func emitState(_ state: State) {
-        stateSubject.send(state)
-    }
-
-    private static let gzipMagic = Data("gz".utf8) + Data([0x01])
-    private static let promptBundleMagic = Data("bgp2".utf8)
-    private static let pbHeaderBytes = 13
+    private static let gzMagic = Data("gz".utf8) + Data([0x01])
+    private static let pbMagic = Data("bgp2".utf8)
+    private static let pbHead = 13
 
     public init(onPrompt: @escaping PromptHandler, onLog: @escaping LogHandler) {
         self.onPrompt = onPrompt
         self.onLog = onLog
-        super.init()
     }
 
+    // MARK: - Public
     public func start() {
-        guard !managerReady else { return }
+        guard !ready else { return }
         pendingStart = true
-        let options: [String: Any] = [
+        let d = BLEPeripheralDelegate()
+        d.owner = self
+        delegateCoordinator = d
+        pm = CBPeripheralManager(delegate: d, queue: nil, options: [
             CBPeripheralManagerOptionShowPowerAlertKey: true,
             CBPeripheralManagerOptionRestoreIdentifierKey: "com.mncompany.geminiairbridge.ble"
-        ]
-        peripheralManager = CBPeripheralManager(delegate: self, queue: nil, options: options)
+        ])
     }
 
     public func stop() {
         pendingStart = false
-        guard let pm = peripheralManager else { return }
-        pm.stopAdvertising()
-        pm.removeAllServices()
-        connectedCentrals.removeAll()
-        mtuByCentral.removeAll()
-        notifyCharacteristic = nil
-        managerReady = false
-        emitState(.idle)
-        onLog("BLE bridge stopped")
+        pm?.stopAdvertising()
+        pm?.removeAllServices()
+        pm = nil; delegateCoordinator = nil; notifyChar = nil
+        centrals.removeAll(); mtu.removeAll(); ready = false
+        subject.send(.idle); log("BLE bridge stopped")
     }
 
     public func isOperational() -> Bool {
-        guard let pm = peripheralManager else { return false }
-        return pm.state == .poweredOn && (pm.isAdvertising || !connectedCentrals.isEmpty)
+        pm?.state == .poweredOn && (pm?.isAdvertising ?? false || !centrals.isEmpty)
     }
 
-    public func sendJson(
-        _ jsonMessage: String,
-        targetAddress: String? = nil,
-        highPriority: Bool = false
-    ) async throws {
-        guard let pm = peripheralManager, managerReady else {
-            throw BLEError.serverNotReady
-        }
-
+    public func sendJson(_ msg: String, targetAddress: String? = nil, highPriority: Bool = false) async throws {
+        guard let pm, ready else { throw BLEError.serverNotReady }
         let central: CBCentral
-        if let addr = targetAddress, let c = connectedCentrals[addr] {
-            central = c
-        } else {
-            guard let first = connectedCentrals.values.first else {
-                throw BLEError.noConnectedCentral
-            }
-            central = first
-        }
+        if let a = targetAddress, let c = centrals[a] { central = c }
+        else { guard let f = centrals.values.first else { throw BLEError.noConnectedCentral }; central = f }
 
-        let mtu = mtuByCentral[central.identifier.uuidString] ?? BLEConstants.defaultAttMtu
-        let mtuPayloadMax = max(BLEConstants.defaultMaxPacketSize, mtu - 3)
-        let maxPacketSize = min(BLEConstants.maxGattAttributeValueBytes, mtuPayloadMax)
-
-        var payload = jsonMessage.data(using: .utf8) ?? Data()
+        let maxSize = min(BLEConstants.maxGattAttributeValueBytes, max(BLEConstants.defaultMaxPacketSize, (mtu[central.identifier.uuidString] ?? BLEConstants.defaultAttMtu) - 3))
+        var payload = msg.data(using: .utf8) ?? Data()
         if payload.count >= BLEConstants.jsonGzipThresholdBytes {
-            payload = Self.gzipMagic + (try (payload as NSData).compressed(using: .zlib) as Data)
+            payload = Self.gzMagic + (try (payload as NSData).compressed(using: .zlib) as Data)
         }
+        let pkts = try FrameCodec.encode(transportId: tids.next(), payload: payload, maxPacketSize: maxSize)
+        let mc = centrals.count > 1
+        let throttle: Int
+        if highPriority || pkts.count <= 12 { throttle = 0 }
+        else if mc && pkts.count > 140 { throttle = BLEConstants.throttleMultiClientEvery }
+        else if mc { throttle = BLEConstants.throttleSingleClientEvery }
+        else if pkts.count > 180 { throttle = 14 }
+        else if pkts.count > 90 { throttle = 10 }
+        else { throttle = BLEConstants.throttleMultiClientEvery }
 
-        let transportId = transportIds.next()
-        let packets = try FrameCodec.encode(transportId: transportId, payload: payload, maxPacketSize: maxPacketSize)
-
-        let multiClient = connectedCentrals.count > 1
-        let throttleEvery: Int
-        if highPriority || packets.count <= 12 {
-            throttleEvery = 0
-        } else if multiClient && packets.count > 140 {
-            throttleEvery = BLEConstants.throttleMultiClientEvery
-        } else if multiClient {
-            throttleEvery = BLEConstants.throttleSingleClientEvery
-        } else if packets.count > 180 {
-            throttleEvery = 14
-        } else if packets.count > 90 {
-            throttleEvery = 10
-        } else {
-            throttleEvery = BLEConstants.throttleMultiClientEvery
-        }
-
-        for (idx, packet) in packets.enumerated() {
-            sendQueue.sync {
-                _ = pm.updateValue(packet, for: notifyCharacteristic!, onSubscribedCentrals: [central])
-            }
-            if throttleEvery > 0 && (idx + 1) % throttleEvery == 0 {
-                try await Task.sleep(nanoseconds: BLEConstants.throttleDelayMs * 1_000_000)
-            }
+        for (i, pkt) in pkts.enumerated() {
+            sendQ.sync { _ = pm.updateValue(pkt, for: notifyChar!, onSubscribedCentrals: [central]) }
+            if throttle > 0 && (i + 1) % throttle == 0 { try await Task.sleep(nanoseconds: BLEConstants.throttleDelayMs * 1_000_000) }
         }
     }
 
-    public func sendRawBytes(_ data: Data, targetAddress: String? = nil) {
-        guard let pm = peripheralManager, managerReady else { return }
+    public func sendRaw(_ data: Data, targetAddress: String? = nil) {
+        guard let pm, ready else { return }
         let central: CBCentral
-        if let addr = targetAddress, let c = connectedCentrals[addr] {
-            central = c
-        } else {
-            guard let first = connectedCentrals.values.first else { return }
-            central = first
-        }
-        sendQueue.sync {
-            _ = pm.updateValue(data, for: notifyCharacteristic!, onSubscribedCentrals: [central])
-        }
+        if let a = targetAddress, let c = centrals[a] { central = c }
+        else { guard let f = centrals.values.first else { return }; central = f }
+        sendQ.sync { _ = pm.updateValue(data, for: notifyChar!, onSubscribedCentrals: [central]) }
     }
 
-    private func isPromptBundle(_ data: Data) -> Bool {
-        data.count >= Self.pbHeaderBytes && data[0..<4] == Self.promptBundleMagic
-    }
-
-    private func decodePromptBundleToJson(_ data: Data) throws -> String {
-        let magic = data[0..<4]
-        guard magic == Self.promptBundleMagic else { throw BLEError.invalidBundle }
-        let flags = data[4]
-        let metadataLen = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.load(fromByteOffset: 5, as: UInt32.self) }))
-        let imageLen = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.load(fromByteOffset: 9, as: UInt32.self) }))
-        let expectedSize = Self.pbHeaderBytes + metadataLen + imageLen
-        guard data.count == expectedSize else { throw BLEError.bundleSizeMismatch }
-
-        var metadata = data[Self.pbHeaderBytes..<(Self.pbHeaderBytes + metadataLen)]
-        if (flags & BLEConstants.promptBundleFlagGzipMetadata) != 0 {
-            metadata = try (metadata as NSData).decompressed(using: .zlib) as Data
-        }
-        guard var json = try JSONSerialization.jsonObject(with: metadata) as? [String: Any] else {
-            throw BLEError.invalidBundle
-        }
-        if imageLen > 0 {
-            let imageBytes = data[Self.pbHeaderBytes + metadataLen..<Self.pbHeaderBytes + metadataLen + imageLen]
-            json["imageBase64"] = imageBytes.base64EncodedString()
-            json["imageMimeType"] = json["imageMimeType"] ?? "image/png"
-        }
-        let result = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys])
-        return String(data: result, encoding: .utf8) ?? ""
-    }
-
-    private func handleWrite(_ request: CBATTRequest) async {
-        let address = request.central.identifier.uuidString
-        let data = request.value ?? Data()
-        if data.count == BLEConstants.binaryFrameSize
-            && data[0] == BLEConstants.binaryFrameMagic[0]
-            && data[1] == BLEConstants.binaryFrameMagic[1] {
-            if data[2] == BLEConstants.binaryPingType {
-                let tsMs = BLEConstants.parseBinaryTimestamp(data)
-                sendRawBytes(BLEConstants.buildBinaryPong(tsMs: tsMs), targetAddress: address)
-            }
-            return
-        }
-
-        do {
-            let frame = try FrameCodec.decode(data)
-            if let completePayload = try await frameAssembler.addFrame(frame) {
-                await processCompletePayload(completePayload, from: address)
-            }
-        } catch {
-            onLog("Frame decode error: \(error.localizedDescription)")
-        }
-    }
-
-    private func processCompletePayload(_ payload: Data, from address: String) async {
-        let json: String
-        if payload.count >= 3 && payload[0] == 103 && payload[1] == 122 && payload[2] == 0x01 {
-            let compressed = payload.dropFirst(3)
-            do {
-                let d = try (compressed as NSData).decompressed(using: .zlib) as Data
-                json = String(data: d, encoding: .utf8) ?? ""
-            } catch { onLog("Decompression failed: \(error.localizedDescription)"); return }
-        } else if isPromptBundle(payload) {
-            do { json = try decodePromptBundleToJson(payload) }
-            catch { onLog("Bundle decode failed: \(error.localizedDescription)"); return }
-        } else {
-            json = String(data: payload, encoding: .utf8) ?? ""
-        }
-        guard !json.isEmpty else { return }
-        onLog("Received request (\(json.count) chars) from \(address)")
-        await onPrompt(json, address)
-    }
-
-    // MARK: - Nonisolated delegation
-    nonisolated public func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
-        Task { await self._handleStateChange(peripheral.state) }
-    }
-
-    private func _handleStateChange(_ state: CBManagerState) {
+    // MARK: - Internal (called from delegate)
+    func handleStateChange(_ state: CBManagerState) {
         switch state {
-        case .poweredOn:
-            onLog("Bluetooth powered on"); managerReady = true
-            if pendingStart { _setupService() }
-        case .poweredOff:
-            onLog("Bluetooth powered off"); managerReady = false; emitState(.error("Bluetooth off"))
-        case .unauthorized:
-            onLog("Bluetooth unauthorized"); managerReady = false; emitState(.error("Bluetooth unauthorized"))
-        case .unsupported:
-            onLog("Bluetooth unsupported"); managerReady = false; emitState(.error("Bluetooth unsupported"))
+        case .poweredOn: log("Bluetooth on"); ready = true; if pendingStart { setup() }
+        case .poweredOff: log("Bluetooth off"); ready = false; subject.send(.error("Bluetooth off"))
+        case .unauthorized: log("Bluetooth unauthorized"); subject.send(.error("Unauthorized"))
+        case .unsupported: log("Bluetooth unsupported"); subject.send(.error("Unsupported"))
         default: break
         }
     }
 
-    private func _setupService() {
-        guard let pm = peripheralManager else { return }
-        emitState(.starting)
-        let service = CBMutableService(type: BLEConstants.serviceUUID, primary: true)
-        let writeChar = CBMutableCharacteristic(type: BLEConstants.writeCharUUID, properties: [.write, .writeWithoutResponse], value: nil, permissions: .writeable)
-        let notifyChar = CBMutableCharacteristic(type: BLEConstants.notifyCharUUID, properties: [.notify], value: nil, permissions: .readable)
-        notifyChar.descriptors = [CBMutableDescriptor(type: BLEConstants.cccdUUID, value: nil)]
-        service.characteristics = [writeChar, notifyChar]
-        pm.add(service)
-        self.notifyCharacteristic = notifyChar
+    func setup() {
+        guard let pm else { return }
+        subject.send(.starting)
+        let svc = CBMutableService(type: BLEConstants.serviceUUID, primary: true)
+        let wc = CBMutableCharacteristic(type: BLEConstants.writeCharUUID, properties: [.write, .writeWithoutResponse], value: nil, permissions: .writeable)
+        let nc = CBMutableCharacteristic(type: BLEConstants.notifyCharUUID, properties: [.notify], value: nil, permissions: .readable)
+        nc.descriptors = [CBMutableDescriptor(type: BLEConstants.cccdUUID, value: nil)]
+        svc.characteristics = [wc, nc]
+        pm.add(svc)
+        notifyChar = nc
     }
 
-    public nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Swift.Error?) {
-        Task {
-            if let err = error {
-                await self.onLog("Failed to add service: \(err.localizedDescription)")
-                await self.emitState(.error(err.localizedDescription))
-                return
+    func startAdvertising() {
+        pm?.startAdvertising([CBAdvertisementDataServiceUUIDsKey: [BLEConstants.serviceUUID], CBAdvertisementDataLocalNameKey: "Gemini AirBridge"])
+        subject.send(.advertising); log("BLE advertising")
+    }
+
+    func handleWrites(_ requests: [CBATTRequest]) {
+        for req in requests {
+            let addr = req.central.identifier.uuidString
+            guard let data = req.value else { continue }
+
+            // Binary ping/pong
+            if data.count == BLEConstants.binaryFrameSize && data[0] == 0xFE && data[1] == 0xFD {
+                if data[2] == BLEConstants.binaryPingType {
+                    sendRaw(BLEConstants.buildBinaryPong(tsMs: BLEConstants.parseBinaryTimestamp(data)), targetAddress: addr)
+                }
+                continue
             }
-            await self.onLog("GATT service added")
-            await self._startAdvertising()
-        }
-    }
 
-    private func _startAdvertising() {
-        guard let pm = peripheralManager else { return }
-        pm.startAdvertising([
-            CBAdvertisementDataServiceUUIDsKey: [BLEConstants.serviceUUID],
-            CBAdvertisementDataLocalNameKey: "Gemini AirBridge"
-        ])
-        emitState(.advertising)
-        onLog("BLE advertising started")
-    }
-
-    public nonisolated func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Swift.Error?) {
-        Task {
-            if let err = error {
-                await self.onLog("Advertising failed: \(err.localizedDescription)")
-                await self.emitState(.error(err.localizedDescription))
-            } else {
-                await self.emitState(.advertising)
+            Task {
+                do {
+                    let frame = try FrameCodec.decode(data)
+                    if let payload = try await assembler.addFrame(frame) {
+                        await processPayload(payload, addr: addr)
+                    }
+                } catch { self.log("Frame decode: \(error.localizedDescription)") }
             }
         }
     }
 
-    public nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
-        Task { for r in requests { await self.handleWrite(r) } }
+    func addCentral(_ c: CBCentral) {
+        let addr = c.identifier.uuidString
+        centrals[addr] = c; mtu[addr] = c.maximumUpdateValueLength
+        log("Connected: \(addr)"); subject.send(.connected(count: centrals.count))
     }
 
-    public nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
-        Task { await self._addCentral(address: central.identifier.uuidString, central: central) }
+    func removeCentral(_ c: CBCentral) {
+        let addr = c.identifier.uuidString
+        centrals.removeValue(forKey: addr); mtu.removeValue(forKey: addr)
+        log("Disconnected: \(addr)")
+        subject.send(centrals.isEmpty ? .advertising : .connected(count: centrals.count))
     }
 
-    private func _addCentral(address: String, central: CBCentral) {
-        connectedCentrals[address] = central
-        mtuByCentral[address] = central.maximumUpdateValueLength
-        onLog("Central subscribed: \(address)")
-        emitState(.connected(count: connectedCentrals.count))
+    private func processPayload(_ payload: Data, addr: String) async {
+        let json: String
+        if payload.count >= 3 && payload[0] == 103 && payload[1] == 122 && payload[2] == 1 {
+            do { let d = try (payload.dropFirst(3) as NSData).decompressed(using: .zlib) as Data; json = String(data: d, encoding: .utf8) ?? "" }
+            catch { log("Decompress fail"); return }
+        } else if payload.count >= Self.pbHead && payload[0..<4] == Self.pbMagic {
+            json = decodeBundle(payload)
+        } else { json = String(data: payload, encoding: .utf8) ?? "" }
+        guard !json.isEmpty else { return }
+        log("Request \(json.count)B from \(addr)")
+        await onPrompt(json, addr)
     }
 
-    public nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
-        Task { await self._removeCentral(address: central.identifier.uuidString) }
+    private func decodeBundle(_ data: Data) -> String {
+        // Simplified: just extract metadata JSON with base64 image appended
+        do {
+            let flags = data[4]
+            let metaLen = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.load(fromByteOffset: 5, as: UInt32.self) }))
+            let imgLen = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.load(fromByteOffset: 9, as: UInt32.self) }))
+            var meta = data[Self.pbHead..<(Self.pbHead + metaLen)]
+            if (flags & BLEConstants.promptBundleFlagGzipMetadata) != 0 {
+                meta = try (meta as NSData).decompressed(using: .zlib) as Data
+            }
+            guard var obj = try JSONSerialization.jsonObject(with: meta) as? [String: Any] else { return "" }
+            if imgLen > 0 {
+                let img = data[Self.pbHead + metaLen..<Self.pbHead + metaLen + imgLen]
+                obj["imageBase64"] = img.base64EncodedString()
+                obj["imageMimeType"] = obj["imageMimeType"] ?? "image/png"
+            }
+            return String(data: try JSONSerialization.data(withJSONObject: obj, options: .sortedKeys), encoding: .utf8) ?? ""
+        } catch { log("Bundle decode error"); return "" }
     }
 
-    private func _removeCentral(address: String) {
-        connectedCentrals.removeValue(forKey: address)
-        mtuByCentral.removeValue(forKey: address)
-        onLog("Central unsubscribed: \(address)")
-        emitState(connectedCentrals.isEmpty ? .advertising : .connected(count: connectedCentrals.count))
-    }
+    func log(_ msg: String) { onLog(msg) }
 }
