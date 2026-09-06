@@ -23,7 +23,7 @@ public final class BridgeService: ObservableObject {
     private init() {
         bleManager = BLEServerManager(
             onPrompt: { [weak self] json, addr in await self?.handleIncoming(json, addr: addr) ?? () },
-            onLog: { [weak self] msg in await self?.appendLog(msg) ?? () }
+            onLog: { [weak self] msg in Task { await self?.appendLog(msg) } }
         )
         bleManager.statePublisher.receive(on: DispatchQueue.main).sink { [weak self] s in self?.bleState = s }.store(in: &cancellables)
         refreshClient()
