@@ -39,9 +39,13 @@ jobs:
 
       - name: Prepare IPA
         run: |
+          APP_PATH=$(find /Users/runner/Library/Developer/Xcode/DerivedData -name "GeminiAirBridge.app" -path "*/Release-iphoneos/*" | head -1)
+          echo "Found app at: $APP_PATH"
           mkdir -p Payload
-          cp -r build/Release-iphoneos/GeminiAirBridge.app Payload/
-          zip -qr GeminiAirBridge.ipa Payload/
+          cp -r "$APP_PATH" Payload/
+          cd Payload
+          zip -qr ../GeminiAirBridge.ipa GeminiAirBridge.app/
+          cd ..
           rm -rf Payload
 
       - name: Upload IPA
