@@ -33,3 +33,5 @@ android/**/*.iml
 .build/
 *.dia
 *.pcm
+GeminiAirBridge-iOS/GeminiAirBridge.ipa
+GeminiAirBridge-iOS/GeminiAirBridge-iOS.xcodeproj/
