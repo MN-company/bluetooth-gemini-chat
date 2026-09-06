@@ -2,20 +2,25 @@ name: Build IPA
 
 on:
   push:
-    branches: [main]
+    branches: [main, next-gen]
     paths:
-      - 'Sources/**'
-      - 'Package.swift'
-      - 'Info.plist'
+      - 'GeminiAirBridge-iOS/Sources/**'
+      - 'GeminiAirBridge-iOS/Package.swift'
+      - 'GeminiAirBridge-iOS/Info.plist'
       - '.github/workflows/build-ipa.yml'
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-15
+    defaults:
+      run:
+        working-directory: GeminiAirBridge-iOS
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
@@ -43,5 +48,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: GeminiAirBridge.ipa
-          path: GeminiAirBridge.ipa
+          path: GeminiAirBridge-iOS/GeminiAirBridge.ipa
           compression-level: 0
